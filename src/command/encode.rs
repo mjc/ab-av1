@@ -8,8 +8,8 @@ use crate::{
     ffprobe::{self, Ffprobe},
     log::ProgressLogger,
     process::FfmpegOut,
-    temporary::{self, TempKind},
 };
+use anyhow::Context;
 use clap::Parser;
 use console::style;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
@@ -101,8 +101,14 @@ pub async fn run(
         output.file_name().and_then(|n| n.to_str()).unwrap_or("")
     );
 
-    let output_cleanup = OutputCleanup::arm(&output);
-    let mut enc = ffmpeg::encode(enc_args, &output, has_audio, audio_codec, stereo_downmix)?;
+    let output_temp = TempOutput::new(&output)?;
+    let mut enc = ffmpeg::encode(
+        enc_args,
+        output_temp.path(),
+        has_audio,
+        audio_codec,
+        stereo_downmix,
+    )?;
     let mut logger = ProgressLogger::new(module_path!(), Instant::now());
     let mut stream_sizes = None;
     while let Some(progress) = enc.next().await {
@@ -127,7 +133,7 @@ pub async fn run(
     enc.wait().await?; // ensure process has exited
     bar.finish();
 
-    output_cleanup.commit();
+    output_temp.persist().await?;
 
     // print output info
     let output_size = fs::metadata(&output).await?.len();
@@ -179,42 +185,59 @@ pub fn default_output_name(input: &Path, encoder: &Encoder, is_image: bool) -> P
     input.with_extension(format!("{pre}.{ext}"))
 }
 
-struct OutputCleanup {
+struct TempOutput {
+    _dir: tempfile::TempDir,
     path: PathBuf,
+    output: PathBuf,
 }
 
-impl OutputCleanup {
-    fn arm(path: impl AsRef<Path>) -> Self {
-        let path = path.as_ref().to_owned();
-        // From this point on ffmpeg may create or partially write the output,
-        // so clean it up on failure.
-        temporary::add(&path, TempKind::NotKeepable);
-        Self { path }
+impl TempOutput {
+    fn new(output: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let output = output.as_ref().to_owned();
+        let parent = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let dir = tempfile::tempdir_in(parent).with_context(|| {
+            format!(
+                "failed to create temporary output directory in {}",
+                parent.display()
+            )
+        })?;
+        let path = dir.path().join(output.file_name().unwrap_or_default());
+
+        Ok(Self {
+            _dir: dir,
+            path,
+            output,
+        })
     }
 
-    fn commit(self) {
-        // Successful encode: the output is user-owned, so don't delete it.
-        temporary::unadd(&self.path);
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    async fn persist(self) -> anyhow::Result<()> {
+        fs::rename(&self.path, &self.output)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to move encoded output from {} to {}",
+                    self.path.display(),
+                    self.output.display()
+                )
+            })?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{str::FromStr, sync::LazyLock};
+    use std::str::FromStr;
 
-    static TEST_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(<_>::default);
-
-    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn test_path(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("ab-av1-{}-{name}", std::process::id(),));
-        path
+    fn test_path(temp_dir: &Path, name: &str) -> PathBuf {
+        temp_dir.join(name)
     }
 
     fn test_probe() -> Ffprobe {
@@ -255,60 +278,108 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn committed_output_cleanup_does_not_delete_output() {
-        let _guard = test_guard();
-        temporary::clean_all().await;
-
-        let output = test_path("committed-output.mkv");
-        fs::write(&output, b"encoded output")
+    async fn temp_output_persists_to_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let output = test_path(temp_dir.path(), "committed-output.mkv");
+        let temp_output = TempOutput::new(&output).expect("temp output");
+        fs::write(temp_output.path(), b"encoded output")
             .await
-            .expect("write output");
+            .expect("write temp output");
 
-        OutputCleanup::arm(&output).commit();
-        temporary::clean_all().await;
+        temp_output.persist().await.expect("persist temp output");
 
         assert_eq!(
             fs::read(&output).await.expect("committed output survives"),
             b"encoded output"
         );
-
-        _ = fs::remove_file(output).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn uncommitted_output_cleanup_deletes_partial_output() {
-        let _guard = test_guard();
-        temporary::clean_all().await;
-
-        let output = test_path("partial-output.mkv");
-        fs::write(&output, b"partial output")
+    async fn unpersisted_temp_output_deletes_partial_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let output = test_path(temp_dir.path(), "partial-output.mkv");
+        let temp_output = TempOutput::new(&output).expect("temp output");
+        let temp_path = temp_output.path().to_owned();
+        fs::write(&temp_path, b"partial output")
             .await
             .expect("write partial output");
 
-        _ = OutputCleanup::arm(&output);
-        temporary::clean_all().await;
+        drop(temp_output);
 
         assert!(
-            !fs::try_exists(&output).await.expect("check partial output"),
+            !fs::try_exists(&temp_path)
+                .await
+                .expect("check partial output"),
             "uncommitted partial output should be deleted"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn temp_output_keeps_filename_in_output_parent_temp_dir() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let output = test_path(temp_dir.path(), "video.av1.mkv");
+
+        let temp_output = TempOutput::new(&output).expect("temp output");
+
+        assert_eq!(temp_output.path().file_name(), output.file_name());
+        assert_ne!(temp_output.path(), output);
+        assert_eq!(
+            temp_output.path().parent().and_then(Path::parent),
+            Some(temp_dir.path())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpersisted_temp_output_does_not_replace_existing_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let output = test_path(temp_dir.path(), "existing-output.mkv");
+        fs::write(&output, b"existing output")
+            .await
+            .expect("write existing output");
+        let temp_output = TempOutput::new(&output).expect("temp output");
+        fs::write(temp_output.path(), b"partial output")
+            .await
+            .expect("write partial output");
+
+        drop(temp_output);
+
+        assert_eq!(
+            fs::read(&output).await.expect("existing output survives"),
+            b"existing output"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persisted_temp_output_replaces_existing_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let output = test_path(temp_dir.path(), "existing-output.mkv");
+        fs::write(&output, b"existing output")
+            .await
+            .expect("write existing output");
+        let temp_output = TempOutput::new(&output).expect("temp output");
+        fs::write(temp_output.path(), b"encoded output")
+            .await
+            .expect("write temp output");
+
+        temp_output.persist().await.expect("persist temp output");
+
+        assert_eq!(
+            fs::read(&output).await.expect("output replaced"),
+            b"encoded output"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn same_file_validation_failure_does_not_delete_input() {
-        let _guard = test_guard();
-        temporary::clean_all().await;
-
-        let input = test_path("same-file-input.mkv");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let input = test_path(temp_dir.path(), "same-file-input.mkv");
         fs::write(&input, b"input").await.expect("write input");
-
         let bar = ProgressBar::hidden();
         let mut args = encode_args(input.clone(), input.clone());
         args.encode.audio_codec = None;
         args.encode.downmix_to_stereo = false;
 
         let result = run(args, Arc::new(test_probe()), &bar).await;
-        temporary::clean_all().await;
 
         assert!(
             result
@@ -317,17 +388,13 @@ mod tests {
                 .contains("Input and Output are specified as the same file")
         );
         assert_eq!(fs::read(&input).await.expect("input survives"), b"input");
-
-        _ = fs::remove_file(input).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn validation_failure_does_not_delete_existing_output() {
-        let _guard = test_guard();
-        temporary::clean_all().await;
-
-        let input = test_path("validation-input.mkv");
-        let output = test_path("validation-output.mkv");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let input = test_path(temp_dir.path(), "validation-input.mkv");
+        let output = test_path(temp_dir.path(), "validation-output.mkv");
         fs::write(&input, b"input").await.expect("write input");
         fs::write(&output, b"existing output")
             .await
@@ -340,7 +407,6 @@ mod tests {
             &bar,
         )
         .await;
-        temporary::clean_all().await;
 
         assert!(
             result
@@ -352,8 +418,5 @@ mod tests {
             fs::read(&output).await.expect("existing output survives"),
             b"existing output"
         );
-
-        _ = fs::remove_file(input).await;
-        _ = fs::remove_file(output).await;
     }
 }
