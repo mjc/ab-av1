@@ -86,9 +86,17 @@ pub fn add(child: ProcessChunkStream) {
     register_if_running(&mut running, child);
 }
 
-/// Wait for all child processes, that were added with [`add`], to exit.
-pub async fn wait() {
+/// Wait for all child processes, killing them first if shutdown was interrupt-driven.
+pub async fn wait_after_interrupt(interrupted: bool) {
     let mut procs = RegisteredChildren::take();
+
+    if interrupted {
+        log_abort_wait();
+        procs.kill_and_reap_all().await;
+        procs.discard();
+        return;
+    }
+
     let mut ctrl_c = pin!(signal::ctrl_c());
 
     tokio::select! {
@@ -168,20 +176,24 @@ impl Stream for TrackedChildStream {
     }
 }
 
+impl TrackedChildStream {
+    pub fn child_mut(&mut self) -> Option<&mut tokio::process::Child> {
+        self.0.as_mut()?.child_mut()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{process::Stdio, sync::MutexGuard};
+    use std::process::Stdio;
     use tokio::process::Command;
     use tokio_process_stream::Item;
     use tokio_stream::StreamExt;
 
-    static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(<_>::default);
+    static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(<_>::default);
 
-    fn test_guard() -> MutexGuard<'static, ()> {
-        TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_MUTEX.lock().await
     }
 
     fn clear_running() {
@@ -201,7 +213,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_tracks_running_child() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -218,13 +230,13 @@ mod tests {
 
         assert_eq!(running_len(), 1, "running child should be tracked");
 
-        wait().await;
+        wait_after_interrupt(false).await;
         clear_running();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_ignores_exited_child() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -244,7 +256,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn drop_of_running_stream_registers_child() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -265,13 +277,13 @@ mod tests {
             "dropping a live stream should register it"
         );
 
-        wait().await;
+        wait_after_interrupt(false).await;
         clear_running();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn tracked_child_stream_yields_inner_process_items() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -308,8 +320,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dropped_ffmpeg_output_stream_registers_child_for_shutdown() {
+        let _guard = test_guard().await;
+        clear_running();
+
+        let mut child = Command::new("sh");
+        child
+            .arg("-c")
+            .arg("sleep 1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = child.spawn().expect("spawn running child");
+
+        let stream = crate::process::FfmpegOut::stream(child, "test child", "test child".into());
+        drop(stream);
+
+        assert_eq!(
+            running_len(),
+            1,
+            "dropping an active ffmpeg output stream should register it"
+        );
+
+        wait_after_interrupt(false).await;
+        clear_running();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cancelled_wait_keeps_unfinished_children_registered() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -323,13 +362,14 @@ mod tests {
 
         add(ProcessChunkStream::from(child));
 
-        let timed_out = tokio::time::timeout(Duration::from_millis(10), wait())
-            .await
-            .is_err();
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(10), wait_after_interrupt(false))
+                .await
+                .is_err();
         let registered_after_cancel = running_len();
 
         if registered_after_cancel > 0 {
-            wait().await;
+            wait_after_interrupt(false).await;
         } else {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -344,7 +384,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn aborting_shutdown_wait_kills_reaps_and_discards_unfinished_children() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -375,8 +415,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn interrupted_shutdown_kills_reaps_and_discards_registered_children() {
+        let _guard = test_guard().await;
+        clear_running();
+
+        let mut child = Command::new("sh");
+        child
+            .kill_on_drop(true)
+            .arg("-c")
+            .arg("sleep 5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = child.spawn().expect("spawn running child");
+
+        add(ProcessChunkStream::from(child));
+        wait_after_interrupt(true).await;
+
+        assert_eq!(
+            running_len(),
+            0,
+            "interrupt-driven shutdown should not wait for a second signal or re-register children"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn aborting_shutdown_wait_reaps_children_that_exit_before_cleanup() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -409,7 +474,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_prunes_children_that_already_exited() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut exited = Command::new("sh");
@@ -441,13 +506,13 @@ mod tests {
             "adding a child should prune any tracked children that already exited"
         );
 
-        wait().await;
+        wait_after_interrupt(false).await;
         clear_running();
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn wait_for_children_waits_for_supplied_children() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");
@@ -475,7 +540,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn wait_for_children_logs_once_after_slow_wait_threshold() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         clear_running();
 
         let mut child = Command::new("sh");

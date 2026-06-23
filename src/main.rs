@@ -55,13 +55,17 @@ async fn main() {
         Command::PrintCompletions(args) => return command::print_completions(args),
     });
 
+    let mut interrupted = false;
     let out = tokio::select! {
         r = command => r,
-        _ = signal::ctrl_c() => Err(anyhow!("ctrl_c")),
+        _ = signal::ctrl_c() => {
+            interrupted = true;
+            Err(anyhow!("ctrl_c"))
+        },
     };
     drop(local);
 
-    crate::process::child::wait().await;
+    crate::process::child::wait_after_interrupt(interrupted).await;
 
     if let Err(err) = out {
         eprintln!("Error: {err}");

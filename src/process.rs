@@ -14,7 +14,7 @@ use std::{
 };
 use time::macros::format_description;
 use tokio::process::Child;
-use tokio_process_stream::{Item, ProcessChunkStream};
+use tokio_process_stream::Item;
 use tokio_stream::Stream;
 
 pub fn ensure_success(name: &'static str, out: &Output) -> anyhow::Result<()> {
@@ -109,7 +109,9 @@ impl FfmpegOut {
 
     pub fn stream(child: Child, name: &'static str, cmd_str: String) -> FfmpegOutStream {
         FfmpegOutStream {
-            chunk_stream: ProcessChunkStream::from(child),
+            chunk_stream: child::TrackedChildStream::from(
+                tokio_process_stream::ProcessChunkStream::from(child),
+            ),
             chunks: <_>::default(),
             name,
             cmd_str,
@@ -229,7 +231,7 @@ pin_project_lite::pin_project! {
     #[must_use = "streams do nothing unless polled"]
     pub struct FfmpegOutStream {
         #[pin]
-        chunk_stream: ProcessChunkStream,
+        chunk_stream: child::TrackedChildStream,
         name: &'static str,
         cmd_str: String,
         chunks: Chunks,

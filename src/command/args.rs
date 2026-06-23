@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+const MAX_SAMPLE_COUNT: u64 = 10_000;
+
 /// Encoding args that apply when encoding to an output.
 #[derive(Parser, Clone)]
 pub struct EncodeToOutput {
@@ -53,7 +55,7 @@ pub struct EncodeToOutput {
 pub struct Sample {
     /// Number of samples to use across the input video. Overrides --sample-every.
     /// More samples take longer but may provide a more accurate result.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=MAX_SAMPLE_COUNT))]
     pub samples: Option<u64>,
 
     /// Calculate number of samples by dividing the input duration by this value.
@@ -65,7 +67,7 @@ pub struct Sample {
     pub sample_every: Duration,
 
     /// Minimum number of samples. So at least this many samples will be used.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=MAX_SAMPLE_COUNT))]
     pub min_samples: Option<u64>,
 
     /// Duration of each sample.
@@ -97,7 +99,7 @@ impl Sample {
             }
         }
         .max(self.min_samples.unwrap_or(1))
-        .max(1)
+        .clamp(1, MAX_SAMPLE_COUNT)
     }
 
     pub fn set_extension_from_input(&mut self, input: &Path, encoder: &Encoder, probe: &Ffprobe) {

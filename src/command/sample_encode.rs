@@ -482,13 +482,21 @@ async fn sample(
     temp: temporary::SharedWorkspace,
 ) -> anyhow::Result<(Arc<PathBuf>, u64)> {
     let sample_n = sample_idx + 1;
+    let samples_u32 = u32::try_from(samples)?;
 
-    let sample_start = (duration.saturating_sub(sample_duration * samples as _)
-        / (samples as u32 + 1))
-        * sample_n as _
-        + sample_duration * sample_idx as _;
+    let total_sample_duration = sample_duration
+        .checked_mul(samples_u32)
+        .unwrap_or(Duration::MAX);
+    let sample_start = (duration.saturating_sub(total_sample_duration) / (samples_u32 + 1))
+        * u32::try_from(sample_n)?
+        + sample_duration * u32::try_from(sample_idx)?;
 
-    let sample_frames = ((sample_duration.as_secs_f64() * fps).round() as u32).max(1);
+    let sample_frames_f = (sample_duration.as_secs_f64() * fps).round();
+    ensure!(
+        sample_frames_f.is_finite() && sample_frames_f >= 0.0 && sample_frames_f <= u32::MAX as f64,
+        "sample duration and fps produce too many sample frames"
+    );
+    let sample_frames = (sample_frames_f as u32).max(1);
     let floor_to_sec = sample_duration >= Duration::from_secs(2);
 
     let sample = sample::copy(&input, sample_start, floor_to_sec, sample_frames, &temp).await?;
