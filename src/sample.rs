@@ -1,7 +1,7 @@
 //! ffmpeg logic
 use crate::{
     process::{CommandExt, ensure_success},
-    temporary::{self, TempKind},
+    temporary::Workspace,
 };
 use anyhow::Context;
 use std::{
@@ -19,17 +19,16 @@ pub async fn copy(
     sample_start: Duration,
     floor_to_sec: bool,
     frames: u32,
-    temp_dir: Option<PathBuf>,
+    temp: &Workspace,
 ) -> anyhow::Result<PathBuf> {
     let mut sample_start_s = sample_start.as_secs_f32();
     if floor_to_sec {
         sample_start_s = sample_start_s.floor();
     }
 
-    let mut dest = temporary::process_dir(temp_dir);
     // Always using mkv for the samples works better than, e.g. using mp4 for mp4s
     // see https://github.com/alexheretic/ab-av1/issues/82#issuecomment-1337306325
-    dest.push(
+    let dest = temp.join(
         input
             .with_extension(format!("sample{sample_start_s}+{frames}f.mkv"))
             .file_name()
@@ -38,7 +37,6 @@ pub async fn copy(
     if dest.exists() {
         return Ok(dest);
     }
-    temporary::add(&dest, TempKind::Keepable);
 
     // Note: `-ss` before `-i` & `-frames:v` instead of `-t`
     // See https://github.com/alexheretic/ab-av1/issues/36#issuecomment-1146634936

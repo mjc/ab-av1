@@ -168,6 +168,7 @@ pub fn run(
         let samples = sample_args.sample_count(duration).max(1);
         let keep = sample_args.keep;
         let temp_dir = sample_args.temp_dir;
+        let temp = Arc::new(temporary::Workspace::new(temp_dir, keep)?);
         // let scoring = ScoringInfo {
         //     args: &score,
         //     vmaf: &vmaf,
@@ -197,7 +198,7 @@ pub fn run(
 
         // Start creating copy samples async, this is IO bound & not cpu intensive
         let (tx, mut sample_tasks) = tokio::sync::mpsc::unbounded_channel();
-        let sample_temp = temp_dir.clone();
+        let sample_temp = temp.clone();
         let sample_in = input.clone();
         tokio::task::spawn_local(async move {
             if full_pass {
@@ -268,7 +269,7 @@ pub fn run(
                             input: &sample,
                             ..enc_args.clone()
                         },
-                        temp_dir.clone(),
+                        &temp,
                         sample_args.extension.as_deref().unwrap_or("mkv"),
                     )?;
                     while let Some(enc_progress) = output.next().await {
@@ -420,8 +421,6 @@ pub fn run(
                         cache::cache_result(k, &result).await?;
                     }
 
-                    // Early clean. Note: Avoid cleaning copy samples
-                    temporary::clean(true).await;
                     if !keep {
                         let _ = tokio::fs::remove_file(encoded_sample).await;
                     }
@@ -472,7 +471,7 @@ async fn sample(
     sample_duration: Duration,
     duration: Duration,
     fps: f64,
-    temp_dir: Option<PathBuf>,
+    temp: temporary::SharedWorkspace,
 ) -> anyhow::Result<(Arc<PathBuf>, u64)> {
     let sample_n = sample_idx + 1;
 
@@ -484,7 +483,7 @@ async fn sample(
     let sample_frames = ((sample_duration.as_secs_f64() * fps).round() as u32).max(1);
     let floor_to_sec = sample_duration >= Duration::from_secs(2);
 
-    let sample = sample::copy(&input, sample_start, floor_to_sec, sample_frames, temp_dir).await?;
+    let sample = sample::copy(&input, sample_start, floor_to_sec, sample_frames, &temp).await?;
     let sample_size = fs::metadata(&sample).await?.len();
     ensure!(
         // ffmpeg copy may fail successfully and give us a small/empty output
