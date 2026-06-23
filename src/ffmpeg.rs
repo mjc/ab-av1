@@ -3,7 +3,7 @@ use crate::{
     command::args::PixelFormat,
     float::TerseF32,
     process::{CommandExt, FfmpegOut, FfmpegOutStream},
-    temporary::{self, TempKind},
+    temporary::Workspace,
 };
 use anyhow::Context;
 use log::debug;
@@ -70,7 +70,7 @@ pub fn encode_sample(
         input_args,
         video_only: _,
     }: FfmpegEncodeArgs,
-    temp_dir: Option<PathBuf>,
+    temp: &Workspace,
     dest_ext: &str,
 ) -> anyhow::Result<(PathBuf, FfmpegOutStream)> {
     let pre = pre_extension_name(&vcodec);
@@ -80,10 +80,7 @@ pub fn encode_sample(
         None => input.with_extension(format!("{pre}.crf{crf_str}.{dest_ext}")),
     };
     let dest_file_name = dest_file_name.file_name().unwrap();
-    let mut dest = temporary::process_dir(temp_dir);
-    dest.push(dest_file_name);
-
-    temporary::add(&dest, TempKind::Keepable);
+    let dest = temp.join(dest_file_name);
 
     let mut cmd = Command::new("ffmpeg");
     cmd.kill_on_drop(true)

@@ -43,7 +43,6 @@ async fn main() {
         .init();
 
     let action = Command::parse();
-    let keep = action.keep_temp_files();
 
     let local = tokio::task::LocalSet::new();
     let command = local.run_until(match action {
@@ -64,28 +63,8 @@ async fn main() {
 
     crate::process::child::wait().await;
 
-    // Final cleanup. Samples are already deleted (if wished by the user) during `command::sample_encode::run`.
-    temporary::clean(keep).await;
-
     if let Err(err) = out {
         eprintln!("Error: {err}");
         std::process::exit(1);
-    }
-}
-
-impl Command {
-    /// This decides what commands will keep temp files.
-    ///
-    /// # Important
-    ///
-    /// Add commands using the sample sub-args here referencing the `keep` flag,
-    /// or the temp files will be removed anyways.
-    fn keep_temp_files(&self) -> bool {
-        match self {
-            Self::SampleEncode(args) => args.sample.keep,
-            Self::CrfSearch(args) => args.sample.keep,
-            Self::AutoEncode(args) => args.search.sample.keep,
-            _ => false,
-        }
     }
 }

@@ -15,7 +15,6 @@ dependencies = [
  "console",
  "dirs",
  "env_logger",
- "fastrand",
  "ffprobe",
  "futures-util",
  "humantime",
