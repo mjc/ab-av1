@@ -102,4 +102,41 @@ mod tests {
 
         assert_ne!(first.path(), second.path());
     }
+
+    #[test]
+    fn shared_workspace_lives_until_last_reference_drops() {
+        let parent = tempfile::tempdir().expect("parent temp dir");
+        let workspace =
+            Arc::new(Workspace::new(Some(parent.path().to_owned()), false).expect("workspace"));
+        let path = workspace.path().to_owned();
+        let clone = workspace.clone();
+
+        drop(workspace);
+        assert!(path.exists(), "workspace should live while a clone exists");
+
+        drop(clone);
+        assert!(
+            !path.exists(),
+            "workspace should be deleted after the last reference drops"
+        );
+    }
+
+    #[test]
+    fn kept_shared_workspace_lives_after_last_reference_drops() {
+        let parent = tempfile::tempdir().expect("parent temp dir");
+        let workspace =
+            Arc::new(Workspace::new(Some(parent.path().to_owned()), true).expect("workspace"));
+        let path = workspace.path().to_owned();
+        let clone = workspace.clone();
+
+        drop(workspace);
+        assert!(path.exists(), "workspace should live while a clone exists");
+
+        drop(clone);
+        assert!(
+            path.exists(),
+            "kept workspace should remain after the last reference drops"
+        );
+        std::fs::remove_dir_all(path).expect("cleanup kept workspace");
+    }
 }
