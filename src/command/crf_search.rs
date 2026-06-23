@@ -322,7 +322,7 @@ pub fn run(
             crf_attempts.push(sample.clone());
             let sample_small_enough = sample.enc.encode_percent <= max_encoded_percent as _;
 
-            if score > min_score {
+            if score_meets_minimum(score, min_score) {
                 // good
                 if sample_small_enough && score < min_score + higher_tolerance {
                     yield Update::Done(sample);
@@ -463,6 +463,10 @@ impl StdoutFormat {
     }
 }
 
+fn score_meets_minimum(score: f32, min_score: f32) -> bool {
+    score >= min_score
+}
+
 /// Produce a q value between given samples using vmaf score linear interpolation
 /// so the output q value should produce the `min_vmaf`.
 ///
@@ -577,6 +581,21 @@ fn q_crf_conversions_high_crf_means_hq() {
     q_conv.crf_increment = 1.0;
     assert_eq!(q_conv.q(27.0), -27);
     assert_eq!(q_conv.crf(-27), 27.0);
+}
+
+#[test]
+fn exact_vmaf_threshold_match_is_good_enough() {
+    assert!(score_meets_minimum(95.0, 95.0));
+}
+
+#[test]
+fn exact_xpsnr_threshold_match_is_good_enough() {
+    assert!(score_meets_minimum(42.5, 42.5));
+}
+
+#[test]
+fn below_threshold_score_is_not_good_enough() {
+    assert!(!score_meets_minimum(94.99, 95.0));
 }
 
 #[derive(Debug)]
