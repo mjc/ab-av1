@@ -77,6 +77,10 @@ pub struct Args {
     /// Calculate a XPSNR score instead of VMAF.
     #[arg(long)]
     pub xpsnr: bool,
+
+    /// Shared temporary workspace, used by callers that run sample-encode repeatedly.
+    #[arg(skip)]
+    pub temp: Option<temporary::SharedWorkspace>,
 }
 
 pub async fn sample_encode(mut args: Args) -> anyhow::Result<()> {
@@ -150,6 +154,7 @@ pub fn run(
         score,
         xpsnr,
         xpsnr_opts,
+        temp,
     }: Args,
     input_probe: Arc<Ffprobe>,
 ) -> impl Stream<Item = anyhow::Result<Update>> {
@@ -168,7 +173,10 @@ pub fn run(
         let samples = sample_args.sample_count(duration).max(1);
         let keep = sample_args.keep;
         let temp_dir = sample_args.temp_dir;
-        let temp = Arc::new(temporary::Workspace::new(temp_dir, keep)?);
+        let temp = match temp {
+            Some(temp) => temp,
+            None => Arc::new(temporary::Workspace::new(temp_dir, keep)?),
+        };
         // let scoring = ScoringInfo {
         //     args: &score,
         //     vmaf: &vmaf,

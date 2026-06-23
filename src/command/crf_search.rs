@@ -10,6 +10,7 @@ use crate::{
     console_ext::style,
     ffprobe::{self, Ffprobe},
     float::TerseF32,
+    temporary,
 };
 use anyhow::Context;
 use clap::{ArgAction, Parser};
@@ -268,6 +269,7 @@ pub fn run(
         let (min_q, max_q) = q_conv.min_max_q(min_crf, max_crf);
         assert!(min_q < max_q);
         let mut q = (min_q + max_q) / 2;
+        let temp = Arc::new(temporary::Workspace::new(sample.temp_dir.clone(), sample.keep)?);
 
         let mut args = sample_encode::Args {
             args: args.clone(),
@@ -279,6 +281,7 @@ pub fn run(
             score: score.clone(),
             xpsnr: min_xpsnr.is_some(),
             xpsnr_opts: xpsnr,
+            temp: Some(temp),
         };
 
         let mut crf_attempts = Vec::new();
