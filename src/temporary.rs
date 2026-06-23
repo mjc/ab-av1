@@ -2,7 +2,7 @@
 use std::{
     collections::HashMap,
     env, iter,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{LazyLock, Mutex},
 };
 
@@ -19,12 +19,6 @@ pub enum TempKind {
 /// Add a file as temporary so it can be deleted later.
 pub fn add(file: impl Into<PathBuf>, kind: TempKind) {
     TEMPS.lock().unwrap().insert(file.into(), kind);
-}
-
-/// Remove a previously added file so that it won't be deleted later,
-/// if it hasn't already.
-pub fn unadd(file: &Path) -> bool {
-    TEMPS.lock().unwrap().remove(file).is_some()
 }
 
 /// Delete all added temporary files.
