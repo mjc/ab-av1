@@ -281,7 +281,6 @@ pub fn run(
             score: score.clone(),
             xpsnr: min_xpsnr.is_some(),
             xpsnr_opts: xpsnr,
-            temp: Some(temp),
         };
 
         let mut crf_attempts = Vec::new();
@@ -296,7 +295,11 @@ pub fn run(
             };
             args.crf = q_conv.crf(q);
 
-            let mut sample_enc = pin!(sample_encode::run(args.clone(), input_probe.clone()));
+            let mut sample_enc = pin!(sample_encode::run_with_workspace(
+                args.clone(),
+                input_probe.clone(),
+                Some(temp.clone()),
+            ));
             let mut sample_enc_output = None;
             while let Some(update) = sample_enc.next().await {
                 match update? {

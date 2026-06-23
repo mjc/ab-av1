@@ -77,10 +77,6 @@ pub struct Args {
     /// Calculate a XPSNR score instead of VMAF.
     #[arg(long)]
     pub xpsnr: bool,
-
-    /// Shared temporary workspace, used by callers that run sample-encode repeatedly.
-    #[arg(skip)]
-    pub temp: Option<temporary::SharedWorkspace>,
 }
 
 pub async fn sample_encode(mut args: Args) -> anyhow::Result<()> {
@@ -143,7 +139,11 @@ pub async fn sample_encode(mut args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(
+pub fn run(args: Args, input_probe: Arc<Ffprobe>) -> impl Stream<Item = anyhow::Result<Update>> {
+    run_with_workspace(args, input_probe, None)
+}
+
+pub fn run_with_workspace(
     Args {
         args,
         crf,
@@ -154,9 +154,9 @@ pub fn run(
         score,
         xpsnr,
         xpsnr_opts,
-        temp,
     }: Args,
     input_probe: Arc<Ffprobe>,
+    temp: Option<temporary::SharedWorkspace>,
 ) -> impl Stream<Item = anyhow::Result<Update>> {
     async_stream::try_stream! {
         let input = Arc::new(args.input.clone());
