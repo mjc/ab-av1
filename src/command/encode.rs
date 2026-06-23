@@ -76,9 +76,6 @@ pub async fn run(
          Pass in `--overwrite-input` to allow this."
     );
 
-    // output is temporary until encoding has completed successfully
-    temporary::add(&output, TempKind::NotKeepable);
-
     if defaulting_output {
         let out = shell_escape::escape(output.display().to_string().into());
         bar.println(style!("Encoding {out}").dim().to_string());
@@ -104,6 +101,7 @@ pub async fn run(
         output.file_name().and_then(|n| n.to_str()).unwrap_or("")
     );
 
+    let output_cleanup = OutputCleanup::arm(&output);
     let mut enc = ffmpeg::encode(enc_args, &output, has_audio, audio_codec, stereo_downmix)?;
     let mut logger = ProgressLogger::new(module_path!(), Instant::now());
     let mut stream_sizes = None;
@@ -129,8 +127,7 @@ pub async fn run(
     enc.wait().await?; // ensure process has exited
     bar.finish();
 
-    // successful encode, so don't delete it!
-    temporary::unadd(&output);
+    output_cleanup.commit();
 
     // print output info
     let output_size = fs::metadata(&output).await?.len();
@@ -180,4 +177,183 @@ pub fn default_output_name(input: &Path, encoder: &Encoder, is_image: bool) -> P
     let pre = ffmpeg::pre_extension_name(encoder.as_str());
     let ext = default_output_ext(input, encoder, is_image);
     input.with_extension(format!("{pre}.{ext}"))
+}
+
+struct OutputCleanup {
+    path: PathBuf,
+}
+
+impl OutputCleanup {
+    fn arm(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_owned();
+        // From this point on ffmpeg may create or partially write the output,
+        // so clean it up on failure.
+        temporary::add(&path, TempKind::NotKeepable);
+        Self { path }
+    }
+
+    fn commit(self) {
+        // Successful encode: the output is user-owned, so don't delete it.
+        temporary::unadd(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{str::FromStr, sync::LazyLock};
+
+    static TEST_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(<_>::default);
+
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn test_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ab-av1-{}-{name}", std::process::id(),));
+        path
+    }
+
+    fn test_probe() -> Ffprobe {
+        Ffprobe {
+            duration: Ok(Duration::from_secs(1)),
+            has_audio: true,
+            max_audio_channels: Some(6),
+            fps: Ok(24.0),
+            resolution: Some((1920, 1080)),
+            is_image: false,
+            pix_fmt: None,
+        }
+    }
+
+    fn encode_args(input: PathBuf, output: PathBuf) -> Args {
+        Args {
+            args: args::Encode {
+                encoder: Encoder::from_str("libsvtav1").expect("encoder"),
+                input,
+                vfilter: None,
+                pix_format: None,
+                preset: None,
+                keyint: None,
+                scd: None,
+                svt_args: Vec::new(),
+                enc_args: Vec::new(),
+                enc_input_args: Vec::new(),
+            },
+            crf: 32.0,
+            encode: args::EncodeToOutput {
+                output: Some(output),
+                audio_codec: Some("copy".into()),
+                downmix_to_stereo: true,
+                video_only: false,
+                overwrite_input: false,
+            },
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_output_cleanup_does_not_delete_output() {
+        let _guard = test_guard();
+        temporary::clean_all().await;
+
+        let output = test_path("committed-output.mkv");
+        fs::write(&output, b"encoded output")
+            .await
+            .expect("write output");
+
+        OutputCleanup::arm(&output).commit();
+        temporary::clean_all().await;
+
+        assert_eq!(
+            fs::read(&output).await.expect("committed output survives"),
+            b"encoded output"
+        );
+
+        _ = fs::remove_file(output).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn uncommitted_output_cleanup_deletes_partial_output() {
+        let _guard = test_guard();
+        temporary::clean_all().await;
+
+        let output = test_path("partial-output.mkv");
+        fs::write(&output, b"partial output")
+            .await
+            .expect("write partial output");
+
+        _ = OutputCleanup::arm(&output);
+        temporary::clean_all().await;
+
+        assert!(
+            !fs::try_exists(&output).await.expect("check partial output"),
+            "uncommitted partial output should be deleted"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_file_validation_failure_does_not_delete_input() {
+        let _guard = test_guard();
+        temporary::clean_all().await;
+
+        let input = test_path("same-file-input.mkv");
+        fs::write(&input, b"input").await.expect("write input");
+
+        let bar = ProgressBar::hidden();
+        let mut args = encode_args(input.clone(), input.clone());
+        args.encode.audio_codec = None;
+        args.encode.downmix_to_stereo = false;
+
+        let result = run(args, Arc::new(test_probe()), &bar).await;
+        temporary::clean_all().await;
+
+        assert!(
+            result
+                .expect_err("same file validation should fail")
+                .to_string()
+                .contains("Input and Output are specified as the same file")
+        );
+        assert_eq!(fs::read(&input).await.expect("input survives"), b"input");
+
+        _ = fs::remove_file(input).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn validation_failure_does_not_delete_existing_output() {
+        let _guard = test_guard();
+        temporary::clean_all().await;
+
+        let input = test_path("validation-input.mkv");
+        let output = test_path("validation-output.mkv");
+        fs::write(&input, b"input").await.expect("write input");
+        fs::write(&output, b"existing output")
+            .await
+            .expect("write existing output");
+
+        let bar = ProgressBar::hidden();
+        let result = run(
+            encode_args(input.clone(), output.clone()),
+            Arc::new(test_probe()),
+            &bar,
+        )
+        .await;
+        temporary::clean_all().await;
+
+        assert!(
+            result
+                .expect_err("validation should fail")
+                .to_string()
+                .contains("--stereo-downmix cannot be used with --acodec copy")
+        );
+        assert_eq!(
+            fs::read(&output).await.expect("existing output survives"),
+            b"existing output"
+        );
+
+        _ = fs::remove_file(input).await;
+        _ = fs::remove_file(output).await;
+    }
 }
