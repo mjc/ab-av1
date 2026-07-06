@@ -115,19 +115,48 @@ pub(crate) fn build_score_ffmpeg_command(
     filter_complex: &str,
     fps: Option<f32>,
 ) -> Command {
+    let spec = ScoreFfmpegCommand::new(reference, distorted, filter_complex, fps);
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-nostdin")
-        .arg2_opt("-r", fps)
-        .arg2("-i", distorted)
-        .arg2_opt("-r", fps)
-        .arg2("-i", reference)
-        .arg2("-filter_complex", filter_complex)
-        // Workaround unused streams causing ffmpeg memory leaks
-        // See https://github.com/alexheretic/ab-av1/issues/189
-        .suppress_non_video_streams()
-        .arg2("-f", "null")
-        .arg("-");
+    spec.apply(&mut cmd);
     cmd
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScoreFfmpegCommand<'a> {
+    reference: &'a Path,
+    distorted: &'a Path,
+    filter_complex: &'a str,
+    fps: Option<f32>,
+}
+
+impl<'a> ScoreFfmpegCommand<'a> {
+    pub(crate) fn new(
+        reference: &'a Path,
+        distorted: &'a Path,
+        filter_complex: &'a str,
+        fps: Option<f32>,
+    ) -> Self {
+        Self {
+            reference,
+            distorted,
+            filter_complex,
+            fps,
+        }
+    }
+
+    pub(crate) fn apply(self, cmd: &mut Command) {
+        cmd.arg("-nostdin")
+            .arg2_opt("-r", self.fps)
+            .arg2("-i", self.distorted)
+            .arg2_opt("-r", self.fps)
+            .arg2("-i", self.reference)
+            .arg2("-filter_complex", self.filter_complex)
+            // Workaround unused streams causing ffmpeg memory leaks
+            // See https://github.com/alexheretic/ab-av1/issues/189
+            .suppress_non_video_streams()
+            .arg2("-f", "null")
+            .arg("-");
+    }
 }
 
 pub fn run_score_stream<Out>(
@@ -182,6 +211,24 @@ mod tests {
     use super::*;
     use crate::process::CommandExt;
     use std::path::Path;
+
+    #[test]
+    fn score_ffmpeg_command_spec_applies_borrowed_args() {
+        let spec = ScoreFfmpegCommand::new(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[0:v][1:v]score",
+            Some(25.0),
+        );
+        let mut cmd = Command::new("ffmpeg");
+
+        spec.apply(&mut cmd);
+
+        let cmd_str = cmd.to_cmd_str();
+        assert!(cmd_str.contains("ref.mkv"));
+        assert!(cmd_str.contains("dist.mkv"));
+        assert!(cmd_str.contains("[0:v][1:v]score"));
+    }
 
     #[test]
     fn build_score_ffmpeg_command_distorted_input_is_stream_zero() {
