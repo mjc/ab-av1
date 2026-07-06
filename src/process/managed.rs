@@ -882,8 +882,7 @@ mod tests {
     async fn terminate_on_drop_stderr_stream_yields_replay_gap_for_delayed_subscriber() {
         // setup
         let cmd = fixture_command("vmaf-progress-score");
-        let process =
-            ManagedProcess::spawn("replay gap fixture", cmd).expect("spawn fixture");
+        let process = ManagedProcess::spawn("replay gap fixture", cmd).expect("spawn fixture");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut events = Box::pin(process.terminate_on_drop().stderr_events());
 

@@ -27,7 +27,6 @@ mod tests {
 
     use proptest::prelude::*;
     use rstest::rstest;
-    use test_case::test_case;
 
     mod proptest_terse_f32 {
         use super::*;
@@ -50,48 +49,13 @@ mod tests {
     #[rstest]
     #[case(1.0, "1")]
     #[case(1.5, "1.5")]
-    fn terse_f32_display_rstest(#[case] value: f32, #[case] expected: &str) {
-        // setup
-        let terse = TerseF32(value);
-
-        // execute
-        let formatted = format!("{terse}");
-
-        // assert
-        assert_eq!(formatted, expected);
-    }
-
-    // ab-kgc.68: values just below 1.0 must not display as integer 1
-    #[test_case(0.9999, "0.9999"; "just_below_one")]
-    #[test_case(0.999, "0.999"; "three_nines")]
-    fn terse_f32_near_one_preserves_fractional_part(value: f32, expected: &str) {
-        // setup
-        let terse = TerseF32(value);
-
-        // execute
-        let formatted = format!("{terse}");
-
-        // assert
-        assert_eq!(formatted, expected);
-    }
-
-    // ab-kgc.69: negative CRF/score displays must preserve sign
-    #[test_case(-1.5, "-1.5"; "negative_half")]
-    #[test_case(-0.25, "-0.25"; "negative_quarter")]
-    fn terse_f32_negative_values_keep_sign(value: f32, expected: &str) {
-        // setup
-        let terse = TerseF32(value);
-
-        // execute
-        let formatted = format!("{terse}");
-
-        // assert
-        assert_eq!(formatted, expected);
-    }
-
-    #[test_case(2.0, "2"; "integer")]
-    #[test_case(2.25, "2.25"; "two decimals")]
-    fn terse_f32_display_test_case(value: f32, expected: &str) {
+    #[case(2.0, "2")]
+    #[case(2.25, "2.25")]
+    #[case(0.9999, "0.9999")] // ab-kgc.68: just below 1.0 must not display as integer 1
+    #[case(0.999, "0.999")]
+    #[case(-1.5, "-1.5")] // ab-kgc.69: negative values must preserve sign
+    #[case(-0.25, "-0.25")]
+    fn terse_f32_display(#[case] value: f32, #[case] expected: &str) {
         // setup
         let terse = TerseF32(value);
 

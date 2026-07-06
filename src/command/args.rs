@@ -154,7 +154,11 @@ mod tests {
     use rstest::rstest;
     use std::{path::Path, time::Duration};
 
-    fn sample_args(samples: Option<u64>, min_samples: Option<u64>, sample_every: Duration) -> Sample {
+    fn sample_args(
+        samples: Option<u64>,
+        min_samples: Option<u64>,
+        sample_every: Duration,
+    ) -> Sample {
         Sample {
             samples,
             sample_every,

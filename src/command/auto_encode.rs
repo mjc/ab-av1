@@ -376,7 +376,9 @@ mod tests {
         let args = auto_args(input.clone(), Some(input.clone()), false);
 
         // execute
-        let err = auto_encode(args).await.expect_err("expected same-file error");
+        let err = auto_encode(args)
+            .await
+            .expect_err("expected same-file error");
 
         // assert
         assert!(err.to_string().contains("same file"));

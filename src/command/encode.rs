@@ -352,10 +352,8 @@ mod tests {
     async fn run_cleans_temp_output_after_encode_failure() {
         // setup
         let input = temp_input("encode-fail");
-        let output = env::temp_dir().join(format!(
-            "ab-av1-encode-fail-out-{}.mkv",
-            std::process::id()
-        ));
+        let output =
+            env::temp_dir().join(format!("ab-av1-encode-fail-out-{}.mkv", std::process::id()));
         let args = encode_args(input.clone(), Some(output.clone()));
         let bar = ProgressBar::new(1);
         let _guard = FixtureGuard::set("stderr-badness-exit-7");
@@ -446,10 +444,8 @@ mod tests {
     async fn run_completes_with_video_only_and_downmix() {
         // setup
         let input = temp_input("video-only-downmix");
-        let output = env::temp_dir().join(format!(
-            "ab-av1-encode-vo-out-{}.mkv",
-            std::process::id()
-        ));
+        let output =
+            env::temp_dir().join(format!("ab-av1-encode-vo-out-{}.mkv", std::process::id()));
         let mut args = encode_args(input.clone(), Some(output.clone()));
         args.encode.video_only = true;
         args.encode.downmix_to_stereo = true;

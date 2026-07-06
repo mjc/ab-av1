@@ -515,9 +515,7 @@ fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr: bo
     let worse_score = output_search_score(&worse_q.enc, use_xpsnr);
     let better_score = output_search_score(&better_q.enc, use_xpsnr);
     assert!(
-        worse_score <= min_vmaf
-            && worse_score < better_score
-            && worse_q.q > better_q.q,
+        worse_score <= min_vmaf && worse_score < better_score && worse_q.q > better_q.q,
         "invalid vmaf_lerp_crf usage: ({min_vmaf}, {worse_q:?}, {better_q:?})"
     );
 
@@ -641,8 +639,8 @@ pub enum Update {
 #[cfg(test)]
 mod crf_search_tests {
     use super::{
-        test_hooks, Args, Error, Update, output_search_score, guess_progress, vmaf_lerp_q, run,
-        Sample,
+        Args, Error, Sample, Update, guess_progress, output_search_score, run, test_hooks,
+        vmaf_lerp_q,
     };
     use crate::{
         command::{
@@ -653,7 +651,12 @@ mod crf_search_tests {
     };
     use futures_util::StreamExt;
     use rstest::rstest;
-    use std::{path::PathBuf, pin::pin, sync::{Arc, Mutex}, time::Duration};
+    use std::{
+        path::PathBuf,
+        pin::pin,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     mod helpers {
         use super::*;
@@ -837,7 +840,9 @@ mod crf_search_tests {
         let _guard = MockGuard::set(move |_crf| mock_output(Some(80.0), None, 50.0));
 
         // execute
-        let err = collect_run(args, test_probe()).await.expect_err("expected failure");
+        let err = collect_run(args, test_probe())
+            .await
+            .expect_err("expected failure");
 
         // assert
         assert!(matches!(err, Error::NoGoodCrf { .. }));
@@ -866,11 +871,7 @@ mod crf_search_tests {
     #[case::above_threshold(96.0, 95.0, true)]
     #[case::below_threshold(94.9, 95.0, false)]
     #[case::within_thorough_tolerance(95.03, 95.0, true)]
-    fn threshold_success_matrix(
-        #[case] score: f32,
-        #[case] min: f32,
-        #[case] should_pass: bool,
-    ) {
+    fn threshold_success_matrix(#[case] score: f32, #[case] min: f32, #[case] should_pass: bool) {
         // execute / assert
         assert_eq!(score >= min, should_pass || score > min);
         if should_pass {
@@ -1152,7 +1153,9 @@ mod crf_search_tests {
             mock_output(Some(vmaf), None, pct)
         });
 
-        let err = collect_run(args, test_probe()).await.expect_err("oversized good score at max");
+        let err = collect_run(args, test_probe())
+            .await
+            .expect_err("oversized good score at max");
         assert!(matches!(err, Error::NoGoodCrf { .. }));
     }
 

@@ -85,8 +85,7 @@ fn apply_copy_args(
     dest: &Path,
     genpts: bool,
 ) {
-    cmd.arg("-nostdin")
-        .arg("-y");
+    cmd.arg("-nostdin").arg("-y");
     if genpts {
         cmd.arg2("-fflags", "+genpts");
     }

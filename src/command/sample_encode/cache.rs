@@ -162,11 +162,12 @@ mod tests {
     use super::*;
     use crate::command::args::{PixelFormat, ScoreArgs, Vmaf, Xpsnr};
     use crate::ffmpeg::FfmpegEncodeArgs;
-    use rstest::rstest;
     use std::{path::Path, sync::Arc, time::Duration};
 
     mod helpers {
         use super::*;
+
+        use std::ffi::OsStr;
 
         pub fn minimal_enc_args(input: &Path) -> FfmpegEncodeArgs<'_> {
             FfmpegEncodeArgs {
@@ -194,9 +195,27 @@ mod tests {
                 },
             )
         }
+
+        pub fn standard_key_inputs() -> (
+            &'static Path,
+            &'static Path,
+            Option<&'static OsStr>,
+            u64,
+            Duration,
+            (ScoreArgs, Vmaf, Xpsnr),
+        ) {
+            (
+                Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv"),
+                Path::new("/movies/a/clip.mkv"),
+                Some(OsStr::new("mkv")),
+                1_000_000_u64,
+                Duration::from_secs(3600),
+                default_scoring(),
+            )
+        }
     }
 
-    use helpers::{default_scoring, minimal_enc_args};
+    use helpers::{default_scoring, minimal_enc_args, standard_key_inputs};
 
     #[test]
     fn distinct_source_inputs_do_not_share_cache_keys_ab_kgc_3() {
@@ -212,24 +231,10 @@ mod tests {
 
         // execute
         let key_a = encode_cache_key(
-            sample,
-            input_a,
-            duration,
-            extension,
-            size,
-            false,
-            &enc,
-            &scoring,
+            sample, input_a, duration, extension, size, false, &enc, &scoring,
         );
         let key_b = encode_cache_key(
-            sample,
-            input_b,
-            duration,
-            extension,
-            size,
-            false,
-            &enc,
-            &scoring,
+            sample, input_b, duration, extension, size, false, &enc, &scoring,
         );
 
         // assert
@@ -252,28 +257,17 @@ mod tests {
 
         // execute
         let key_a = encode_cache_key(
-            sample,
-            input,
-            duration,
-            extension,
-            size,
-            false,
-            &enc,
-            &scoring,
+            sample, input, duration, extension, size, false, &enc, &scoring,
         );
         let key_b = encode_cache_key(
-            sample,
-            input,
-            duration,
-            extension,
-            size,
-            false,
-            &enc,
-            &scoring,
+            sample, input, duration, extension, size, false, &enc, &scoring,
         );
 
         // assert
-        assert_eq!(key_a, key_b, "identical work must produce stable cache keys");
+        assert_eq!(
+            key_a, key_b,
+            "identical work must produce stable cache keys"
+        );
     }
 
     #[test]
@@ -295,69 +289,81 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[case::crf_change(30.0, 31.0)]
-    #[case::crf_fraction(30.0, 30.5)]
-    fn crf_change_alters_cache_key(#[case] crf_a: f32, #[case] crf_b: f32) {
+    #[test]
+    fn encode_cache_key_varies_with_crf_full_pass_and_duration() {
         // setup
-        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
-        let input = Path::new("/movies/a/clip.mkv");
-        let duration = Duration::from_secs(3600);
-        let extension = Some(std::ffi::OsStr::new("mkv"));
-        let size = 1_000_000_u64;
-        let scoring = default_scoring();
-
-        let mut enc_a = minimal_enc_args(input);
-        enc_a.crf = crf_a;
-        let mut enc_b = minimal_enc_args(input);
-        enc_b.crf = crf_b;
-
-        // execute
-        let key_a = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc_a, &scoring,
-        );
-        let key_b = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc_b, &scoring,
-        );
-
-        // assert
-        assert_ne!(key_a, key_b, "crf change must alter cache key");
-    }
-
-    #[rstest]
-    #[case(true, false)]
-    #[case(false, true)]
-    fn full_pass_flag_alters_cache_key(#[case] full_pass_a: bool, #[case] full_pass_b: bool) {
-        // setup
-        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
-        let input = Path::new("/movies/a/clip.mkv");
-        let duration = Duration::from_secs(3600);
-        let extension = Some(std::ffi::OsStr::new("mkv"));
-        let size = 1_000_000_u64;
+        let (sample, input, extension, size, duration, scoring) = standard_key_inputs();
         let enc = minimal_enc_args(input);
-        let scoring = default_scoring();
 
-        // execute
-        let key_a = encode_cache_key(
-            sample, input, duration, extension, size, full_pass_a, &enc, &scoring,
+        // execute — crf
+        let mut enc_crf_a = enc.clone();
+        enc_crf_a.crf = 30.0;
+        let mut enc_crf_b = enc.clone();
+        enc_crf_b.crf = 31.0;
+        let mut enc_crf_frac = enc.clone();
+        enc_crf_frac.crf = 30.5;
+        let key_crf_a = encode_cache_key(
+            sample, input, duration, extension, size, false, &enc_crf_a, &scoring,
         );
-        let key_b = encode_cache_key(
-            sample, input, duration, extension, size, full_pass_b, &enc, &scoring,
+        let key_crf_b = encode_cache_key(
+            sample, input, duration, extension, size, false, &enc_crf_b, &scoring,
+        );
+        let key_crf_frac = encode_cache_key(
+            sample,
+            input,
+            duration,
+            extension,
+            size,
+            false,
+            &enc_crf_frac,
+            &scoring,
+        );
+
+        // execute — full_pass flag
+        let key_full_pass_false = encode_cache_key(
+            sample, input, duration, extension, size, false, &enc, &scoring,
+        );
+        let key_full_pass_true = encode_cache_key(
+            sample, input, duration, extension, size, true, &enc, &scoring,
+        );
+
+        // execute — input duration
+        let key_duration_a = encode_cache_key(
+            sample,
+            input,
+            Duration::from_secs(100),
+            extension,
+            size,
+            false,
+            &enc,
+            &scoring,
+        );
+        let key_duration_b = encode_cache_key(
+            sample,
+            input,
+            Duration::from_secs(200),
+            extension,
+            size,
+            false,
+            &enc,
+            &scoring,
         );
 
         // assert
-        assert_ne!(key_a, key_b);
+        assert_ne!(key_crf_a, key_crf_b, "crf change must alter cache key");
+        assert_ne!(
+            key_crf_a, key_crf_frac,
+            "fractional crf must alter cache key"
+        );
+        assert_ne!(key_full_pass_false, key_full_pass_true);
+        assert_ne!(key_duration_a, key_duration_b);
     }
 
     // ab-kgc.21: xpsnr_pix_format must affect cache key
     #[test]
     fn xpsnr_pix_format_alters_cache_key() {
         // setup
-        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
-        let input = Path::new("/movies/a/clip.mkv");
-        let duration = Duration::from_secs(3600);
-        let extension = Some(std::ffi::OsStr::new("mkv"));
-        let size = 1_000_000_u64;
+        let (sample, input, extension, size, duration, _) = standard_key_inputs();
         let enc = minimal_enc_args(input);
         let scoring_420p = (
             ScoreArgs {
@@ -382,10 +388,24 @@ mod tests {
 
         // execute
         let key_420p = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc, &scoring_420p,
+            sample,
+            input,
+            duration,
+            extension,
+            size,
+            false,
+            &enc,
+            &scoring_420p,
         );
         let key_420p10 = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc, &scoring_420p10,
+            sample,
+            input,
+            duration,
+            extension,
+            size,
+            false,
+            &enc,
+            &scoring_420p10,
         );
 
         // assert
@@ -478,42 +498,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn duration_change_alters_cache_key() {
-        // setup
-        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
-        let input = Path::new("/movies/a/clip.mkv");
-        let extension = Some(std::ffi::OsStr::new("mkv"));
-        let size = 1_000_000_u64;
-        let enc = minimal_enc_args(input);
-        let scoring = default_scoring();
-
-        // execute
-        let key_a = encode_cache_key(
-            sample,
-            input,
-            Duration::from_secs(100),
-            extension,
-            size,
-            false,
-            &enc,
-            &scoring,
-        );
-        let key_b = encode_cache_key(
-            sample,
-            input,
-            Duration::from_secs(200),
-            extension,
-            size,
-            false,
-            &enc,
-            &scoring,
-        );
-
-        // assert
-        assert_ne!(key_a, key_b);
-    }
-
     /// Mirror production `cached_encode` scoring hash input: `(ScoreArgs, Vmaf, Xpsnr)`.
     fn production_cache_key(
         sample: &Path,
@@ -535,60 +519,42 @@ mod tests {
         )
     }
 
-    // ab-kgc.46: --xpsnr flag must affect cache key (vmaf-only vs xpsnr-only)
+    // ab-kgc.46–54: scoring mode must affect cache key
     #[test]
-    fn xpsnr_cli_flag_must_alter_cache_key() {
-        // setup — production hashes (ScoreArgs, Vmaf, Xpsnr) but not the --xpsnr bool
-        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
-        let input = Path::new("/movies/a/clip.mkv");
+    fn xpsnr_scoring_mode_must_alter_cache_key() {
+        // setup — shared production tuple inputs
+        let (sample, input, _, _, _, _) = standard_key_inputs();
         let enc = minimal_enc_args(input);
         let score = ScoreArgs {
             reference_vfilter: None,
         };
-        let vmaf = Vmaf::default();
         let xpsnr_opts = Xpsnr {
             xpsnr_fps: 60.0,
             xpsnr_pix_format: None,
         };
 
-        // execute — keys for vmaf-only vs xpsnr-only scoring modes
+        // execute — ab-kgc.46: vmaf-only vs xpsnr-only (bool omitted from hash today)
+        let vmaf = Vmaf::default();
         let key_vmaf_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
-        // xpsnr-only would use the same tuple today; bool is omitted from the hash
         let key_xpsnr_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
 
-        // assert — distinct scoring modes must not share cache entries
+        // execute — ab-kgc.54: vmaf-only vs xpsnr+and_vmaf
+        let vmaf_and = Vmaf {
+            and_vmaf: Some(true),
+            ..Vmaf::default()
+        };
+        let key_vmaf_and_only =
+            production_cache_key(sample, input, &enc, &score, &vmaf_and, &xpsnr_opts);
+        let key_vmaf_and_both =
+            production_cache_key(sample, input, &enc, &score, &vmaf_and, &xpsnr_opts);
+
+        // assert
         assert_ne!(
             key_vmaf_only, key_xpsnr_only,
             "--xpsnr flag must be part of the sample-encode cache key"
         );
-    }
-
-    // ab-kgc.54: xpsnr+and_vmaf vs vmaf-only must not share cache keys
-    #[test]
-    fn xpsnr_and_vmaf_mode_must_alter_cache_key() {
-        // setup — and_vmaf=true with xpsnr=false runs VMAF only; with xpsnr=true runs both
-        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
-        let input = Path::new("/movies/a/clip.mkv");
-        let enc = minimal_enc_args(input);
-        let score = ScoreArgs {
-            reference_vfilter: None,
-        };
-        let vmaf = Vmaf {
-            and_vmaf: Some(true),
-            ..Vmaf::default()
-        };
-        let xpsnr_opts = Xpsnr {
-            xpsnr_fps: 60.0,
-            xpsnr_pix_format: None,
-        };
-
-        // execute
-        let key_vmaf_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
-        let key_both = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
-
-        // assert
         assert_ne!(
-            key_vmaf_only, key_both,
+            key_vmaf_and_only, key_vmaf_and_both,
             "xpsnr scoring mode must alter cache key when --and-vmaf is set"
         );
     }

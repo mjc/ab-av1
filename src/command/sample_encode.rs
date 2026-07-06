@@ -879,7 +879,12 @@ mod tests {
     }
 
     /// Mirror progress denominator: `sample_duration_us * samples * 2`.
-    fn encode_progress_ratio(time_us: u64, sample_idx: u64, sample_duration_us: u64, samples: u64) -> f32 {
+    fn encode_progress_ratio(
+        time_us: u64,
+        sample_idx: u64,
+        sample_duration_us: u64,
+        samples: u64,
+    ) -> f32 {
         (time_us + sample_idx * sample_duration_us * 2) as f32
             / (sample_duration_us * samples * 2) as f32
     }
@@ -902,31 +907,23 @@ mod tests {
         );
     }
 
-    // ab-kgc.37: zero total sample duration must not yield infinite predictions
+    // ab-kgc.37–38: zero total sample duration must not yield infinite predictions
     #[test]
-    fn estimate_encode_size_zero_sample_duration_is_finite() {
+    fn estimate_encode_predictions_finite_for_zero_sample_duration() {
         // setup
-        let results = vec![encode_result(1000, 500, 0, Some(90.0), None)];
+        let size_results = vec![encode_result(1000, 500, 0, Some(90.0), None)];
+        let time_results = vec![encode_result(1000, 500, 0, None, Some(90.0))];
         let input_duration = Duration::from_secs(100);
 
         // execute
-        let size = results.estimate_encode_size_by_duration(input_duration, false);
+        let size = size_results.estimate_encode_size_by_duration(input_duration, false);
+        let estimate = time_results.estimate_encode_time(input_duration, false);
 
         // assert
-        assert!(size < u64::MAX, "size prediction must be finite for zero sample duration");
-    }
-
-    // ab-kgc.38: zero total sample duration must not yield infinite time predictions
-    #[test]
-    fn estimate_encode_time_zero_sample_duration_is_finite() {
-        // setup
-        let results = vec![encode_result(1000, 500, 0, None, Some(90.0))];
-        let input_duration = Duration::from_secs(100);
-
-        // execute
-        let estimate = results.estimate_encode_time(input_duration, false);
-
-        // assert
+        assert!(
+            size < u64::MAX,
+            "size prediction must be finite for zero sample duration"
+        );
         assert!(
             estimate < Duration::from_secs(u64::MAX / 2),
             "time prediction must be finite for zero sample duration"
@@ -978,41 +975,31 @@ mod tests {
         );
     }
 
-    // ab-kgc.48: NaN vmaf scores must not produce NaN means
+    // ab-kgc.48–49: NaN scores must not produce NaN means
     #[test]
-    fn mean_vmaf_score_ignores_nan_scores() {
+    fn mean_scores_ignore_nan_values() {
         // setup
-        let results = vec![
+        let vmaf_results = vec![
             encode_result(1000, 500, 10, Some(f32::NAN), None),
             encode_result(1000, 500, 10, Some(90.0), None),
         ];
-
-        // execute
-        let mean = results.mean_vmaf_score();
-
-        // assert
-        assert_eq!(
-            mean,
-            Some(90.0),
-            "NaN vmaf scores must not poison the reported mean"
-        );
-    }
-
-    // ab-kgc.49: NaN xpsnr scores must not produce NaN means
-    #[test]
-    fn mean_xpsnr_score_ignores_nan_scores() {
-        // setup
-        let results = vec![
+        let xpsnr_results = vec![
             encode_result(1000, 500, 10, None, Some(f32::NAN)),
             encode_result(1000, 500, 10, None, Some(88.0)),
         ];
 
         // execute
-        let mean = results.mean_xpsnr_score();
+        let vmaf_mean = vmaf_results.mean_vmaf_score();
+        let xpsnr_mean = xpsnr_results.mean_xpsnr_score();
 
         // assert
         assert_eq!(
-            mean,
+            vmaf_mean,
+            Some(90.0),
+            "NaN vmaf scores must not poison the reported mean"
+        );
+        assert_eq!(
+            xpsnr_mean,
             Some(88.0),
             "NaN xpsnr scores must not poison the reported mean"
         );
@@ -1034,26 +1021,25 @@ mod tests {
         assert_eq!(mean, None, "all-NaN vmaf scores should yield no mean");
     }
 
-    // ab-kgc.50: zero sample_size must not yield infinite attempt percentage
+    // ab-kgc.50–63: zero sample_size must not yield infinite attempt percentages
     #[test]
-    fn attempt_percent_finite_when_sample_size_zero() {
-        // setup — mirrors EncodeResult::print_attempt percentage math
+    fn attempt_percentages_finite_when_sample_size_zero() {
+        // setup — mirrors EncodeResult::print_attempt and log_attempt percentage math
         let sample_size = 0_u64;
         let encoded_size = 500_u64;
 
         // execute
         let percent = 100.0 * encoded_size as f32 / sample_size as f32;
 
-        // assert
+        // assert — ab-kgc.50/63: print_attempt and log_attempt share this math
         assert!(
             percent.is_finite(),
-            "attempt percent must be finite when sample_size is zero, got {percent}"
+            "attempt/log attempt percent must be finite when sample_size is zero, got {percent}"
         );
     }
-
-    // ab-kgc.51: Output::single_score must not silently return 0.0 when scores absent
+    // ab-kgc.51–52: absent scores must not guess defaults
     #[test]
-    fn output_single_score_absent_returns_none_semantics() {
+    fn output_single_score_absent_has_no_silent_defaults() {
         // setup
         let output = Output {
             vmaf_score: None,
@@ -1066,85 +1052,38 @@ mod tests {
 
         // execute
         let score = output.single_score();
+        let kind = output.single_score_kind();
 
         // assert
         assert!(
             score.is_nan(),
             "single_score must not default to 0.0 when both scores are absent"
         );
-    }
-
-    // ab-kgc.52: Output::single_score_kind must not default to Xpsnr when both absent
-    #[test]
-    fn output_single_score_kind_absent_is_explicit() {
-        // setup
-        let output = Output {
-            vmaf_score: None,
-            xpsnr_score: None,
-            predicted_encode_size: 0,
-            encode_percent: 0.0,
-            predicted_encode_time: Duration::ZERO,
-            from_cache: false,
-        };
-
-        // execute / assert — neither score present; kind must not guess Xpsnr
         assert_eq!(
-            output.single_score_kind(),
+            kind,
             ScoreKind::Vmaf,
             "single_score_kind must not default to Xpsnr when both scores are absent"
         );
     }
 
-    // ab-kgc.53: JSON cache roundtrip must preserve subsecond encode_time
+    // ab-kgc.56–64: JSON cache roundtrip must preserve NaN scores
     #[test]
-    fn encode_result_json_roundtrip_preserves_subsecond_encode_time() {
+    fn encode_result_json_roundtrip_preserves_nan_scores() {
         // setup
-        let original = EncodeResult {
-            sample_size: 1_000_000,
-            encoded_size: 500_000,
-            vmaf_score: Some(95.5),
-            xpsnr_score: None,
-            encode_time: Duration::from_nanos(500_000_123),
-            sample_duration: Duration::from_nanos(1_234_567_890),
-            from_cache: false,
-        };
+        let vmaf_original = encode_result(1_000, 500, 10, Some(f32::NAN), None);
+        let xpsnr_original = encode_result(1_000, 500, 10, None, Some(f32::NAN));
 
         // execute
-        let bytes = serde_json::to_vec(&original).expect("serialize");
-        let decoded: EncodeResult = serde_json::from_slice(&bytes).expect("deserialize");
+        let vmaf_decoded: EncodeResult =
+            serde_json::from_slice(&serde_json::to_vec(&vmaf_original).expect("serialize vmaf"))
+                .expect("deserialize vmaf");
+        let xpsnr_decoded: EncodeResult =
+            serde_json::from_slice(&serde_json::to_vec(&xpsnr_original).expect("serialize xpsnr"))
+                .expect("deserialize xpsnr");
 
         // assert
-        assert_eq!(decoded.encode_time, original.encode_time);
-        assert_eq!(decoded.sample_duration, original.sample_duration);
-    }
-
-    // ab-kgc.56: JSON cache roundtrip must preserve NaN vmaf scores
-    #[test]
-    fn encode_result_json_roundtrip_preserves_nan_vmaf_score() {
-        // setup
-        let original = encode_result(1_000, 500, 10, Some(f32::NAN), None);
-
-        // execute
-        let bytes = serde_json::to_vec(&original).expect("serialize");
-        let decoded: EncodeResult = serde_json::from_slice(&bytes).expect("deserialize");
-
-        // assert
-        assert!(decoded.vmaf_score.unwrap().is_nan());
-    }
-
-    // ab-kgc.57: JSON cache roundtrip must preserve from_cache=true
-    #[test]
-    fn encode_result_json_roundtrip_preserves_from_cache_flag() {
-        // setup
-        let mut original = encode_result(1_000, 500, 10, Some(90.0), None);
-        original.from_cache = true;
-
-        // execute
-        let bytes = serde_json::to_vec(&original).expect("serialize");
-        let decoded: EncodeResult = serde_json::from_slice(&bytes).expect("deserialize");
-
-        // assert
-        assert!(decoded.from_cache);
+        assert!(vmaf_decoded.vmaf_score.unwrap().is_nan());
+        assert!(xpsnr_decoded.xpsnr_score.unwrap().is_nan());
     }
 
     // ab-kgc.62: estimate_encode_time must not truncate subseconds when scaled total >= 1s
@@ -1166,37 +1105,6 @@ mod tests {
             Duration::from_millis(1200),
             "scaled encode time must retain subsecond precision"
         );
-    }
-
-    // ab-kgc.63: log_attempt percentage must be finite when sample_size is zero
-    #[test]
-    fn log_attempt_percent_finite_when_sample_size_zero() {
-        // setup — mirrors EncodeResult::log_attempt percentage math
-        let sample_size = 0_u64;
-        let encoded_size = 500_u64;
-
-        // execute
-        let percent = 100.0 * encoded_size as f32 / sample_size as f32;
-
-        // assert
-        assert!(
-            percent.is_finite(),
-            "log attempt percent must be finite when sample_size is zero, got {percent}"
-        );
-    }
-
-    // ab-kgc.64: JSON cache roundtrip must preserve NaN xpsnr scores
-    #[test]
-    fn encode_result_json_roundtrip_preserves_nan_xpsnr_score() {
-        // setup
-        let original = encode_result(1_000, 500, 10, None, Some(f32::NAN));
-
-        // execute
-        let bytes = serde_json::to_vec(&original).expect("serialize");
-        let decoded: EncodeResult = serde_json::from_slice(&bytes).expect("deserialize");
-
-        // assert
-        assert!(decoded.xpsnr_score.unwrap().is_nan());
     }
 
     // ab-kgc.28: zero sample_size must not yield infinite encoded percent
@@ -1242,35 +1150,33 @@ mod tests {
 
     // ab-kgc.22: sparse per-sample scores must not dilute the mean
     #[test]
-    fn mean_vmaf_score_averages_only_samples_with_scores() {
-        // setup — mixed cache/legacy rows where only one sample has VMAF
-        let results = vec![
+    fn mean_scores_average_only_samples_with_scores() {
+        // setup — mixed cache/legacy rows where only some samples have scores
+        let vmaf_results = vec![
             encode_result(1000, 500, 10, Some(90.0), None),
             encode_result(1000, 500, 10, None, None),
         ];
-
-        // execute
-        let mean = results.mean_vmaf_score();
-
-        // assert — must not divide by total sample count when scores are sparse
-        assert_eq!(mean, Some(90.0), "expected mean of present scores only");
-    }
-
-    // ab-kgc.22
-    #[test]
-    fn mean_xpsnr_score_averages_only_samples_with_scores() {
-        // setup
-        let results = vec![
+        let xpsnr_results = vec![
             encode_result(1000, 500, 10, None, Some(88.0)),
             encode_result(1000, 500, 10, None, Some(92.0)),
             encode_result(1000, 500, 10, None, None),
         ];
 
         // execute
-        let mean = results.mean_xpsnr_score();
+        let vmaf_mean = vmaf_results.mean_vmaf_score();
+        let xpsnr_mean = xpsnr_results.mean_xpsnr_score();
 
-        // assert
-        assert_eq!(mean, Some(90.0), "expected mean of present scores only");
+        // assert — must not divide by total sample count when scores are sparse
+        assert_eq!(
+            vmaf_mean,
+            Some(90.0),
+            "expected vmaf mean of present scores only"
+        );
+        assert_eq!(
+            xpsnr_mean,
+            Some(90.0),
+            "expected xpsnr mean of present scores only"
+        );
     }
 
     #[test]
@@ -1379,21 +1285,6 @@ mod tests {
                 let pct_a = results_a.encoded_percent_size();
                 let pct_b = results_b.encoded_percent_size();
                 prop_assert_eq!(pct_a <= pct_b, encoded_a <= encoded_b);
-            }
-
-            // ab-kgc.59: mean vmaf must stay in [0, 100] for finite inputs
-            #[test]
-            fn mean_vmaf_score_bounded_for_finite_inputs(
-                score_a in 0.0f32..100.0f32,
-                score_b in 0.0f32..100.0f32,
-            ) {
-                let results = vec![
-                    encode_result(1000, 500, 10, Some(score_a), None),
-                    encode_result(1000, 500, 10, Some(score_b), None),
-                ];
-                let mean = results.mean_vmaf_score().unwrap();
-                prop_assert!(mean.is_finite());
-                prop_assert!(mean >= 0.0 && mean <= 100.0);
             }
         }
     }

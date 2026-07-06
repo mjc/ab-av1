@@ -68,31 +68,29 @@ mod tests {
     }
 
     #[test]
-    fn ensure_other_ok_when_condition_true() {
-        // setup
+    fn ensure_other_ok_and_err() {
+        // setup (none)
         // execute
-        let result = Error::ensure_other(true, "should not fail");
-        // assert
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn ensure_other_err_when_condition_false() {
-        // setup
-        // execute
+        let ok = Error::ensure_other(true, "should not fail");
         let err = Error::ensure_other(false, "bad state").expect_err("expected error");
+
         // assert
+        assert!(ok.is_ok());
         assert!(matches!(err, Error::Other(_)));
         assert!(err.to_string().contains("bad state"));
     }
 
     #[test]
-    fn ensure_or_no_good_crf_returns_no_good_crf() {
+    fn ensure_or_no_good_crf_ok_and_no_good_crf() {
         // setup
         let last = search_sample(32.0);
+
         // execute
+        let ok = Error::ensure_or_no_good_crf(true, &last);
         let err = Error::ensure_or_no_good_crf(false, &last).expect_err("expected NoGoodCrf");
+
         // assert
+        assert!(ok.is_ok());
         assert!(matches!(err, Error::NoGoodCrf { .. }));
         assert_eq!(err.to_string(), "Failed to find a suitable crf");
     }
@@ -145,14 +143,5 @@ mod tests {
             message.contains("37.5") || message.contains("37"),
             "NoGoodCrf display should mention last crf, got: {message}"
         );
-    }
-
-    #[test]
-    fn ensure_or_no_good_crf_ok_when_condition_true() {
-        // setup
-        let last = search_sample(28.0);
-        // execute
-        // assert
-        assert!(Error::ensure_or_no_good_crf(true, &last).is_ok());
     }
 }

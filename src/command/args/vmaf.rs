@@ -215,10 +215,8 @@ enum VmafModel {
 
 impl VmafModel {
     fn from_args(args: &[Arc<str>]) -> Option<Self> {
-        let mut using_custom_model: Vec<_> = args
-            .iter()
-            .filter(|v| is_vmaf_model_override(v))
-            .collect();
+        let mut using_custom_model: Vec<_> =
+            args.iter().filter(|v| is_vmaf_model_override(v)).collect();
 
         match using_custom_model.len() {
             0 => None,

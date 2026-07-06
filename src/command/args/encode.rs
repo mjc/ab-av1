@@ -588,17 +588,17 @@ fn test_try_parse_fps_vfilter() {
 }
 
 #[test]
-fn frame_interval_from_str() {
+fn keyinterval_from_str_parses_frames_and_duration() {
+    // setup / execute / assert
     use std::str::FromStr;
-    let from_300 = KeyInterval::from_str("300").unwrap();
-    assert_eq!(from_300, KeyInterval::Frames(300));
-}
-
-#[test]
-fn duration_interval_from_str() {
-    use std::{str::FromStr, time::Duration};
-    let from_10s = KeyInterval::from_str("10s").unwrap();
-    assert_eq!(from_10s, KeyInterval::Duration(Duration::from_secs(10)));
+    assert_eq!(
+        KeyInterval::from_str("300").unwrap(),
+        KeyInterval::Frames(300)
+    );
+    assert_eq!(
+        KeyInterval::from_str("10s").unwrap(),
+        KeyInterval::Duration(Duration::from_secs(10))
+    );
 }
 
 /// Should use keyint & scd defaults for >3m inputs.
@@ -931,7 +931,9 @@ fn keyinterval_parse_error_reports_both_failures() {
 fn keyinterval_frames_variant_passthrough() {
     // setup / execute / assert
     assert_eq!(
-        KeyInterval::Frames(240).keyint_number(Ok(30.0)).expect("frames"),
+        KeyInterval::Frames(240)
+            .keyint_number(Ok(30.0))
+            .expect("frames"),
         240
     );
 }
@@ -956,7 +958,10 @@ fn to_ffmpeg_args_rejects_svt_on_non_svtav1() {
         .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
         .expect_err("svt on x264");
     // assert
-    assert!(err.to_string().contains("--svt may only be used with svt-av1"));
+    assert!(
+        err.to_string()
+            .contains("--svt may only be used with svt-av1")
+    );
 }
 
 #[test]
@@ -985,7 +990,11 @@ fn to_ffmpeg_args_libaom_defaults() {
             .windows(2)
             .any(|w| w[0].as_str() == "-b:v" && w[1].as_str() == "0")
     );
-    assert!(args.output_args.iter().all(|a| a.as_str() != "-svtav1-params"));
+    assert!(
+        args.output_args
+            .iter()
+            .all(|a| a.as_str() != "-svtav1-params")
+    );
 }
 
 #[test]
@@ -1049,9 +1058,9 @@ fn to_ffmpeg_args_vaapi_input_defaults() {
             .any(|w| w[0].as_str() == "-hwaccel" && w[1].as_str() == "vaapi")
     );
     assert!(
-        args.input_args.windows(2).any(|w| {
-            w[0].as_str() == "-hwaccel_output_format" && w[1].as_str() == "vaapi"
-        })
+        args.input_args
+            .windows(2)
+            .any(|w| { w[0].as_str() == "-hwaccel_output_format" && w[1].as_str() == "vaapi" })
     );
 }
 
@@ -1126,10 +1135,7 @@ fn to_ffmpeg_args_enc_input_none_disables_vaapi_defaults() {
         scd: None,
         svt_args: vec![],
         enc_args: vec![],
-        enc_input_args: vec![
-            "-hwaccel=none".into(),
-            "-hwaccel_output_format=none".into(),
-        ],
+        enc_input_args: vec!["-hwaccel=none".into(), "-hwaccel_output_format=none".into()],
     };
     // execute
     let args = enc
@@ -1144,9 +1150,9 @@ fn to_ffmpeg_args_enc_input_none_disables_vaapi_defaults() {
 }
 
 #[test]
-fn to_ffmpeg_args_rejects_reserved_output_arg() {
+fn to_ffmpeg_args_rejects_reserved_output_and_input_args() {
     // setup
-    let enc = Encode {
+    let mut enc_output = Encode {
         encoder: Encoder("libx264".into()),
         input: "vid.mp4".into(),
         vfilter: None,
@@ -1158,35 +1164,21 @@ fn to_ffmpeg_args_rejects_reserved_output_arg() {
         enc_args: vec!["-crf=32".into()],
         enc_input_args: vec![],
     };
+    let mut enc_input = enc_output.clone();
+    enc_input.enc_args = vec![];
+    enc_input.enc_input_args = vec!["-preset=fast".into()];
+
     // execute
-    let err = enc
+    let output_err = enc_output
         .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
         .expect_err("reserved -crf");
-    // assert
-    assert!(err.to_string().contains("`-crf` not allowed"));
-}
-
-#[test]
-fn to_ffmpeg_args_rejects_reserved_input_arg() {
-    // setup
-    let enc = Encode {
-        encoder: Encoder("libx264".into()),
-        input: "vid.mp4".into(),
-        vfilter: None,
-        preset: None,
-        pix_format: None,
-        keyint: None,
-        scd: None,
-        svt_args: vec![],
-        enc_args: vec![],
-        enc_input_args: vec!["-preset=fast".into()],
-    };
-    // execute
-    let err = enc
+    let input_err = enc_input
         .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
         .expect_err("reserved -preset");
+
     // assert
-    assert!(err.to_string().contains("`-preset` not allowed"));
+    assert!(output_err.to_string().contains("`-crf` not allowed"));
+    assert!(input_err.to_string().contains("`-preset` not allowed"));
 }
 
 #[test]

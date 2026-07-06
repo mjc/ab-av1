@@ -201,7 +201,10 @@ mod tests {
     mod helpers {
         use super::*;
 
-        pub fn probe_with(fps: Result<f64, ProbeError>, duration: Result<Duration, ProbeError>) -> Ffprobe {
+        pub fn probe_with(
+            fps: Result<f64, ProbeError>,
+            duration: Result<Duration, ProbeError>,
+        ) -> Ffprobe {
             Ffprobe {
                 duration,
                 fps,
@@ -231,19 +234,23 @@ mod tests {
         }
     }
 
-    use helpers::{probe_with, ForceFfprobeError};
+    use helpers::{ForceFfprobeError, probe_with};
 
     #[rstest]
     #[case("30000/1001", 30000.0 / 1001.0)]
     #[case("24/1", 24.0)]
     #[case("24", 24.0)]
     #[case("29.97", 29.97)]
+    #[case("24 / 1", 24.0)] // ab-kgc.91: spaced fraction strings
     fn parse_frame_rate_valid(#[case] input: &str, #[case] expected: f64) {
         // setup
         // execute
         let fps = parse_frame_rate(input).expect("valid frame rate");
         // assert
-        assert!((fps - expected).abs() < 1e-9, "got {fps}, expected {expected}");
+        assert!(
+            (fps - expected).abs() < 1e-9,
+            "got {fps}, expected {expected}"
+        );
     }
 
     #[test_case("0/1", None; "zero numerator")]
@@ -297,10 +304,7 @@ mod tests {
     #[test]
     fn nframes_computes_from_fps_and_duration() {
         // setup
-        let probe = probe_with(
-            Ok(30.0),
-            Ok(Duration::from_secs_f64(10.0)),
-        );
+        let probe = probe_with(Ok(30.0), Ok(Duration::from_secs_f64(10.0)));
         // execute
         let frames = probe.nframes().expect("nframes");
         // assert
@@ -329,57 +333,46 @@ mod tests {
     }
 
     #[test]
-    fn pixel_format_parses_known_pix_fmt() {
+    fn pixel_format_parsing() {
         // setup
         let mut probe = probe_with(Ok(24.0), Ok(Duration::from_secs(1)));
+
+        // execute / assert — known pix_fmt
         probe.pix_fmt = Some("yuv420p10le".into());
-        // execute
-        let pf = probe.pixel_format();
-        // assert
-        assert_eq!(pf, Some(PixelFormat::Yuv420p10le));
-    }
+        assert_eq!(probe.pixel_format(), Some(PixelFormat::Yuv420p10le));
 
-    #[test]
-    fn pixel_format_unknown_returns_none() {
-        // setup
-        let mut probe = probe_with(Ok(24.0), Ok(Duration::from_secs(1)));
+        // execute / assert — unknown pix_fmt
         probe.pix_fmt = Some("rgb24".into());
-        // execute
-        // assert
         assert_eq!(probe.pixel_format(), None);
+
+        // execute / assert — ab-kgc.92: mixed-case pix_fmt strings
+        probe.pix_fmt = Some("YUV420P".into());
+        assert_eq!(probe.pixel_format(), Some(PixelFormat::Yuv420p));
     }
 
     #[test]
-    fn ffprobe_error_fallback_preserves_image_detection() {
-        // setup
-        let is_image = true;
-        let err = "probe failed";
+    fn ffprobe_error_fallback_behavior() {
+        // setup (none)
         // execute
-        let probe = ffprobe_error_fallback(is_image, err);
-        // assert
-        assert!(probe.is_image);
-        assert!(!probe.has_audio);
-        assert!(probe.duration.is_err());
-        assert!(probe.fps.is_err());
-    }
+        let image_probe = ffprobe_error_fallback(true, "probe failed");
+        let video_probe = ffprobe_error_fallback(false, "missing ffprobe");
 
-    #[test]
-    fn ffprobe_error_fallback_uses_conservative_audio_metadata() {
-        // setup
-        // execute
-        let probe = ffprobe_error_fallback(false, "missing ffprobe");
-        // assert
-        assert!(!probe.has_audio);
-        assert_eq!(probe.max_audio_channels, None);
+        // assert — image detection preserved on failure
+        assert!(image_probe.is_image);
+        assert!(!image_probe.has_audio);
+        assert!(image_probe.duration.is_err());
+        assert!(image_probe.fps.is_err());
+
+        // assert — conservative audio metadata when not an image
+        assert!(!video_probe.has_audio);
+        assert_eq!(video_probe.max_audio_channels, None);
     }
 
     #[test]
     fn probe_preserves_image_detection_when_ffprobe_fails() {
         // setup: image header on disk + test seam forces ffprobe failure.
-        let path = std::env::temp_dir().join(format!(
-            "ab-av1-probe-fallback-{}.jpg",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ab-av1-probe-fallback-{}.jpg", std::process::id()));
         std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xD9]).expect("write jpeg stub");
         let _guard = ForceFfprobeError::set();
         // execute
@@ -390,7 +383,10 @@ mod tests {
             "header-based image detection must survive ffprobe failure"
         );
         assert!(!probe.has_audio);
-        assert!(probe.duration.is_err(), "ffprobe failure must propagate to duration");
+        assert!(
+            probe.duration.is_err(),
+            "ffprobe failure must propagate to duration"
+        );
         assert!(probe.fps.is_err(), "ffprobe failure must propagate to fps");
         assert!(
             probe.duration.unwrap_err().to_string().contains("ffprobe"),
@@ -409,46 +405,26 @@ mod tests {
         assert!(from_err.to_string().contains("oops"));
     }
 
-    // ab-kgc.91: spaced fraction strings appear in some ffprobe builds
     #[test]
-    fn parse_frame_rate_fraction_with_spaces() {
-        assert_eq!(parse_frame_rate("24 / 1"), Some(24.0));
-    }
+    fn nframes_error_and_edge_cases() {
+        // setup / execute / assert — duration error propagates
+        let duration_err = ProbeError("bad duration".into());
+        let probe = probe_with(Ok(24.0), Err(duration_err.clone()));
+        assert_eq!(probe.nframes(), Err(duration_err));
 
-    #[test]
-    fn nframes_propagates_duration_error() {
-        let err = ProbeError("bad duration".into());
-        let probe = probe_with(Ok(24.0), Err(err.clone()));
-        assert_eq!(probe.nframes(), Err(err));
-    }
-
-    #[test]
-    fn nframes_rejects_zero_duration() {
+        // setup / execute / assert — zero duration rejected
         let probe = probe_with(Ok(24.0), Ok(Duration::ZERO));
         assert!(probe.nframes().is_err());
-    }
 
-    // ab-kgc.92: ffprobe occasionally reports mixed-case pix_fmt strings
-    #[test]
-    fn pixel_format_accepts_uppercase_yuv420p() {
-        let mut probe = probe_with(Ok(24.0), Ok(Duration::from_secs(1)));
-        probe.pix_fmt = Some("YUV420P".into());
-        assert_eq!(probe.pixel_format(), Some(PixelFormat::Yuv420p));
-    }
-
-    // bug-hunt-red: infinite fps from ffprobe must fail nframes rather than wrapping
-    #[test]
-    fn nframes_rejects_infinite_fps() {
+        // setup / execute / assert — infinite fps rejected rather than wrapping
         let probe = probe_with(Ok(f64::INFINITY), Ok(Duration::from_secs(10)));
         assert!(probe.nframes().is_err());
     }
 
     #[test]
     fn probe_webp_header_detects_image_on_ffprobe_failure() {
-        let path = std::env::temp_dir().join(format!(
-            "ab-av1-probe-webp-{}.webp",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ab-av1-probe-webp-{}.webp", std::process::id()));
         // Minimal RIFF WEBP header stub
         std::fs::write(
             &path,
@@ -457,7 +433,10 @@ mod tests {
         .expect("write webp stub");
         let _guard = ForceFfprobeError::set();
         let probe = probe(&path);
-        assert!(probe.is_image, "webp header must be detected when ffprobe fails");
+        assert!(
+            probe.is_image,
+            "webp header must be detected when ffprobe fails"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -466,10 +445,8 @@ mod tests {
         // setup: 1×1 GIF — ffprobe succeeds, format duration is zero.
         let gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\
 \x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
-        let path = std::env::temp_dir().join(format!(
-            "ab-av1-probe-gif-{}.gif",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ab-av1-probe-gif-{}.gif", std::process::id()));
         std::fs::write(&path, gif).expect("write gif stub");
         // execute
         let probe = probe(&path);

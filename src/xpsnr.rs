@@ -198,19 +198,19 @@ mod test {
         );
     }
 
+    // ab-kgc.95: score_from_line must handle special trailing formats
     #[test]
-    fn score_from_line_parses_minimum_inf() {
-        let score = score_from_line(
-            "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: inf  u: inf  v: inf  (minimum: inf)",
+    fn score_from_line_parses_special_cases() {
+        // setup (none)
+        // execute / assert
+        assert_eq!(
+            score_from_line("[Parsed_xpsnr_0 @ 0x1] XPSNR  y: inf  u: inf  v: inf  (minimum: inf)",),
+            Some(f32::INFINITY)
         );
-        assert_eq!(score, Some(f32::INFINITY));
-    }
-
-    // ab-kgc.95: trailing average line without minimum should still yield a score
-    #[test]
-    fn score_from_line_parses_trailing_average_without_minimum() {
-        let score = score_from_line("XPSNR average, 1344 frames  y: 40.7139");
-        assert_eq!(score, Some(40.7139));
+        assert_eq!(
+            score_from_line("XPSNR average, 1344 frames  y: 40.7139"),
+            Some(40.7139)
+        );
     }
 
     #[test]

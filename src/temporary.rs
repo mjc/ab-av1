@@ -101,13 +101,8 @@ mod tests {
     use std::{env, fs};
 
     fn temp_path(label: &str) -> PathBuf {
-        env::temp_dir().join(format!(
-            "ab-av1-temp-test-{}-{}",
-            label,
-            std::process::id()
-        ))
+        env::temp_dir().join(format!("ab-av1-temp-test-{}-{}", label, std::process::id()))
     }
-
 
     #[tokio::test]
     async fn add_and_clean_all_removes_not_keepable() {
@@ -227,7 +222,10 @@ mod tests {
         clean_all().await;
 
         // assert
-        assert!(!nested.exists(), "nested files must be removed with their temp dir");
+        assert!(
+            !nested.exists(),
+            "nested files must be removed with their temp dir"
+        );
         assert!(!parent.exists(), "registered temp dir must be removed");
     }
 
@@ -239,7 +237,10 @@ mod tests {
         let input = env::temp_dir().join("ab-av1-temp-test-input/clip.mkv");
 
         // execute
-        let temp_dir = process_dir(Some(explicit.clone()), input.parent().map(Path::to_path_buf));
+        let temp_dir = process_dir(
+            Some(explicit.clone()),
+            input.parent().map(Path::to_path_buf),
+        );
 
         // assert
         assert!(
