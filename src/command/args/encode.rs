@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::ensure;
 use clap::{Parser, ValueHint};
+use rstest::rstest;
 use std::{
     collections::HashMap,
     fmt::{self, Write},
@@ -361,6 +362,13 @@ impl Encode {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Encoder(Arc<str>);
 
+#[cfg(test)]
+impl Encoder {
+    pub fn for_test(name: &str) -> Self {
+        Self(name.into())
+    }
+}
+
 impl Encoder {
     /// vcodec name that would work if you used it as the -e argument.
     pub fn as_str(&self) -> &str {
@@ -716,4 +724,497 @@ fn svtav1_to_ffmpeg_args_default_under_3m() {
         .as_str();
     assert_eq!(svtargs, "scd=0:crf=32");
     assert!(input_args.is_empty());
+}
+
+#[test]
+fn pixel_format_opt_max() {
+    // setup
+    use PixelFormat::*;
+    // execute / assert
+    assert_eq!(
+        PixelFormat::opt_max(Some(Yuv420p), Some(Yuv444p10le)),
+        Some(Yuv444p10le)
+    );
+    assert_eq!(
+        PixelFormat::opt_max(None, Some(Yuv420p10le)),
+        Some(Yuv420p10le)
+    );
+    assert_eq!(
+        PixelFormat::opt_max(Some(Yuv422p10le), None),
+        Some(Yuv422p10le)
+    );
+    assert_eq!(PixelFormat::opt_max(None, None), None);
+}
+
+#[test]
+fn parse_svt_arg_rejects_reserved_keys() {
+    // setup
+    // execute
+    let err = parse_svt_arg("crf=32").expect_err("crf reserved");
+    // assert
+    assert!(err.to_string().contains("crf"));
+}
+
+#[test]
+fn parse_enc_arg_adds_leading_dash() {
+    // setup
+    // execute
+    let arg = parse_enc_arg("x265-params=lossless=1").expect("parse");
+    // assert
+    assert_eq!(arg, "-x265-params=lossless=1");
+}
+
+#[rstest]
+#[case::libx264("libx264", 0.1, 10.0, 46.0)]
+#[case::libx265("libx265", 0.1, 10.0, 46.0)]
+#[case::libsvtav1("libsvtav1", 0.25, 5.0, 70.0)]
+#[case::mpeg2("mpeg2video", 1.0, 2.0, 30.0)]
+#[case::librav1e("librav1e", 1.0, 10.0, 255.0)]
+fn encoder_defaults_matrix(
+    #[case] name: &str,
+    #[case] increment: f32,
+    #[case] min_crf: f32,
+    #[case] max_crf: f32,
+) {
+    // setup
+    let enc = Encoder::for_test(name);
+
+    // execute / assert
+    assert_eq!(enc.default_crf_increment(), increment);
+    assert_eq!(enc.default_min_crf(), min_crf);
+    assert_eq!(enc.default_max_crf(), max_crf);
+}
+
+#[rstest]
+#[case::svt_alias("svt-av1", "libsvtav1")]
+#[case::passthrough("libaom-av1", "libaom-av1")]
+fn encoder_from_str_matrix(#[case] input: &str, #[case] expected: &str) {
+    // setup
+    use std::str::FromStr;
+
+    // execute
+    let enc = Encoder::from_str(input).expect("parse encoder");
+
+    // assert
+    assert_eq!(enc.as_str(), expected);
+}
+
+fn test_probe(duration_secs: u64, fps: f64) -> Ffprobe {
+    Ffprobe {
+        duration: Ok(Duration::from_secs(duration_secs)),
+        has_audio: true,
+        max_audio_channels: Some(2),
+        fps: Ok(fps),
+        resolution: Some((1280, 720)),
+        is_image: false,
+        pix_fmt: None,
+    }
+}
+
+#[test]
+fn encode_hint_includes_non_default_options() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libx264".into()),
+        input: "clip mkv".into(),
+        vfilter: Some("scale=1280:-1".into()),
+        preset: Some("fast".into()),
+        pix_format: Some(PixelFormat::Yuv420p),
+        keyint: Some(KeyInterval::Frames(300)),
+        scd: Some(true),
+        svt_args: vec![],
+        enc_args: vec!["x265-params=lossless=1".into()],
+        enc_input_args: vec!["hwaccel=vaapi".into()],
+    };
+    // execute
+    let hint = enc.encode_hint(32.5);
+    // assert
+    assert!(hint.contains("-e libx264"));
+    assert!(hint.contains("--preset fast"));
+    assert!(hint.contains("--keyint 300"));
+    assert!(hint.contains("--scd true"));
+    assert!(hint.contains("--pix-format yuv420p"));
+    assert!(hint.contains("--vfilter"));
+    assert!(hint.contains("--enc x265-params=lossless=1"));
+    assert!(hint.contains("--enc-input hwaccel=vaapi"));
+}
+
+#[test]
+fn encode_hint_omits_default_svtav1_encoder_flag() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libsvtav1".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec!["film-grain=8".into()],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let hint = enc.encode_hint(32.0);
+    // assert
+    assert!(!hint.contains("-e libsvtav1"));
+    assert!(hint.contains("--svt film-grain=8"));
+}
+
+#[test]
+fn keyinterval_display_formats_frames_and_duration() {
+    // setup / execute / assert
+    assert_eq!(KeyInterval::Frames(300).to_string(), "300");
+    assert_eq!(
+        KeyInterval::Duration(Duration::from_secs(10)).to_string(),
+        "10s"
+    );
+}
+
+#[test]
+fn keyinterval_parse_error_reports_both_failures() {
+    // setup / execute
+    use std::str::FromStr;
+    let err = KeyInterval::from_str("not-valid").expect_err("invalid keyint");
+    // assert
+    let msg = err.to_string();
+    assert!(msg.contains("frames:"));
+    assert!(msg.contains("duration:"));
+}
+
+#[test]
+fn keyinterval_frames_variant_passthrough() {
+    // setup / execute / assert
+    assert_eq!(
+        KeyInterval::Frames(240).keyint_number(Ok(30.0)).expect("frames"),
+        240
+    );
+}
+
+#[test]
+fn to_ffmpeg_args_rejects_svt_on_non_svtav1() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libx264".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec!["film-grain=8".into()],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let err = enc
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .expect_err("svt on x264");
+    // assert
+    assert!(err.to_string().contains("--svt may only be used with svt-av1"));
+}
+
+#[test]
+fn to_ffmpeg_args_libaom_defaults() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libaom-av1".into()),
+        input: "vid.mkv".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(30.0, &test_probe(120, 24.0))
+        .expect("to_ffmpeg_args");
+    // assert
+    assert_eq!(args.pix_fmt, Some(PixelFormat::Yuv420p10le));
+    assert!(
+        args.output_args
+            .windows(2)
+            .any(|w| w[0].as_str() == "-b:v" && w[1].as_str() == "0")
+    );
+    assert!(args.output_args.iter().all(|a| a.as_str() != "-svtav1-params"));
+}
+
+#[test]
+fn to_ffmpeg_args_qsv_defaults() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("av1_qsv".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .expect("to_ffmpeg_args");
+    // assert
+    for (flag, val) in [
+        ("-look_ahead", "1"),
+        ("-extbrc", "1"),
+        ("-look_ahead_depth", "40"),
+    ] {
+        assert!(
+            args.output_args
+                .windows(2)
+                .any(|w| w[0].as_str() == flag && w[1].as_str() == val),
+            "missing {flag} in {:?}",
+            args.output_args
+        );
+    }
+}
+
+#[test]
+fn to_ffmpeg_args_vaapi_input_defaults() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("h264_vaapi".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .expect("to_ffmpeg_args");
+    // assert
+    assert!(
+        args.input_args
+            .windows(2)
+            .any(|w| w[0].as_str() == "-hwaccel" && w[1].as_str() == "vaapi")
+    );
+    assert!(
+        args.input_args.windows(2).any(|w| {
+            w[0].as_str() == "-hwaccel_output_format" && w[1].as_str() == "vaapi"
+        })
+    );
+}
+
+#[test]
+fn to_ffmpeg_args_vulkan_input_defaults() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("av1_vulkan".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .expect("to_ffmpeg_args");
+    // assert
+    assert!(
+        args.input_args
+            .windows(2)
+            .any(|w| w[0].as_str() == "-hwaccel" && w[1].as_str() == "vulkan")
+    );
+}
+
+#[test]
+fn to_ffmpeg_args_merges_enc_svtav1_params() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libsvtav1".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec!["film-grain=8".into()],
+        enc_args: vec!["svtav1-params=tune=0".into()],
+        enc_input_args: vec![],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(32.0, &test_probe(60, 24.0))
+        .expect("to_ffmpeg_args");
+    // assert
+    let svt = args
+        .output_args
+        .windows(2)
+        .find(|w| w[0].as_str() == "-svtav1-params")
+        .map(|w| w[1].as_str())
+        .expect("svtav1-params");
+    assert!(svt.contains("tune=0"));
+    assert!(svt.contains("film-grain=8"));
+    assert!(svt.contains("crf=32"));
+}
+
+#[test]
+fn to_ffmpeg_args_enc_input_none_disables_vaapi_defaults() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("h264_vaapi".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![
+            "-hwaccel=none".into(),
+            "-hwaccel_output_format=none".into(),
+        ],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(28.0, &test_probe(120, 24.0))
+        .expect("to_ffmpeg_args");
+    // assert
+    assert!(
+        !args.input_args.iter().any(|a| a.as_str() == "-hwaccel"),
+        "hwaccel defaults should be omitted: {:?}",
+        args.input_args
+    );
+}
+
+#[test]
+fn to_ffmpeg_args_rejects_reserved_output_arg() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libx264".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec!["-crf=32".into()],
+        enc_input_args: vec![],
+    };
+    // execute
+    let err = enc
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .expect_err("reserved -crf");
+    // assert
+    assert!(err.to_string().contains("`-crf` not allowed"));
+}
+
+#[test]
+fn to_ffmpeg_args_rejects_reserved_input_arg() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libx264".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec!["-preset=fast".into()],
+    };
+    // execute
+    let err = enc
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .expect_err("reserved -preset");
+    // assert
+    assert!(err.to_string().contains("`-preset` not allowed"));
+}
+
+#[test]
+fn to_ffmpeg_args_explicit_keyint_with_vfilter_fps() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libsvtav1".into()),
+        input: "vid.mp4".into(),
+        vfilter: Some("fps=24".into()),
+        preset: None,
+        pix_format: None,
+        keyint: Some(KeyInterval::Duration(Duration::from_secs(5))),
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(32.0, &test_probe(60, 30.0))
+        .expect("to_ffmpeg_args");
+    // assert: vfilter fps=24 wins over probe fps=30 → 5s * 24 = 120
+    assert!(
+        args.output_args
+            .windows(2)
+            .any(|w| w[0].as_str() == "-g" && w[1].as_str() == "120")
+    );
+}
+
+#[test]
+fn to_ffmpeg_args_scd_explicit_true_without_default_keyint() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libsvtav1".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: Some(true),
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    // execute
+    let args = enc
+        .to_ffmpeg_args(32.0, &test_probe(60, 24.0))
+        .expect("to_ffmpeg_args");
+    // assert
+    let svt = args
+        .output_args
+        .windows(2)
+        .find(|w| w[0].as_str() == "-svtav1-params")
+        .map(|w| w[1].as_str())
+        .expect("svtav1-params");
+    assert!(svt.starts_with("scd=1:"));
+}
+
+#[test]
+fn encoder_high_crf_means_hq_videotoolbox() {
+    // setup / execute / assert
+    assert!(Encoder::for_test("hevc_videotoolbox").high_crf_means_hq());
+    assert!(!Encoder::for_test("libx264").high_crf_means_hq());
+}
+
+#[test]
+fn encoder_default_image_ext_x264() {
+    // setup / execute / assert
+    assert_eq!(Encoder::for_test("libx264").default_image_ext(), "264");
+}
+
+#[test]
+fn pixel_format_as_str_yuv420p() {
+    // setup / execute / assert
+    assert_eq!(PixelFormat::Yuv420p.as_str(), "yuv420p");
 }

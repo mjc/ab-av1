@@ -652,7 +652,8 @@ mod crf_search_tests {
         ffprobe::Ffprobe,
     };
     use futures_util::StreamExt;
-    use std::{path::PathBuf, pin::pin, sync::Arc, time::Duration};
+    use rstest::rstest;
+    use std::{path::PathBuf, pin::pin, sync::{Arc, Mutex}, time::Duration};
 
     mod helpers {
         use super::*;
@@ -685,6 +686,16 @@ mod crf_search_tests {
         }
 
         pub fn search_args(min_vmaf: Option<f32>, min_xpsnr: Option<f32>, thorough: bool) -> Args {
+            search_args_with_crf_range(min_vmaf, min_xpsnr, thorough, Some(20.0), Some(40.0))
+        }
+
+        pub fn search_args_with_crf_range(
+            min_vmaf: Option<f32>,
+            min_xpsnr: Option<f32>,
+            thorough: bool,
+            min_crf: Option<f32>,
+            max_crf: Option<f32>,
+        ) -> Args {
             Args {
                 args: Encode {
                     encoder: "libsvtav1".parse().unwrap(),
@@ -701,8 +712,8 @@ mod crf_search_tests {
                 min_vmaf,
                 min_xpsnr,
                 max_encoded_percent: 80.0,
-                min_crf: Some(20.0),
-                max_crf: Some(40.0),
+                min_crf,
+                max_crf,
                 crf_increment: Some(1.0),
                 high_crf_means_hq: Some(false),
                 thorough,
@@ -833,30 +844,126 @@ mod crf_search_tests {
     }
 
     // ab-c8k.12: threshold boundary matrix (unit tests; rstest when ab-c8k.10 lands)
-    #[test]
-    fn output_search_score_prefers_xpsnr_when_requested() {
+    #[rstest]
+    #[case::vmaf_only(false, Some(70.0), None, 70.0)]
+    #[case::xpsnr_when_requested(true, Some(70.0), Some(92.0), 92.0)]
+    #[case::vmaf_fallback(false, None, Some(88.0), 88.0)]
+    fn output_search_score_matrix(
+        #[case] use_xpsnr: bool,
+        #[case] vmaf: Option<f32>,
+        #[case] xpsnr: Option<f32>,
+        #[case] expected: f32,
+    ) {
         // setup
-        let enc = mock_output(Some(70.0), Some(92.0), 50.0);
+        let enc = mock_output(vmaf, xpsnr, 50.0);
 
         // execute / assert
-        assert_eq!(output_search_score(&enc, true), 92.0);
-        assert_eq!(output_search_score(&enc, false), 70.0);
+        assert_eq!(output_search_score(&enc, use_xpsnr), expected);
+    }
+
+    #[rstest]
+    #[case::exact_match(95.0, 95.0, true)]
+    #[case::above_threshold(96.0, 95.0, true)]
+    #[case::below_threshold(94.9, 95.0, false)]
+    #[case::within_thorough_tolerance(95.03, 95.0, true)]
+    fn threshold_success_matrix(
+        #[case] score: f32,
+        #[case] min: f32,
+        #[case] should_pass: bool,
+    ) {
+        // execute / assert
+        assert_eq!(score >= min, should_pass || score > min);
+        if should_pass {
+            assert!(score >= min);
+        } else {
+            assert!(score < min);
+        }
     }
 
     #[test]
-    fn threshold_boundary_matrix() {
+    fn vmaf_lerp_q_interpolates_with_vmaf_scores() {
         // setup
-        let min = 95.0;
-        let tol = 0.05;
+        let use_xpsnr = false;
+        let worse = Sample {
+            crf: 30.0,
+            q: 30,
+            enc: mock_output(Some(88.0), None, 50.0),
+        };
+        let better = Sample {
+            crf: 25.0,
+            q: 25,
+            enc: mock_output(Some(96.0), None, 50.0),
+        };
 
-        // execute / assert — exact match
-        assert!(min >= min);
-        assert!(min < min + tol);
+        // execute
+        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr);
 
-        // above threshold
-        assert!(96.0 >= min);
-        // below threshold
-        assert!(94.9 < min);
+        // assert
+        assert!((26..=28).contains(&q));
+    }
+
+    #[tokio::test]
+    async fn cut_on_iter2_narrows_toward_min_on_wide_crf_range() {
+        // setup — range > half default span enables cut_on_iter2
+        let args = search_args_with_crf_range(Some(95.0), None, true, Some(5.0), Some(70.0));
+        let crfs = Arc::new(Mutex::new(Vec::new()));
+        let crfs2 = crfs.clone();
+        let _guard = MockGuard::set(move |crf| {
+            crfs2.lock().unwrap().push(crf);
+            mock_output(Some(80.0), None, 50.0)
+        });
+
+        // execute
+        let _ = collect_run(args, test_probe()).await;
+
+        // assert — second probe should not jump straight to min_crf
+        let tried = crfs.lock().unwrap();
+        assert!(tried.len() >= 2);
+        assert!(
+            tried[1] > 5.0 + f32::EPSILON,
+            "cut_on_iter2 should narrow before min_crf, got {:?}",
+            *tried
+        );
+    }
+
+    #[tokio::test]
+    async fn narrow_crf_range_skips_cut_on_iter2() {
+        // setup — custom range under half default span
+        let args = search_args(Some(95.0), None, true);
+        let crfs = Arc::new(Mutex::new(Vec::new()));
+        let crfs2 = crfs.clone();
+        let _guard = MockGuard::set(move |crf| {
+            crfs2.lock().unwrap().push(crf);
+            mock_output(Some(80.0), None, 50.0)
+        });
+
+        // execute
+        let _ = collect_run(args, test_probe()).await;
+
+        // assert — second probe should hit min_crf directly
+        let tried = crfs.lock().unwrap();
+        assert!(tried.len() >= 2);
+        assert!((tried[1] - 20.0).abs() < f32::EPSILON, "got {:?}", *tried);
+    }
+
+    #[tokio::test]
+    async fn thorough_mode_accepts_score_within_tolerance_band() {
+        // setup
+        let min_score = 95.0;
+        let args = search_args(Some(min_score), None, true);
+        let _guard = MockGuard::set(move |_crf| mock_output(Some(min_score + 0.03), None, 50.0));
+
+        // execute
+        let updates = collect_run(args, test_probe()).await.expect("run");
+
+        // assert — thorough tolerance is 0.05
+        let done = last_done(&updates).expect("expected Done");
+        assert!(done.enc.vmaf_score.unwrap() < min_score + 0.05);
+        let run_results = updates
+            .iter()
+            .filter(|u| matches!(u, Update::RunResult(_)))
+            .count();
+        assert!(run_results <= 1);
     }
 
     #[test]
@@ -886,5 +993,37 @@ mod crf_search_tests {
         // setup / execute / assert
         assert!(guess_progress(1, 0.5, true) < guess_progress(2, 0.5, true));
         assert!(guess_progress(6, 1.0, true) <= super::BAR_LEN as f64);
+    }
+
+    mod proptest_crf_search {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn vmaf_lerp_q_bounded_between_samples(
+                worse_score in 80.0f32..94.0f32,
+                better_score in 96.0f32..99.0f32,
+                worse_q in 30i64..50i64,
+                better_q in 20i64..28i64,
+            ) {
+                prop_assume!(worse_q > better_q + 1);
+                let min_vmaf = (worse_score + better_score) / 2.0;
+                let worse = Sample {
+                    crf: worse_q as f32,
+                    q: worse_q,
+                    enc: mock_output(Some(worse_score), None, 50.0),
+                };
+                let better = Sample {
+                    crf: better_q as f32,
+                    q: better_q,
+                    enc: mock_output(Some(better_score), None, 50.0),
+                };
+
+                let q = vmaf_lerp_q(min_vmaf, &worse, &better, false);
+
+                prop_assert!(q > better_q && q < worse_q);
+            }
+        }
     }
 }

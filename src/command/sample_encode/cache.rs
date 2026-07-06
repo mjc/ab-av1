@@ -162,6 +162,7 @@ mod tests {
     use super::*;
     use crate::command::args::{ScoreArgs, Vmaf, Xpsnr};
     use crate::ffmpeg::FfmpegEncodeArgs;
+    use rstest::rstest;
     use std::{path::Path, sync::Arc, time::Duration};
 
     mod helpers {
@@ -292,5 +293,123 @@ mod tests {
             message.contains("XDG_CACHE_HOME") || message.contains("no-cache"),
             "error should mention workaround: {message}"
         );
+    }
+
+    #[rstest]
+    #[case::crf_change(30.0, 31.0)]
+    #[case::crf_fraction(30.0, 30.5)]
+    fn crf_change_alters_cache_key(#[case] crf_a: f32, #[case] crf_b: f32) {
+        // setup
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let duration = Duration::from_secs(3600);
+        let extension = Some(std::ffi::OsStr::new("mkv"));
+        let size = 1_000_000_u64;
+        let scoring = default_scoring();
+
+        let mut enc_a = minimal_enc_args(input);
+        enc_a.crf = crf_a;
+        let mut enc_b = minimal_enc_args(input);
+        enc_b.crf = crf_b;
+
+        // execute
+        let key_a = encode_cache_key(
+            sample, input, duration, extension, size, false, &enc_a, &scoring,
+        );
+        let key_b = encode_cache_key(
+            sample, input, duration, extension, size, false, &enc_b, &scoring,
+        );
+
+        // assert
+        assert_ne!(key_a, key_b, "crf change must alter cache key");
+    }
+
+    #[rstest]
+    #[case(true, false)]
+    #[case(false, true)]
+    fn full_pass_flag_alters_cache_key(#[case] full_pass_a: bool, #[case] full_pass_b: bool) {
+        // setup
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let duration = Duration::from_secs(3600);
+        let extension = Some(std::ffi::OsStr::new("mkv"));
+        let size = 1_000_000_u64;
+        let enc = minimal_enc_args(input);
+        let scoring = default_scoring();
+
+        // execute
+        let key_a = encode_cache_key(
+            sample, input, duration, extension, size, full_pass_a, &enc, &scoring,
+        );
+        let key_b = encode_cache_key(
+            sample, input, duration, extension, size, full_pass_b, &enc, &scoring,
+        );
+
+        // assert
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn duration_change_alters_cache_key() {
+        // setup
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let extension = Some(std::ffi::OsStr::new("mkv"));
+        let size = 1_000_000_u64;
+        let enc = minimal_enc_args(input);
+        let scoring = default_scoring();
+
+        // execute
+        let key_a = encode_cache_key(
+            sample,
+            input,
+            Duration::from_secs(100),
+            extension,
+            size,
+            false,
+            &enc,
+            &scoring,
+        );
+        let key_b = encode_cache_key(
+            sample,
+            input,
+            Duration::from_secs(200),
+            extension,
+            size,
+            false,
+            &enc,
+            &scoring,
+        );
+
+        // assert
+        assert_ne!(key_a, key_b);
+    }
+
+    mod proptest_cache_keys {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn distinct_sizes_produce_distinct_keys(
+                size_a in 1_000u64..1_000_000u64,
+                size_b in 1_000_000u64..2_000_000u64,
+            ) {
+                let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+                let input = Path::new("/movies/a/clip.mkv");
+                let duration = Duration::from_secs(3600);
+                let extension = Some(std::ffi::OsStr::new("mkv"));
+                let enc = minimal_enc_args(input);
+                let scoring = default_scoring();
+
+                let key_a = encode_cache_key(
+                    sample, input, duration, extension, size_a, false, &enc, &scoring,
+                );
+                let key_b = encode_cache_key(
+                    sample, input, duration, extension, size_b, false, &enc, &scoring,
+                );
+                prop_assert_ne!(key_a, key_b);
+            }
+        }
     }
 }

@@ -20,3 +20,57 @@ impl std::fmt::Display for TerseF32 {
 fn pseudo_int(f: f64) -> bool {
     !(0.0002..=0.9998).contains(&f.fract())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use proptest::prelude::*;
+    use rstest::rstest;
+    use test_case::test_case;
+
+    mod proptest_terse_f32 {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn display_never_panics(v in any::<f32>()) {
+                // setup
+                let terse = TerseF32(v);
+
+                // execute
+                let formatted = format!("{terse}");
+
+                // assert
+                prop_assert!(!formatted.is_empty() || v.is_nan());
+            }
+        }
+    }
+
+    #[rstest]
+    #[case(1.0, "1")]
+    #[case(1.5, "1.5")]
+    fn terse_f32_display_rstest(#[case] value: f32, #[case] expected: &str) {
+        // setup
+        let terse = TerseF32(value);
+
+        // execute
+        let formatted = format!("{terse}");
+
+        // assert
+        assert_eq!(formatted, expected);
+    }
+
+    #[test_case(2.0, "2"; "integer")]
+    #[test_case(2.25, "2.25"; "two decimals")]
+    fn terse_f32_display_test_case(value: f32, expected: &str) {
+        // setup
+        let terse = TerseF32(value);
+
+        // execute
+        let formatted = format!("{terse}");
+
+        // assert
+        assert_eq!(formatted, expected);
+    }
+}

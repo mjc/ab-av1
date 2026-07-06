@@ -80,6 +80,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
     let enc_args = search.args.clone();
     let thorough = search.thorough;
     let verbose = search.verbose;
+    let keep_temp_files = search.sample.keep;
 
     let mut crf_search = pin!(crf_search::run(search, input_probe.clone()));
     let mut best = None;
@@ -169,7 +170,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
         style(best.enc.single_score()).green(),
         style(format!("{:.0}%", best.enc.encode_percent)).green(),
     ));
-    temporary::clean_all().await;
+    temporary::clean(keep_temp_files).await;
 
     let bar = ProgressBar::new(12).with_style(
         ProgressStyle::default_bar()
@@ -192,4 +193,257 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
         &bar,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        command::{
+            args::{self, Encode, Sample as SampleArgs, Vmaf},
+            crf_search::{self, test_hooks as crf_test_hooks},
+            encode::test_hooks as encode_test_hooks,
+            sample_encode,
+        },
+        temporary::{self, TempKind},
+    };
+    use std::{env, fs, path::PathBuf, sync::Mutex, time::Duration};
+
+    static AUTO_ENCODE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    mod helpers {
+        use super::*;
+
+        pub fn unique_suffix() -> u128 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        }
+
+        pub fn temp_input(label: &str) -> PathBuf {
+            let path = env::temp_dir().join(format!(
+                "ab-av1-auto-encode-{}-{}-{}",
+                label,
+                std::process::id(),
+                unique_suffix()
+            ));
+            fs::write(&path, b"input").expect("write temp input");
+            path
+        }
+
+        pub fn auto_args(input: PathBuf, output: Option<PathBuf>, keep: bool) -> Args {
+            Args {
+                search: crf_search::Args {
+                    args: Encode {
+                        encoder: "libsvtav1".parse().unwrap(),
+                        input,
+                        vfilter: None,
+                        pix_format: None,
+                        preset: None,
+                        keyint: None,
+                        scd: None,
+                        svt_args: vec![],
+                        enc_args: vec![],
+                        enc_input_args: vec![],
+                    },
+                    min_vmaf: Some(95.0),
+                    min_xpsnr: None,
+                    max_encoded_percent: 80.0,
+                    min_crf: Some(20.0),
+                    max_crf: Some(40.0),
+                    crf_increment: Some(1.0),
+                    high_crf_means_hq: Some(false),
+                    thorough: true,
+                    cache: false,
+                    sample: SampleArgs {
+                        samples: Some(1),
+                        sample_every: Duration::from_secs(720),
+                        min_samples: None,
+                        sample_duration: Duration::from_secs(20),
+                        keep,
+                        temp_dir: None,
+                        extension: None,
+                    },
+                    vmaf: Vmaf::default(),
+                    score: args::ScoreArgs {
+                        reference_vfilter: None,
+                    },
+                    xpsnr: args::Xpsnr {
+                        xpsnr_fps: 60.0,
+                        xpsnr_pix_format: None,
+                    },
+                    verbose: clap_verbosity_flag::Verbosity::new(0, 0),
+                },
+                encode: args::EncodeToOutput {
+                    output,
+                    audio_codec: None,
+                    downmix_to_stereo: false,
+                    video_only: false,
+                    overwrite_input: false,
+                },
+            }
+        }
+
+        pub fn mock_output(vmaf: f32) -> sample_encode::Output {
+            sample_encode::Output {
+                vmaf_score: Some(vmaf),
+                xpsnr_score: None,
+                predicted_encode_size: 1_000_000,
+                encode_percent: 50.0,
+                predicted_encode_time: Duration::from_secs(60),
+                from_cache: false,
+            }
+        }
+    }
+
+    use helpers::*;
+
+    struct MockGuard {
+        crf: bool,
+        encode: bool,
+    }
+
+    impl MockGuard {
+        fn crf(mock: impl Fn(f32) -> sample_encode::Output + 'static) -> Self {
+            crf_test_hooks::set(mock);
+            Self {
+                crf: true,
+                encode: false,
+            }
+        }
+
+        fn both(
+            crf_mock: impl Fn(f32) -> sample_encode::Output + 'static,
+            encode_fixture: &'static str,
+        ) -> Self {
+            crf_test_hooks::set(crf_mock);
+            encode_test_hooks::set_fixture(encode_fixture);
+            Self {
+                crf: true,
+                encode: true,
+            }
+        }
+    }
+
+    impl Drop for MockGuard {
+        fn drop(&mut self) {
+            if self.crf {
+                crf_test_hooks::clear();
+            }
+            if self.encode {
+                encode_test_hooks::clear();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_same_input_and_output_without_overwrite() {
+        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
+        // setup
+        let input = temp_input("same-io");
+        let args = auto_args(input.clone(), Some(input.clone()), false);
+
+        // execute
+        let err = auto_encode(args).await.expect_err("expected same-file error");
+
+        // assert
+        assert!(err.to_string().contains("same file"));
+
+        // cleanup
+        let _ = fs::remove_file(input);
+    }
+
+    #[tokio::test]
+    async fn propagates_no_good_crf_from_search() {
+        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
+        // setup
+        let input = temp_input("no-good-crf");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-auto-out-{}-{}.mkv",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let args = auto_args(input.clone(), Some(output), false);
+        let _guard = MockGuard::crf(|_crf| mock_output(80.0));
+
+        // execute
+        let err = auto_encode(args).await.expect_err("expected NoGoodCrf");
+
+        // assert
+        assert!(err.to_string().contains("Failed to find a suitable crf"));
+
+        // cleanup
+        let _ = fs::remove_file(input);
+    }
+
+    #[tokio::test]
+    async fn successful_run_preserves_keepable_temps_with_keep_ab_kgc_15() {
+        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
+        // setup
+        let input = temp_input("keep");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-auto-keep-out-{}-{}.mkv",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let keepable = env::temp_dir().join(format!(
+            "ab-av1-auto-keepable-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::write(&keepable, b"keep-me").expect("write keepable");
+        temporary::add(&keepable, TempKind::Keepable);
+        let args = auto_args(input.clone(), Some(output.clone()), true);
+        let _guard = MockGuard::both(|_crf| mock_output(96.0), "stderr-ffmpeg-progress");
+
+        // execute
+        auto_encode(args).await.expect("auto encode");
+
+        // assert
+        assert!(
+            keepable.exists(),
+            "auto-encode --keep must preserve Keepable temp files after search"
+        );
+        assert!(output.exists(), "encode output should exist");
+
+        // cleanup
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+        let _ = fs::remove_file(keepable);
+    }
+
+    #[tokio::test]
+    async fn successful_run_cleans_keepable_temps_without_keep() {
+        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
+        // setup
+        let input = temp_input("no-keep");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-auto-no-keep-out-{}-{}.mkv",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let keepable = env::temp_dir().join(format!(
+            "ab-av1-auto-drop-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::write(&keepable, b"drop-me").expect("write keepable");
+        temporary::add(&keepable, TempKind::Keepable);
+        let args = auto_args(input.clone(), Some(output.clone()), false);
+        let _guard = MockGuard::both(|_crf| mock_output(96.0), "stderr-ffmpeg-progress");
+
+        // execute
+        auto_encode(args).await.expect("auto encode");
+
+        // assert
+        assert!(
+            !keepable.exists(),
+            "without --keep, search temp files should be cleaned before encode"
+        );
+
+        // cleanup
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
 }

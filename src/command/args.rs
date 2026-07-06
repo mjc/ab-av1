@@ -146,3 +146,145 @@ impl std::hash::Hash for Xpsnr {
         self.xpsnr_fps.to_ne_bytes().hash(state);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
+    use std::{path::Path, time::Duration};
+
+    fn sample_args(samples: Option<u64>, min_samples: Option<u64>, sample_every: Duration) -> Sample {
+        Sample {
+            samples,
+            sample_every,
+            min_samples,
+            sample_duration: Duration::from_secs(20),
+            keep: false,
+            temp_dir: None,
+            extension: None,
+        }
+    }
+
+    #[rstest]
+    #[case(Duration::from_secs(600), 12 * 60, 1)] // 10m / 12m -> ceil 1
+    #[case(Duration::from_secs(25 * 60), 12 * 60, 3)] // 25m / 12m -> ceil 3
+    #[case(Duration::from_secs(30), 12 * 60, 1)] // sub-sample_every still min 1
+    fn sample_count_from_sample_every(
+        #[case] duration: Duration,
+        #[case] sample_every_secs: u64,
+        #[case] expected: u64,
+    ) {
+        // setup
+        let args = sample_args(None, None, Duration::from_secs(sample_every_secs));
+        // execute
+        let count = args.sample_count(duration);
+        // assert
+        assert_eq!(count, expected);
+    }
+
+    #[test]
+    fn sample_count_samples_override_wins() {
+        // setup
+        let args = sample_args(Some(7), None, Duration::from_secs(60));
+        // execute
+        let count = args.sample_count(Duration::from_secs(3600));
+        // assert
+        assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn sample_count_respects_min_samples() {
+        // setup
+        let args = sample_args(None, Some(5), Duration::from_secs(60 * 60));
+        // execute
+        let count = args.sample_count(Duration::from_secs(60));
+        // assert
+        assert_eq!(count, 5);
+    }
+
+    mod proptest_sample_count {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn monotonic_in_duration(
+                base_secs in 10u64..3600,
+                extra_secs in 1u64..3600,
+                sample_every_secs in 1u64..600,
+            ) {
+                // setup
+                let args = sample_args(None, None, Duration::from_secs(sample_every_secs));
+                let shorter = Duration::from_secs(base_secs);
+                let longer = Duration::from_secs(base_secs + extra_secs);
+
+                // execute
+                let short_count = args.sample_count(shorter);
+                let long_count = args.sample_count(longer);
+
+                // assert
+                prop_assert!(long_count >= short_count);
+                prop_assert!(short_count >= 1);
+                prop_assert!(long_count >= 1);
+            }
+
+            #[test]
+            fn samples_override_is_exact(samples in 1u64..100) {
+                // setup
+                let args = sample_args(Some(samples), Some(1), Duration::from_secs(1));
+
+                // execute
+                let count = args.sample_count(Duration::from_secs(10_000));
+
+                // assert
+                prop_assert_eq!(count, samples);
+            }
+        }
+    }
+
+    #[test]
+    fn set_extension_from_input_uses_image_ext() {
+        // setup
+        let mut args = sample_args(None, None, Duration::from_secs(60));
+        let input = Path::new("photo.png");
+        let encoder = Encoder::for_test("libsvtav1");
+        let probe = Ffprobe {
+            duration: Ok(Duration::ZERO),
+            has_audio: false,
+            max_audio_channels: None,
+            fps: Ok(24.0),
+            resolution: None,
+            is_image: true,
+            pix_fmt: None,
+        };
+        // execute
+        args.set_extension_from_input(input, &encoder, &probe);
+        // assert
+        assert_eq!(args.extension.as_deref(), Some("avif"));
+    }
+
+    #[test]
+    fn set_extension_from_output_uses_path_extension() {
+        // setup
+        let mut args = sample_args(None, None, Duration::from_secs(60));
+        // execute
+        args.set_extension_from_output(Path::new("out/sample.mkv"));
+        // assert
+        assert_eq!(args.extension.as_deref(), Some("mkv"));
+    }
+
+    #[rstest]
+    #[case(60.0, Some(60.0))]
+    #[case(0.0, None)]
+    #[case(-1.0, None)]
+    fn xpsnr_fps_filter(#[case] fps: f32, #[case] expected: Option<f32>) {
+        // setup
+        let xpsnr = Xpsnr {
+            xpsnr_fps: fps,
+            xpsnr_pix_format: None,
+        };
+        // execute
+        // assert
+        assert_eq!(xpsnr.fps(), expected);
+    }
+}

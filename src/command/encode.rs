@@ -23,6 +23,49 @@ use std::{
 use tokio::fs;
 use tokio_stream::StreamExt;
 
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FIXTURE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+    }
+
+    pub fn set_fixture(name: &'static str) {
+        FIXTURE.with(|f| *f.borrow_mut() = Some(name));
+    }
+
+    pub fn clear() {
+        FIXTURE.with(|f| *f.borrow_mut() = None);
+    }
+
+    pub fn fixture() -> Option<&'static str> {
+        FIXTURE.with(|f| *f.borrow())
+    }
+}
+
+#[cfg(test)]
+fn test_ffmpeg_stream(fixture: &'static str) -> anyhow::Result<crate::process::FfmpegOutStream> {
+    use crate::process::managed::ManagedProcess;
+    use std::env;
+    use tokio::process::Command;
+
+    const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
+    const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";
+
+    let mut cmd = Command::new(env::current_exe().expect("current test executable"));
+    cmd.arg("--exact")
+        .arg(FIXTURE_TEST)
+        .arg("--nocapture")
+        .env(FIXTURE_ENV, fixture);
+    let enc = ManagedProcess::spawn("ffmpeg encode fixture", cmd)?;
+    Ok(crate::process::FfmpegOut::stream(
+        enc,
+        "ffmpeg encode fixture",
+        fixture.into(),
+    ))
+}
+
 /// Invoke ffmpeg to encode a video or image.
 #[derive(Parser)]
 #[group(skip)]
@@ -104,7 +147,16 @@ pub async fn run(
         output.file_name().and_then(|n| n.to_str()).unwrap_or("")
     );
 
-    let mut enc = ffmpeg::encode(enc_args, &output, has_audio, audio_codec, stereo_downmix)?;
+    let mut enc = {
+        #[cfg(test)]
+        if let Some(fixture) = test_hooks::fixture() {
+            test_ffmpeg_stream(fixture)?
+        } else {
+            ffmpeg::encode(enc_args, &output, has_audio, audio_codec, stereo_downmix)?
+        }
+        #[cfg(not(test))]
+        ffmpeg::encode(enc_args, &output, has_audio, audio_codec, stereo_downmix)?
+    };
     let mut logger = ProgressLogger::new(module_path!(), Instant::now());
     let mut stream_sizes = None;
     while let Some(progress) = enc.next().await {
@@ -128,6 +180,11 @@ pub async fn run(
     }
     enc.wait().await?; // ensure process has exited
     bar.finish();
+
+    #[cfg(test)]
+    if test_hooks::fixture().is_some() && !output.exists() {
+        fs::write(&output, b"fixture-encoded").await?;
+    }
 
     // successful encode, so don't delete it!
     temporary::unadd(&output);
@@ -180,4 +237,202 @@ pub fn default_output_name(input: &Path, encoder: &Encoder, is_image: bool) -> P
     let pre = ffmpeg::pre_extension_name(encoder.as_str());
     let ext = default_output_ext(input, encoder, is_image);
     input.with_extension(format!("{pre}.{ext}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        command::args::{Encode, EncodeToOutput},
+        ffprobe::Ffprobe,
+    };
+    use std::{env, fs, sync::Arc, time::Duration};
+    use test_case::test_case;
+
+    mod helpers {
+        use super::*;
+
+        pub fn test_probe() -> Arc<Ffprobe> {
+            Arc::new(Ffprobe {
+                duration: Ok(Duration::from_secs(120)),
+                has_audio: true,
+                max_audio_channels: Some(6),
+                fps: Ok(24.0),
+                resolution: Some((1920, 1080)),
+                is_image: false,
+                pix_fmt: Some("yuv420p".into()),
+            })
+        }
+
+        pub fn temp_input(label: &str) -> PathBuf {
+            let path = env::temp_dir().join(format!(
+                "ab-av1-encode-test-{}-{}",
+                label,
+                std::process::id()
+            ));
+            fs::write(&path, b"input-bytes").expect("write temp input");
+            path
+        }
+
+        pub fn encode_args(input: PathBuf, output: Option<PathBuf>) -> Args {
+            Args {
+                args: Encode {
+                    encoder: "libsvtav1".parse().unwrap(),
+                    input,
+                    vfilter: None,
+                    pix_format: None,
+                    preset: None,
+                    keyint: None,
+                    scd: None,
+                    svt_args: vec![],
+                    enc_args: vec![],
+                    enc_input_args: vec![],
+                },
+                crf: 32.0,
+                encode: EncodeToOutput {
+                    output,
+                    audio_codec: None,
+                    downmix_to_stereo: false,
+                    video_only: false,
+                    overwrite_input: false,
+                },
+            }
+        }
+    }
+
+    use helpers::*;
+
+    struct FixtureGuard;
+
+    impl FixtureGuard {
+        fn set(name: &'static str) -> Self {
+            test_hooks::set_fixture(name);
+            Self
+        }
+    }
+
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            test_hooks::clear();
+        }
+    }
+
+    #[test_case("clip.mp4", false, "mp4"; "video mp4 keeps mp4")]
+    #[test_case("clip.mkv", false, "mkv"; "video mkv keeps mkv")]
+    #[test_case("still.png", true, "avif"; "image uses encoder default")]
+    fn default_output_ext_cases(input_name: &str, is_image: bool, expected: &str) {
+        // setup
+        let input = Path::new(input_name);
+        let encoder: Encoder = "libsvtav1".parse().unwrap();
+
+        // execute
+        let ext = default_output_ext(input, &encoder, is_image);
+
+        // assert
+        assert_eq!(ext, expected);
+    }
+
+    #[test]
+    fn default_output_name_adds_encoder_prefix() {
+        // setup
+        let input = Path::new("movie.mkv");
+        let encoder: Encoder = "libsvtav1".parse().unwrap();
+
+        // execute
+        let out = default_output_name(input, &encoder, false);
+
+        // assert
+        assert_eq!(out, Path::new("movie.av1.mkv"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_same_input_and_output_without_overwrite() {
+        // setup
+        let input = temp_input("same-io");
+        let args = encode_args(input.clone(), Some(input.clone()));
+        let bar = ProgressBar::new(1);
+
+        // execute
+        let err = run(args, test_probe(), &bar)
+            .await
+            .expect_err("expected same-file error");
+
+        // assert
+        assert!(err.to_string().contains("same file"));
+
+        // cleanup
+        let _ = fs::remove_file(input);
+    }
+
+    #[tokio::test]
+    async fn run_rejects_stereo_downmix_with_copy_codec() {
+        // setup
+        let input = temp_input("downmix-copy");
+        let output = env::temp_dir().join(format!("ab-av1-encode-out-{}", std::process::id()));
+        let mut args = encode_args(input.clone(), Some(output));
+        args.encode.downmix_to_stereo = true;
+        args.encode.audio_codec = Some("copy".into());
+        let bar = ProgressBar::new(1);
+
+        // execute
+        let err = run(args, test_probe(), &bar)
+            .await
+            .expect_err("expected downmix/copy error");
+
+        // assert
+        assert!(err.to_string().contains("--stereo-downmix"));
+
+        // cleanup
+        let _ = fs::remove_file(input);
+    }
+
+    #[tokio::test]
+    async fn run_completes_with_process_fixture() {
+        // setup
+        let input = temp_input("fixture-run");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-encode-fixture-out-{}.mkv",
+            std::process::id()
+        ));
+        let args = encode_args(input.clone(), Some(output.clone()));
+        let bar = ProgressBar::new(120);
+        let _guard = FixtureGuard::set("stderr-ffmpeg-progress");
+
+        // execute
+        run(args, test_probe(), &bar).await.expect("encode run");
+
+        // assert
+        assert!(output.exists());
+
+        // cleanup
+        temporary::clean_all().await;
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[tokio::test]
+    async fn run_completes_with_video_only_and_downmix() {
+        // setup
+        let input = temp_input("video-only-downmix");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-encode-vo-out-{}.mkv",
+            std::process::id()
+        ));
+        let mut args = encode_args(input.clone(), Some(output.clone()));
+        args.encode.video_only = true;
+        args.encode.downmix_to_stereo = true;
+        let bar = ProgressBar::new(120);
+        let _guard = FixtureGuard::set("stderr-ffmpeg-progress");
+
+        // execute
+        run(args, test_probe(), &bar).await.expect("encode run");
+
+        // assert
+        assert!(output.exists());
+
+        // cleanup
+        temporary::clean_all().await;
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
 }

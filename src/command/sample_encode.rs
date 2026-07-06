@@ -841,3 +841,173 @@ pub enum Update {
     },
     Done(Output),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
+    use std::time::Duration;
+
+    mod helpers {
+        use super::*;
+
+        pub fn encode_result(
+            sample_size: u64,
+            encoded_size: u64,
+            sample_duration_secs: u64,
+            vmaf: Option<f32>,
+            xpsnr: Option<f32>,
+        ) -> EncodeResult {
+            EncodeResult {
+                sample_size,
+                encoded_size,
+                vmaf_score: vmaf,
+                xpsnr_score: xpsnr,
+                encode_time: Duration::from_secs(sample_duration_secs),
+                sample_duration: Duration::from_secs(sample_duration_secs),
+                from_cache: false,
+            }
+        }
+    }
+
+    use helpers::*;
+
+    trait Predictions: EncodeResults {}
+    impl Predictions for Vec<EncodeResult> {}
+
+    #[test]
+    fn encoded_percent_size_averages_multiple_samples() {
+        // setup
+        let results = vec![
+            encode_result(1000, 500, 10, Some(90.0), None),
+            encode_result(1000, 600, 10, Some(92.0), None),
+        ];
+
+        // execute / assert
+        assert!((results.encoded_percent_size() - 55.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn mean_scores_average_present_values() {
+        // setup
+        let results = vec![
+            encode_result(1000, 500, 10, Some(90.0), Some(88.0)),
+            encode_result(1000, 500, 10, Some(94.0), Some(92.0)),
+        ];
+
+        // execute / assert
+        assert_eq!(results.mean_vmaf_score(), Some(92.0));
+        assert_eq!(results.mean_xpsnr_score(), Some(90.0));
+    }
+
+    #[test]
+    fn estimate_encode_size_scales_by_duration_ratio() {
+        // setup
+        let results = vec![encode_result(1000, 500, 10, Some(90.0), None)];
+        let input_duration = Duration::from_secs(100);
+
+        // execute
+        let size = results.estimate_encode_size_by_duration(input_duration, false);
+
+        // assert — 500 bytes per 10s sample → 5000 for 100s input
+        assert_eq!(size, 5000);
+    }
+
+    #[test]
+    fn estimate_encode_time_scales_and_truncates_to_seconds() {
+        // setup
+        let results = vec![
+            encode_result(1000, 500, 10, None, Some(90.0)),
+            encode_result(1000, 500, 10, None, Some(91.0)),
+        ];
+        let input_duration = Duration::from_secs(100);
+
+        // execute
+        let estimate = results.estimate_encode_time(input_duration, false);
+
+        // assert — 20s total sample encode time scaled 5× → 100s
+        assert_eq!(estimate, Duration::from_secs(100));
+    }
+
+    #[test]
+    fn single_full_pass_prediction_uses_first_sample_only() {
+        // setup
+        let results = vec![
+            encode_result(1000, 400, 10, Some(90.0), None),
+            encode_result(1000, 900, 10, Some(95.0), None),
+        ];
+        let input_duration = Duration::from_secs(3600);
+
+        // execute / assert
+        assert_eq!(
+            results.estimate_encode_size_by_duration(input_duration, true),
+            400
+        );
+        assert_eq!(
+            results.estimate_encode_time(input_duration, true),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn encode_result_json_roundtrip_for_cache() {
+        // setup
+        let original = encode_result(1_000_000, 500_000, 20, Some(95.5), Some(92.0));
+
+        // execute
+        let bytes = serde_json::to_vec(&original).expect("serialize");
+        let decoded: EncodeResult = serde_json::from_slice(&bytes).expect("deserialize");
+
+        // assert
+        assert_eq!(decoded.sample_size, original.sample_size);
+        assert_eq!(decoded.encoded_size, original.encoded_size);
+        assert_eq!(decoded.vmaf_score, original.vmaf_score);
+        assert_eq!(decoded.xpsnr_score, original.xpsnr_score);
+        assert!(!decoded.from_cache);
+    }
+
+    #[rstest]
+    #[case::vmaf_only(false, Some(70.0), None, ScoreKind::Vmaf)]
+    #[case::xpsnr_only(true, None, Some(92.0), ScoreKind::Xpsnr)]
+    #[case::vmaf_when_both_present(false, Some(70.0), Some(92.0), ScoreKind::Vmaf)]
+    fn output_single_score_kind_matrix(
+        #[case] use_xpsnr: bool,
+        #[case] vmaf: Option<f32>,
+        #[case] xpsnr: Option<f32>,
+        #[case] expected: ScoreKind,
+    ) {
+        // setup
+        let output = Output {
+            vmaf_score: vmaf,
+            xpsnr_score: xpsnr,
+            predicted_encode_size: 0,
+            encode_percent: 0.0,
+            predicted_encode_time: Duration::ZERO,
+            from_cache: false,
+        };
+
+        // execute / assert
+        let _ = use_xpsnr;
+        assert_eq!(output.single_score_kind(), expected);
+    }
+
+    mod proptest_predictions {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn encoded_percent_monotonic_with_encoded_size(
+                sample_size in 1000u64..10_000u64,
+                encoded_a in 100u64..5000u64,
+                encoded_b in 100u64..5000u64,
+            ) {
+                let results_a = vec![encode_result(sample_size, encoded_a, 10, None, None)];
+                let results_b = vec![encode_result(sample_size, encoded_b, 10, None, None)];
+                let pct_a = results_a.encoded_percent_size();
+                let pct_b = results_b.encoded_percent_size();
+                prop_assert_eq!(pct_a <= pct_b, encoded_a <= encoded_b);
+            }
+        }
+    }
+}

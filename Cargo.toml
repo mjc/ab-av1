@@ -52,5 +52,10 @@ lto = true
 opt-level = "s"
 strip = true
 
+[dev-dependencies]
+proptest = "1"
+rstest = "0.24"
+test-case = "3"
+
 [lints.rust]
 unused_crate_dependencies = "deny"

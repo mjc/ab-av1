@@ -11,14 +11,35 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUST_BACKTRACE: 1
+      PROPTEST_CASES: "256"
     steps:
     - run: rustup update stable
     - uses: actions/checkout@v6
-    - run: cargo test --locked
+    - run: cargo install cargo-nextest --locked
+    - run: cargo nextest run --locked
     # check print-completions don't fail
     - run: cargo run --locked -- print-completions bash
     - run: cargo run --locked -- print-completions fish
     - run: cargo run --locked -- print-completions zsh
+
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: 1
+      PROPTEST_CASES: "256"
+    steps:
+    - run: rustup update stable
+    - uses: actions/checkout@v6
+    - run: rustup component add llvm-tools-preview
+    - run: cargo install cargo-llvm-cov --locked
+    - run: cargo install cargo-nextest --locked
+    - run: cargo install cargo-nextest --locked
+    - run: cargo llvm-cov nextest --locked --summary-only --fail-under-lines 80
+    - run: cargo llvm-cov nextest --locked --lcov --output-path lcov.info
+    - uses: actions/upload-artifact@v4
+      with:
+        name: lcov
+        path: lcov.info
 
   # Disabled while we no longer need cfg(windows) code
   # test-windows:

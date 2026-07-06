@@ -45,3 +45,74 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::sample_encode;
+    use std::time::Duration;
+
+    fn search_sample(crf: f32) -> super::super::Sample {
+        super::super::Sample {
+            crf,
+            q: crf.round() as i64,
+            enc: sample_encode::Output {
+                vmaf_score: Some(90.0),
+                xpsnr_score: None,
+                predicted_encode_size: 1_000_000,
+                encode_percent: 50.0,
+                predicted_encode_time: Duration::from_secs(60),
+                from_cache: false,
+            },
+        }
+    }
+
+    #[test]
+    fn ensure_other_ok_when_condition_true() {
+        // setup
+        // execute
+        let result = Error::ensure_other(true, "should not fail");
+        // assert
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn ensure_other_err_when_condition_false() {
+        // setup
+        // execute
+        let err = Error::ensure_other(false, "bad state").expect_err("expected error");
+        // assert
+        assert!(matches!(err, Error::Other(_)));
+        assert!(err.to_string().contains("bad state"));
+    }
+
+    #[test]
+    fn ensure_or_no_good_crf_returns_no_good_crf() {
+        // setup
+        let last = search_sample(32.0);
+        // execute
+        let err = Error::ensure_or_no_good_crf(false, &last).expect_err("expected NoGoodCrf");
+        // assert
+        assert!(matches!(err, Error::NoGoodCrf { .. }));
+        assert_eq!(err.to_string(), "Failed to find a suitable crf");
+    }
+
+    #[test]
+    fn from_anyhow_error_is_other() {
+        // setup
+        // execute
+        let err: Error = anyhow::anyhow!("boom").into();
+        // assert
+        assert!(matches!(err, Error::Other(_)));
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn ensure_or_no_good_crf_ok_when_condition_true() {
+        // setup
+        let last = search_sample(28.0);
+        // execute
+        // assert
+        assert!(Error::ensure_or_no_good_crf(true, &last).is_ok());
+    }
+}

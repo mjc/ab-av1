@@ -100,6 +100,67 @@ mod tests {
     use super::*;
     use std::{env, fs};
 
+    fn temp_path(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "ab-av1-temp-test-{}-{}",
+            label,
+            std::process::id()
+        ))
+    }
+
+
+    #[tokio::test]
+    async fn add_and_clean_all_removes_not_keepable() {
+        // setup
+        let path = temp_path("not-keepable");
+        fs::write(&path, b"temp").expect("write temp file");
+        add(&path, TempKind::NotKeepable);
+
+        // execute
+        clean_all().await;
+
+        // assert
+        assert!(!path.exists(), "NotKeepable file should be deleted");
+    }
+
+    #[tokio::test]
+    async fn clean_with_keep_keepables_preserves_keepable_files() {
+        // setup
+        let keep = temp_path("keepable");
+        let drop = temp_path("drop");
+        fs::write(&keep, b"keep").expect("write keepable");
+        fs::write(&drop, b"drop").expect("write not-keepable");
+        add(&keep, TempKind::Keepable);
+        add(&drop, TempKind::NotKeepable);
+
+        // execute
+        clean(true).await;
+
+        // assert
+        assert!(keep.exists(), "Keepable file should survive clean(true)");
+        assert!(!drop.exists(), "NotKeepable file should be deleted");
+
+        // cleanup
+        clean_all().await;
+    }
+
+    #[tokio::test]
+    async fn unadd_prevents_later_deletion() {
+        // setup
+        let path = temp_path("unadded");
+        fs::write(&path, b"stay").expect("write file");
+        add(&path, TempKind::NotKeepable);
+
+        // execute
+        let removed = unadd(&path);
+        clean_all().await;
+
+        // assert
+        assert!(removed);
+        assert!(path.exists(), "unadded file must not be deleted");
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn default_temp_dir_uses_input_directory_ab_kgc_11() {
         // setup

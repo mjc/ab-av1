@@ -252,3 +252,118 @@ pub fn remove_arg(args: &mut Vec<Arc<String>>, arg: &'static str) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    #[test]
+    fn pre_extension_name_maps_codecs() {
+        // setup / execute / assert
+        assert_eq!(pre_extension_name("libsvtav1"), "av1");
+        assert_eq!(pre_extension_name("libvpx-vp9"), "vp9");
+        assert_eq!(pre_extension_name("libx264"), "x264");
+    }
+
+    #[rstest]
+    #[case::libsvtav1("libsvtav1", "-crf", "-preset", 63.0)]
+    #[case::librav1e("librav1e", "-qp", "-speed", 40.0)]
+    #[case::libx264("libx264", "-crf", "-preset", 32.0)]
+    #[case::hevc_vt("hevc_videotoolbox", "-q:v", "-preset", 50.0)]
+    fn vcodec_arg_matrix(
+        #[case] codec: &str,
+        #[case] crf_arg: &str,
+        #[case] preset_arg: &str,
+        #[case] crf_in: f32,
+    ) {
+        // setup
+        let vcodec: Arc<str> = Arc::from(codec);
+
+        // execute / assert
+        assert_eq!(VCodecSpecific::crf_arg(&vcodec), crf_arg);
+        assert_eq!(VCodecSpecific::preset_arg(&vcodec), preset_arg);
+        assert_eq!(VCodecSpecific::crf(&vcodec, crf_in), crf_in.min(if codec == "libsvtav1" { 63.0 } else { crf_in }));
+    }
+
+    #[test]
+    fn sample_encode_hash_stable_for_identical_args() {
+        // setup
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let input = std::path::Path::new("/tmp/vid.mkv");
+        let args = FfmpegEncodeArgs {
+            input,
+            vcodec: Arc::from("libsvtav1"),
+            vfilter: Some("scale=1280:-1"),
+            pix_fmt: None,
+            crf: 30.0,
+            preset: Some(Arc::from("8")),
+            output_args: vec![],
+            input_args: vec![],
+            video_only: false,
+        };
+
+        // execute
+        let mut hasher_a = DefaultHasher::new();
+        let mut hasher_b = DefaultHasher::new();
+        args.sample_encode_hash(&mut hasher_a);
+        args.sample_encode_hash(&mut hasher_b);
+
+        // assert
+        assert_eq!(hasher_a.finish(), hasher_b.finish());
+    }
+
+    #[test]
+    fn sample_encode_hash_differs_when_crf_changes() {
+        // setup
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let input = std::path::Path::new("/tmp/vid.mkv");
+        let base = FfmpegEncodeArgs {
+            input,
+            vcodec: Arc::from("libsvtav1"),
+            vfilter: None,
+            pix_fmt: None,
+            crf: 30.0,
+            preset: None,
+            output_args: vec![],
+            input_args: vec![],
+            video_only: false,
+        };
+        let mut other = base.clone();
+        other.crf = 31.0;
+
+        // execute
+        let mut hash_a = DefaultHasher::new();
+        let mut hash_b = DefaultHasher::new();
+        base.sample_encode_hash(&mut hash_a);
+        other.sample_encode_hash(&mut hash_b);
+
+        // assert
+        assert_ne!(hash_a.finish(), hash_b.finish());
+    }
+
+    #[test]
+    fn remove_arg_strips_flag_and_value() {
+        // setup
+        let mut args = vec![
+            Arc::new("-preset".to_string()),
+            Arc::new("8".to_string()),
+            Arc::new("-crf".to_string()),
+            Arc::new("30".to_string()),
+        ];
+
+        // execute
+        remove_arg(&mut args, "-preset");
+
+        // assert
+        assert_eq!(
+            args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            vec!["-crf", "30"]
+        );
+    }
+}

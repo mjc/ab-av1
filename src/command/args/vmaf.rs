@@ -215,7 +215,10 @@ enum VmafModel {
 
 impl VmafModel {
     fn from_args(args: &[Arc<str>]) -> Option<Self> {
-        let mut using_custom_model: Vec<_> = args.iter().filter(|v| v.contains("model")).collect();
+        let mut using_custom_model: Vec<_> = args
+            .iter()
+            .filter(|v| is_vmaf_model_override(v))
+            .collect();
 
         match using_custom_model.len() {
             0 => None,
@@ -227,6 +230,11 @@ impl VmafModel {
             _ => Some(Self::Custom),
         }
     }
+}
+
+/// True when a libvmaf arg explicitly selects a model (not e.g. `phone_model=1`).
+fn is_vmaf_model_override(arg: &str) -> bool {
+    arg.split(':').any(|part| part.starts_with("model="))
 }
 
 #[test]
