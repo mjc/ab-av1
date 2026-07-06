@@ -263,6 +263,23 @@ mod tests {
         assert_eq!(args.extension.as_deref(), Some("avif"));
     }
 
+    // ab-kgc.43: extensionless outputs should inherit the input container for sample encoding
+    #[test]
+    fn set_extension_from_output_without_extension_falls_back_to_input_container() {
+        // setup
+        let mut args = sample_args(None, None, Duration::from_secs(60));
+
+        // execute — auto_encode only calls set_extension_from_output today
+        args.set_extension_from_output(Path::new("/out/encoded"));
+
+        // assert
+        assert_eq!(
+            args.extension.as_deref(),
+            Some("mkv"),
+            "extensionless output path must still yield a sample container extension"
+        );
+    }
+
     #[test]
     fn set_extension_from_output_uses_path_extension() {
         // setup
@@ -271,6 +288,28 @@ mod tests {
         args.set_extension_from_output(Path::new("out/sample.mkv"));
         // assert
         assert_eq!(args.extension.as_deref(), Some("mkv"));
+    }
+
+    // ab-kgc.33: sub-second sample_every should not be silently clamped to 1 second
+    #[test]
+    fn sample_count_honors_sub_second_sample_every() {
+        let args = sample_args(None, None, Duration::from_millis(500));
+        let count = args.sample_count(Duration::from_secs(10));
+        assert_eq!(
+            count, 20,
+            "10s / 500ms should yield 20 samples, not duration/1s"
+        );
+    }
+
+    // ab-kgc.19: explicit --samples 0 must not be silently raised
+    #[test]
+    fn sample_count_rejects_zero_samples_override() {
+        let args = sample_args(Some(0), None, Duration::from_secs(60));
+        assert_eq!(
+            args.sample_count(Duration::from_secs(3600)),
+            0,
+            "explicit --samples 0 must not be silently raised"
+        );
     }
 
     #[rstest]
@@ -286,5 +325,32 @@ mod tests {
         // execute
         // assert
         assert_eq!(xpsnr.fps(), expected);
+    }
+
+    // ab-kgc.82: xpsnr pix_format must participate in args hashing (distinct from cache key ab-kgc.21)
+    #[test]
+    fn xpsnr_hash_includes_pix_format() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a = Xpsnr {
+            xpsnr_fps: 60.0,
+            xpsnr_pix_format: Some(PixelFormat::Yuv420p),
+        };
+        let b = Xpsnr {
+            xpsnr_fps: 60.0,
+            xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+        };
+
+        let mut hash_a = DefaultHasher::new();
+        let mut hash_b = DefaultHasher::new();
+        a.hash(&mut hash_a);
+        b.hash(&mut hash_b);
+
+        assert_ne!(
+            hash_a.finish(),
+            hash_b.finish(),
+            "xpsnr_pix_format must affect Xpsnr hash"
+        );
     }
 }

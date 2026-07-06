@@ -409,6 +409,58 @@ mod tests {
         assert!(from_err.to_string().contains("oops"));
     }
 
+    // ab-kgc.91: spaced fraction strings appear in some ffprobe builds
+    #[test]
+    fn parse_frame_rate_fraction_with_spaces() {
+        assert_eq!(parse_frame_rate("24 / 1"), Some(24.0));
+    }
+
+    #[test]
+    fn nframes_propagates_duration_error() {
+        let err = ProbeError("bad duration".into());
+        let probe = probe_with(Ok(24.0), Err(err.clone()));
+        assert_eq!(probe.nframes(), Err(err));
+    }
+
+    #[test]
+    fn nframes_rejects_zero_duration() {
+        let probe = probe_with(Ok(24.0), Ok(Duration::ZERO));
+        assert!(probe.nframes().is_err());
+    }
+
+    // ab-kgc.92: ffprobe occasionally reports mixed-case pix_fmt strings
+    #[test]
+    fn pixel_format_accepts_uppercase_yuv420p() {
+        let mut probe = probe_with(Ok(24.0), Ok(Duration::from_secs(1)));
+        probe.pix_fmt = Some("YUV420P".into());
+        assert_eq!(probe.pixel_format(), Some(PixelFormat::Yuv420p));
+    }
+
+    // bug-hunt-red: infinite fps from ffprobe must fail nframes rather than wrapping
+    #[test]
+    fn nframes_rejects_infinite_fps() {
+        let probe = probe_with(Ok(f64::INFINITY), Ok(Duration::from_secs(10)));
+        assert!(probe.nframes().is_err());
+    }
+
+    #[test]
+    fn probe_webp_header_detects_image_on_ffprobe_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "ab-av1-probe-webp-{}.webp",
+            std::process::id()
+        ));
+        // Minimal RIFF WEBP header stub
+        std::fs::write(
+            &path,
+            b"RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00\x2f\x01\x00\x9d\x01\x2a\x01\x00\x01\x00\x02\x00\x34\x25\xa4\x00\x03\x70\x00\xfe\xfb\xfd\xc0\x00",
+        )
+        .expect("write webp stub");
+        let _guard = ForceFfprobeError::set();
+        let probe = probe(&path);
+        assert!(probe.is_image, "webp header must be detected when ffprobe fails");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn probe_reads_zero_duration_from_minimal_gif() {
         // setup: 1×1 GIF — ffprobe succeeds, format duration is zero.

@@ -109,4 +109,22 @@ mod tests {
         assert_eq!(completion, LogicalScoreCompletion::Done(Score::new(97.5)));
         assert!(completion.is_done());
     }
+
+    // ab-kgc.44: first parsed score must win when ffmpeg prints duplicate score lines
+    #[test]
+    fn logical_score_completion_keeps_first_score_when_duplicated() {
+        // setup
+        let mut completion = LogicalScoreCompletion::Pending;
+
+        // execute
+        completion.record(&ScoreStreamParse::LogicalDone(Score::new(97.5)));
+        completion.record(&ScoreStreamParse::LogicalDone(Score::new(88.0)));
+
+        // assert
+        assert_eq!(
+            completion,
+            LogicalScoreCompletion::Done(Score::new(97.5)),
+            "duplicate score lines must not overwrite the first logical score"
+        );
+    }
 }

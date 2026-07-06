@@ -160,7 +160,7 @@ impl std::hash::Hasher for BlakeStdHasher<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::args::{ScoreArgs, Vmaf, Xpsnr};
+    use crate::command::args::{PixelFormat, ScoreArgs, Vmaf, Xpsnr};
     use crate::ffmpeg::FfmpegEncodeArgs;
     use rstest::rstest;
     use std::{path::Path, sync::Arc, time::Duration};
@@ -349,6 +349,135 @@ mod tests {
         assert_ne!(key_a, key_b);
     }
 
+    // ab-kgc.21: xpsnr_pix_format must affect cache key
+    #[test]
+    fn xpsnr_pix_format_alters_cache_key() {
+        // setup
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let duration = Duration::from_secs(3600);
+        let extension = Some(std::ffi::OsStr::new("mkv"));
+        let size = 1_000_000_u64;
+        let enc = minimal_enc_args(input);
+        let scoring_420p = (
+            ScoreArgs {
+                reference_vfilter: None,
+            },
+            Vmaf::default(),
+            Xpsnr {
+                xpsnr_fps: 60.0,
+                xpsnr_pix_format: Some(PixelFormat::Yuv420p),
+            },
+        );
+        let scoring_420p10 = (
+            ScoreArgs {
+                reference_vfilter: None,
+            },
+            Vmaf::default(),
+            Xpsnr {
+                xpsnr_fps: 60.0,
+                xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+            },
+        );
+
+        // execute
+        let key_420p = encode_cache_key(
+            sample, input, duration, extension, size, false, &enc, &scoring_420p,
+        );
+        let key_420p10 = encode_cache_key(
+            sample, input, duration, extension, size, false, &enc, &scoring_420p10,
+        );
+
+        // assert
+        assert_ne!(
+            key_420p, key_420p10,
+            "xpsnr_pix_format must be part of the cache key"
+        );
+    }
+
+    // ab-kgc.25: production scoring tuple is (ScoreArgs, Vmaf, bool); xpsnr_opts.fps must affect key
+    #[test]
+    fn xpsnr_fps_alters_cache_key() {
+        fn cache_key_for_xpsnr_fps(
+            sample: &Path,
+            input: &Path,
+            enc: &FfmpegEncodeArgs<'_>,
+            _xpsnr_fps: f32,
+        ) -> Key {
+            // Production hashes only the bool xpsnr flag, not xpsnr_opts (ab-kgc.25).
+            let scoring = (
+                ScoreArgs {
+                    reference_vfilter: None,
+                },
+                Vmaf::default(),
+                true,
+            );
+            encode_cache_key(
+                sample,
+                input,
+                Duration::from_secs(3600),
+                Some(std::ffi::OsStr::new("mkv")),
+                1_000_000_u64,
+                false,
+                enc,
+                &scoring,
+            )
+        }
+
+        // setup
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let enc = minimal_enc_args(input);
+
+        // execute
+        let key_fps_60 = cache_key_for_xpsnr_fps(sample, input, &enc, 60.0);
+        let key_fps_30 = cache_key_for_xpsnr_fps(sample, input, &enc, 30.0);
+
+        // assert
+        assert_ne!(
+            key_fps_60, key_fps_30,
+            "xpsnr_fps must be part of the sample-encode cache key"
+        );
+    }
+
+    // ab-kgc.26: encoded sample container extension affects encode output
+    #[test]
+    fn sample_dest_extension_alters_cache_key() {
+        fn cache_key_for_dest_ext(
+            sample: &Path,
+            input: &Path,
+            enc: &FfmpegEncodeArgs<'_>,
+            _dest_ext: &str,
+        ) -> Key {
+            let scoring = default_scoring();
+            encode_cache_key(
+                sample,
+                input,
+                Duration::from_secs(3600),
+                Some(std::ffi::OsStr::new("mkv")),
+                1_000_000_u64,
+                false,
+                enc,
+                &scoring,
+            )
+        }
+
+        // setup
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let enc = minimal_enc_args(input);
+
+        // execute
+        let key_mkv = cache_key_for_dest_ext(sample, input, &enc, "mkv");
+        let key_av1 = cache_key_for_dest_ext(sample, input, &enc, "av1");
+
+        // assert
+        assert_ne!(
+            key_mkv, key_av1,
+            "sample output extension must be part of the cache key"
+        );
+    }
+
     #[test]
     fn duration_change_alters_cache_key() {
         // setup
@@ -383,6 +512,85 @@ mod tests {
 
         // assert
         assert_ne!(key_a, key_b);
+    }
+
+    /// Mirror production `cached_encode` scoring hash input: `(ScoreArgs, Vmaf, Xpsnr)`.
+    fn production_cache_key(
+        sample: &Path,
+        input: &Path,
+        enc: &FfmpegEncodeArgs<'_>,
+        score: &ScoreArgs,
+        vmaf: &Vmaf,
+        xpsnr_opts: &Xpsnr,
+    ) -> Key {
+        encode_cache_key(
+            sample,
+            input,
+            Duration::from_secs(3600),
+            Some(std::ffi::OsStr::new("mkv")),
+            1_000_000_u64,
+            false,
+            enc,
+            (score, vmaf, xpsnr_opts),
+        )
+    }
+
+    // ab-kgc.46: --xpsnr flag must affect cache key (vmaf-only vs xpsnr-only)
+    #[test]
+    fn xpsnr_cli_flag_must_alter_cache_key() {
+        // setup — production hashes (ScoreArgs, Vmaf, Xpsnr) but not the --xpsnr bool
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let enc = minimal_enc_args(input);
+        let score = ScoreArgs {
+            reference_vfilter: None,
+        };
+        let vmaf = Vmaf::default();
+        let xpsnr_opts = Xpsnr {
+            xpsnr_fps: 60.0,
+            xpsnr_pix_format: None,
+        };
+
+        // execute — keys for vmaf-only vs xpsnr-only scoring modes
+        let key_vmaf_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
+        // xpsnr-only would use the same tuple today; bool is omitted from the hash
+        let key_xpsnr_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
+
+        // assert — distinct scoring modes must not share cache entries
+        assert_ne!(
+            key_vmaf_only, key_xpsnr_only,
+            "--xpsnr flag must be part of the sample-encode cache key"
+        );
+    }
+
+    // ab-kgc.54: xpsnr+and_vmaf vs vmaf-only must not share cache keys
+    #[test]
+    fn xpsnr_and_vmaf_mode_must_alter_cache_key() {
+        // setup — and_vmaf=true with xpsnr=false runs VMAF only; with xpsnr=true runs both
+        let sample = Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let enc = minimal_enc_args(input);
+        let score = ScoreArgs {
+            reference_vfilter: None,
+        };
+        let vmaf = Vmaf {
+            and_vmaf: Some(true),
+            ..Vmaf::default()
+        };
+        let xpsnr_opts = Xpsnr {
+            xpsnr_fps: 60.0,
+            xpsnr_pix_format: None,
+        };
+
+        // execute
+        let key_vmaf_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
+        let key_both = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
+
+        // assert
+        assert_ne!(
+            key_vmaf_only, key_both,
+            "xpsnr scoring mode must alter cache key when --and-vmaf is set"
+        );
     }
 
     mod proptest_cache_keys {

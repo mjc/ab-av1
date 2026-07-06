@@ -337,6 +337,37 @@ mod tests {
         }
     }
 
+    // ab-kgc.90: auto-encode must reject --stereo-downmix with --acodec copy before search
+    #[tokio::test]
+    async fn rejects_stereo_downmix_with_copy_codec_before_search() {
+        let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
+        // setup
+        let input = temp_input("downmix-copy");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-auto-downmix-out-{}-{}.mkv",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let mut args = auto_args(input.clone(), Some(output), false);
+        args.encode.downmix_to_stereo = true;
+        args.encode.audio_codec = Some("copy".into());
+        let _guard = MockGuard::crf(|_crf| mock_output(96.0));
+
+        // execute
+        let err = auto_encode(args)
+            .await
+            .expect_err("expected downmix/copy rejection before crf search");
+
+        // assert
+        assert!(
+            err.to_string().contains("--stereo-downmix"),
+            "auto-encode must reject --stereo-downmix with --acodec copy before search"
+        );
+
+        // cleanup
+        let _ = fs::remove_file(input);
+    }
+
     #[tokio::test]
     async fn rejects_same_input_and_output_without_overwrite() {
         let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");

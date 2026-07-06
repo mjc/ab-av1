@@ -104,10 +104,84 @@ impl VmafOut {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::process::CommandExt;
     use std::env;
+    use std::path::Path;
     use std::pin::Pin;
     use tokio::process::Command;
     use tokio_stream::StreamExt;
+
+    fn assert_suppresses_non_video_streams(cmd: &Command) {
+        let cmd_str = cmd.to_cmd_str();
+        for flag in ["-an", "-sn", "-dn"] {
+            assert!(
+                cmd_str.split_whitespace().any(|arg| arg == flag),
+                "expected {flag} in `{cmd_str}`"
+            );
+        }
+    }
+
+    // ab-kgc.93: ffmpeg capitalizes VMAF score lines on some builds
+    #[test]
+    fn parse_vmaf_score_accepts_capitalized_label() {
+        let mut chunks = Chunks::default();
+        let line = b"[Parsed_libvmaf_0 @ 0x1] VMAF Score: 88.125000\n";
+        let out = VmafOut::try_from_chunk(line, &mut chunks);
+        assert!(
+            matches!(out, Some(VmafOut::Done(score)) if (score - 88.125).abs() < 1e-6),
+            "expected capitalized VMAF score parse, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn vmaf_build_command_distorted_input_is_stream_zero() {
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[dis][ref]libvmaf",
+            Some(25.0),
+        );
+        let cmd_str = cmd.to_cmd_str();
+        let dist_pos = cmd_str.find("dist.mkv").expect("distorted path");
+        let ref_pos = cmd_str.find("ref.mkv").expect("reference path");
+        assert!(
+            dist_pos < ref_pos,
+            "distorted input must precede reference for [0:v] mapping: `{cmd_str}`"
+        );
+        assert!(cmd_str.contains("-r 25"));
+        assert_suppresses_non_video_streams(&cmd);
+    }
+
+    #[test]
+    fn vmaf_build_command_omits_fps_override_when_none() {
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[dis][ref]libvmaf",
+            None,
+        );
+        let cmd_str = cmd.to_cmd_str();
+        assert!(
+            !cmd_str.split_whitespace().any(|arg| arg == "-r"),
+            "native frame rate must omit -r: `{cmd_str}`"
+        );
+    }
+
+    // ab-kgc.94: VMAF and XPSNR must agree on ffmpeg input ordering
+    #[test]
+    fn vmaf_and_xpsnr_build_commands_use_same_input_order() {
+        let reference = Path::new("ref.mkv");
+        let distorted = Path::new("dist.mkv");
+        let filter = "[0:v][1:v]score";
+        let fps = Some(25.0);
+        let vmaf_cmd = build_ffmpeg_command(reference, distorted, filter, fps).to_cmd_str();
+        let xpsnr_cmd =
+            crate::xpsnr::build_ffmpeg_command(reference, distorted, filter, fps).to_cmd_str();
+        assert_eq!(
+            vmaf_cmd, xpsnr_cmd,
+            "score runners must use identical ffmpeg input ordering"
+        );
+    }
 
     const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
     const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";

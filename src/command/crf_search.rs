@@ -946,6 +946,49 @@ mod crf_search_tests {
         assert!((tried[1] - 20.0).abs() < f32::EPSILON, "got {:?}", *tried);
     }
 
+    // ab-kgc.35: validate should reject inverted/equal crf bounds before streaming search
+    #[test]
+    fn validate_rejects_min_crf_gte_max_crf() {
+        // setup
+        let mut args = search_args(Some(95.0), None, true);
+        args.min_crf = Some(40.0);
+        args.max_crf = Some(30.0);
+
+        // execute / assert
+        assert!(
+            args.validate().is_err(),
+            "min_crf >= max_crf must fail validation before search starts"
+        );
+    }
+
+    // ab-kgc.36: --min-xpsnr search must fall back to VMAF when XPSNR is absent
+    #[test]
+    fn output_search_score_uses_vmaf_fallback_when_xpsnr_missing() {
+        // setup — and-vmaf runs can still lack per-sample XPSNR on cache hits
+        let enc = mock_output(Some(96.0), None, 50.0);
+
+        // execute / assert
+        assert_eq!(
+            output_search_score(&enc, true),
+            96.0,
+            "use_xpsnr search should fall back to VMAF when XPSNR score is missing"
+        );
+    }
+
+    // ab-kgc.27: --min-xpsnr must win over --min-vmaf when both are set
+    #[test]
+    fn min_score_prefers_xpsnr_when_both_thresholds_set() {
+        // setup — clap group prevents CLI double-set; programmatic Args can still carry both
+        let args = search_args(Some(95.0), Some(90.0), true);
+
+        // execute / assert
+        assert_eq!(
+            args.min_score(),
+            90.0,
+            "min_score must use --min-xpsnr when both thresholds are present"
+        );
+    }
+
     #[tokio::test]
     async fn thorough_mode_accepts_score_within_tolerance_band() {
         // setup
@@ -995,11 +1038,178 @@ mod crf_search_tests {
         assert!(guess_progress(6, 1.0, true) <= super::BAR_LEN as f64);
     }
 
+    // ab-kgc.29: adjacent l_bound must not return Done when lower still misses min_score
+    #[tokio::test]
+    async fn adjacent_l_bound_done_requires_min_score() {
+        let args = search_args_with_crf_range(Some(95.0), None, true, Some(24.0), Some(26.0));
+        let _guard = MockGuard::set(move |crf| {
+            let vmaf = match crf.round() as i32 {
+                25 => 93.0,
+                26 => 92.0,
+                _ => 80.0,
+            };
+            mock_output(Some(vmaf), None, 50.0)
+        });
+
+        let updates = collect_run(args, test_probe()).await.expect("run");
+        let done = last_done(&updates).expect("expected Done");
+        assert!(
+            done.enc.vmaf_score.unwrap_or(0.0) >= 95.0,
+            "Done sample must meet min_score, got {:?}",
+            done.enc.vmaf_score
+        );
+    }
+
+    // ab-kgc.41: run() must use min_xpsnr threshold when both min scores set programmatically
+    #[tokio::test]
+    async fn run_uses_xpsnr_threshold_when_both_min_scores_set() {
+        let mut args = search_args(Some(95.0), Some(90.0), true);
+        args.args.encoder = "libsvtav1".parse().unwrap();
+        let _guard = MockGuard::set(move |_crf| mock_output(Some(85.0), Some(92.0), 50.0));
+
+        let updates = collect_run(args, test_probe()).await.expect("run");
+        let done = last_done(&updates).expect("expected Done with XPSNR >= 90");
+        assert!(
+            done.enc.xpsnr_score.unwrap_or(0.0) >= 90.0,
+            "search must succeed against --min-xpsnr 90, got {:?}",
+            done.enc.xpsnr_score
+        );
+    }
+
+    // ab-kgc.87: max_encoded_percent must be positive
+    #[test]
+    fn validate_rejects_non_positive_max_encoded_percent() {
+        let mut args = search_args(Some(95.0), None, true);
+        args.max_encoded_percent = 0.0;
+        let err = args.validate().expect_err("zero max_encoded_percent");
+        assert!(err.to_string().contains("max-encoded-percent"));
+
+        args.max_encoded_percent = -1.0;
+        let err = args.validate().expect_err("negative max_encoded_percent");
+        assert!(err.to_string().contains("max-encoded-percent"));
+    }
+
+    // ab-kgc.86: validate must reject both min_vmaf and min_xpsnr set programmatically
+    #[test]
+    fn validate_rejects_both_min_vmaf_and_min_xpsnr() {
+        let args = search_args(Some(95.0), Some(90.0), true);
+        let err = args.validate().expect_err("both min scores set");
+        assert!(
+            err.to_string().contains("min-vmaf") || err.to_string().contains("min-xpsnr"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_positional_vmaf_number_without_min_vmaf() {
+        let mut args = search_args(None, None, true);
+        args.vmaf.vmaf_args = vec!["95".into()];
+        let err = args.validate().expect_err("positional vmaf number");
+        assert!(err.to_string().contains("--min-vmaf 95"));
+    }
+
+    #[tokio::test]
+    async fn cut_on_iter2_disabled_at_exact_half_default_span() {
+        // libsvtav1 default span 5..70 = 65; half = 32.5; range 5..37.5 spans exactly 32.5
+        let args = search_args_with_crf_range(Some(95.0), None, true, Some(5.0), Some(37.5));
+        let crfs = Arc::new(Mutex::new(Vec::new()));
+        let crfs2 = crfs.clone();
+        let _guard = MockGuard::set(move |crf| {
+            crfs2.lock().unwrap().push(crf);
+            mock_output(Some(80.0), None, 50.0)
+        });
+
+        let _ = collect_run(args, test_probe()).await;
+        let tried = crfs.lock().unwrap();
+        assert!(tried.len() >= 2);
+        assert!(
+            (tried[1] - 5.0).abs() < f32::EPSILON,
+            "at exactly half default span cut_on_iter2 must be off; second crf should be min_crf, got {:?}",
+            *tried
+        );
+    }
+
+    // ab-kgc.84: guess_progress must not jump backwards between runs
+    #[test]
+    fn guess_progress_non_decreasing_at_run_boundaries() {
+        let prev = guess_progress(4, 1.0, false);
+        let next = guess_progress(5, 0.0, false);
+        assert!(
+            next >= prev,
+            "progress must not jump backwards between runs: {prev} -> {next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_good_crf_when_score_meets_threshold_but_size_exceeds_at_max_q() {
+        let args = search_args_with_crf_range(Some(95.0), None, true, Some(24.0), Some(26.0));
+        let _guard = MockGuard::set(move |crf| {
+            let (vmaf, pct) = if (crf - 26.0).abs() < f32::EPSILON {
+                (96.0, 90.0)
+            } else {
+                (80.0, 50.0)
+            };
+            mock_output(Some(vmaf), None, pct)
+        });
+
+        let err = collect_run(args, test_probe()).await.expect_err("oversized good score at max");
+        assert!(matches!(err, Error::NoGoodCrf { .. }));
+    }
+
+    // ab-kgc.88: non-thorough search must not accept first hit far above tolerance band
+    #[tokio::test]
+    async fn non_thorough_rejects_score_above_tolerance_band() {
+        let min_score = 95.0;
+        let args = search_args(Some(min_score), None, false);
+        let _guard = MockGuard::set(move |_crf| mock_output(Some(min_score + 0.15), None, 50.0));
+
+        let updates = collect_run(args, test_probe()).await.expect("run");
+        let done = last_done(&updates).expect("expected Done");
+        assert!(
+            done.enc.vmaf_score.unwrap() <= min_score + 0.11,
+            "non-thorough must not accept first hit far above tolerance, got {}",
+            done.enc.vmaf_score.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn high_crf_means_hq_encoder_search_converges() {
+        let mut args = search_args_with_crf_range(Some(95.0), None, true, Some(10.0), Some(50.0));
+        args.args.encoder = "hevc_videotoolbox".parse().unwrap();
+        args.high_crf_means_hq = Some(true);
+        args.crf_increment = Some(1.0);
+        let _guard = MockGuard::set(move |crf| {
+            // Higher CRF → higher quality for videotoolbox (high_crf_means_hq).
+            let vmaf = 70.0 + crf * 0.5;
+            mock_output(Some(vmaf), None, 50.0)
+        });
+
+        let updates = collect_run(args, test_probe()).await.expect("run");
+        let done = last_done(&updates).expect("expected Done");
+        assert!(
+            done.enc.vmaf_score.unwrap_or(0.0) >= 95.0,
+            "high_crf_means_hq search must find acceptable CRF, got {:?}",
+            done.enc.vmaf_score
+        );
+    }
+
     mod proptest_crf_search {
         use super::*;
         use proptest::prelude::*;
 
         proptest! {
+            // ab-kgc.85: guess_progress must stay within progress bar length
+            #[test]
+            fn guess_progress_stays_within_bar_len(
+                run in 1usize..20,
+                sample_progress in 0.0f32..1.5,
+                thorough in proptest::bool::ANY,
+            ) {
+                let progress = guess_progress(run, sample_progress, thorough);
+                prop_assert!(progress >= 0.0);
+                prop_assert!(progress <= super::super::BAR_LEN as f64);
+            }
+
             #[test]
             fn vmaf_lerp_q_bounded_between_samples(
                 worse_score in 80.0f32..94.0f32,

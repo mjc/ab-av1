@@ -347,6 +347,29 @@ mod tests {
         assert_ne!(hash_a.finish(), hash_b.finish());
     }
 
+    // ab-kgc.24: duplicate ffmpeg flags should survive single removal
+    #[test]
+    fn remove_arg_strips_only_first_matching_pair() {
+        // setup — duplicate flags should require multiple removals or retain extras
+        let mut args = vec![
+            Arc::new("-preset".to_string()),
+            Arc::new("8".to_string()),
+            Arc::new("-preset".to_string()),
+            Arc::new("6".to_string()),
+            Arc::new("-crf".to_string()),
+            Arc::new("30".to_string()),
+        ];
+
+        // execute
+        remove_arg(&mut args, "-preset");
+
+        // assert — second -preset pair must survive one removal
+        assert_eq!(
+            args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            vec!["-preset", "6", "-crf", "30"]
+        );
+    }
+
     #[test]
     fn remove_arg_strips_flag_and_value() {
         // setup
@@ -365,5 +388,131 @@ mod tests {
             args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             vec!["-crf", "30"]
         );
+    }
+
+    // ab-kgc.71: libaom-av1 sample filenames should use av1 suffix
+    #[test]
+    fn pre_extension_name_libaom_av1_uses_av1_suffix() {
+        assert_eq!(pre_extension_name("libaom-av1"), "av1");
+    }
+
+    // ab-kgc.72: libdav1d codec names should produce av1 extension
+    #[test]
+    fn pre_extension_name_libdav1d_uses_av1_suffix() {
+        assert_eq!(pre_extension_name("libdav1d"), "av1");
+    }
+
+    // ab-kgc.73: bare svtav1 encoder names should normalize like libsvtav1
+    #[test]
+    fn pre_extension_name_bare_svtav1_uses_av1_suffix() {
+        assert_eq!(pre_extension_name("svtav1"), "av1");
+    }
+
+    // ab-kgc.76: remove_arg must not consume a value token that looks like another flag
+    #[test]
+    fn remove_arg_preserves_value_when_it_matches_a_flag_name() {
+        let mut args = vec![
+            Arc::new("-preset".to_string()),
+            Arc::new("-crf".to_string()),
+            Arc::new("30".to_string()),
+        ];
+
+        remove_arg(&mut args, "-preset");
+
+        assert_eq!(
+            args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            vec!["-crf", "30"]
+        );
+    }
+
+    #[test]
+    fn sample_encode_hash_differs_when_output_args_change() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let input = std::path::Path::new("/tmp/vid.mkv");
+        let base = FfmpegEncodeArgs {
+            input,
+            vcodec: Arc::from("libx264"),
+            vfilter: None,
+            pix_fmt: None,
+            crf: 30.0,
+            preset: None,
+            output_args: vec![],
+            input_args: vec![],
+            video_only: false,
+        };
+        let mut other = base.clone();
+        other.output_args = vec![Arc::from("-g".to_string()), Arc::from("240".to_string())];
+
+        let mut hash_a = DefaultHasher::new();
+        let mut hash_b = DefaultHasher::new();
+        base.sample_encode_hash(&mut hash_a);
+        other.sample_encode_hash(&mut hash_b);
+
+        assert_ne!(hash_a.finish(), hash_b.finish());
+    }
+
+    #[test]
+    fn sample_encode_hash_differs_when_input_args_change() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let input = std::path::Path::new("/tmp/vid.mkv");
+        let base = FfmpegEncodeArgs {
+            input,
+            vcodec: Arc::from("libx264"),
+            vfilter: None,
+            pix_fmt: None,
+            crf: 30.0,
+            preset: None,
+            output_args: vec![],
+            input_args: vec![],
+            video_only: false,
+        };
+        let mut other = base.clone();
+        other.input_args = vec![Arc::from("-ss".to_string()), Arc::from("12".to_string())];
+
+        let mut hash_a = DefaultHasher::new();
+        let mut hash_b = DefaultHasher::new();
+        base.sample_encode_hash(&mut hash_a);
+        other.sample_encode_hash(&mut hash_b);
+
+        assert_ne!(hash_a.finish(), hash_b.finish());
+    }
+
+    #[rstest]
+    #[case::libaom_av1("libaom-av1", "-cpu-used", "-crf")]
+    #[case::mpeg2video("mpeg2video", "-preset", "-q")]
+    #[case::h264_nvenc("h264_nvenc", "-preset", "-cq")]
+    #[case::h264_vaapi("h264_vaapi", "-preset", "-q")]
+    #[case::h264_qsv("h264_qsv", "-preset", "-global_quality")]
+    fn vcodec_arg_matrix_extended(
+        #[case] codec: &str,
+        #[case] preset_arg: &str,
+        #[case] crf_arg: &str,
+    ) {
+        let vcodec: Arc<str> = Arc::from(codec);
+        assert_eq!(VCodecSpecific::preset_arg(&vcodec), preset_arg);
+        assert_eq!(VCodecSpecific::crf_arg(&vcodec), crf_arg);
+    }
+
+    // ab-kgc.74: bare libvpx should normalize like libvpx-vp9
+    #[test]
+    fn pre_extension_name_libvpx_is_vp9() {
+        assert_eq!(pre_extension_name("libvpx"), "vp9");
+    }
+
+    // ab-kgc.75: sample cache filenames must distinguish libaom from libsvtav1
+    #[test]
+    fn pre_extension_name_libaom_and_svtav1_share_av1_suffix() {
+        assert_eq!(pre_extension_name("libaom-av1"), pre_extension_name("libsvtav1"));
+    }
+
+    #[test]
+    fn libsvtav1_crf_caps_above_ffmpeg_limit() {
+        let vcodec: Arc<str> = Arc::from("libsvtav1");
+        assert_eq!(VCodecSpecific::crf(&vcodec, 70.0), 63.0);
+        assert_eq!(VCodecSpecific::crf(&vcodec, 63.0), 63.0);
     }
 }

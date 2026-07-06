@@ -155,6 +155,65 @@ mod test {
     }
 
     #[test]
+    fn xpsnr_build_command_reference_input_is_stream_zero() {
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[ref][dis]xpsnr",
+            Some(25.0),
+        );
+        let cmd_str = cmd.to_cmd_str();
+        let ref_pos = cmd_str.find("ref.mkv").expect("reference path");
+        let dist_pos = cmd_str.find("dist.mkv").expect("distorted path");
+        assert!(
+            ref_pos < dist_pos,
+            "reference input must precede distorted for [0:v] mapping: `{cmd_str}`"
+        );
+        assert!(cmd_str.contains("-r 25"));
+    }
+
+    #[test]
+    fn xpsnr_build_command_omits_fps_override_when_none() {
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[ref][dis]xpsnr",
+            None,
+        );
+        let cmd_str = cmd.to_cmd_str();
+        assert!(
+            !cmd_str.split_whitespace().any(|arg| arg == "-r"),
+            "native frame rate must omit -r: `{cmd_str}`"
+        );
+    }
+
+    // bug-hunt-red: per-frame XPSNR progress lines must not emit Done early
+    #[test]
+    fn xpsnr_per_frame_lines_do_not_emit_done() {
+        let mut chunks = Chunks::default();
+        let line = b"n:   12  XPSNR y: 41.0726  XPSNR u: 39.7731  XPSNR v: 42.5210\n";
+        assert!(
+            XpsnrOut::try_from_chunk(line, &mut chunks).is_none(),
+            "per-frame XPSNR lines must not complete scoring"
+        );
+    }
+
+    #[test]
+    fn score_from_line_parses_minimum_inf() {
+        let score = score_from_line(
+            "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: inf  u: inf  v: inf  (minimum: inf)",
+        );
+        assert_eq!(score, Some(f32::INFINITY));
+    }
+
+    // ab-kgc.95: trailing average line without minimum should still yield a score
+    #[test]
+    fn score_from_line_parses_trailing_average_without_minimum() {
+        let score = score_from_line("XPSNR average, 1344 frames  y: 40.7139");
+        assert_eq!(score, Some(40.7139));
+    }
+
+    #[test]
     fn score_runners_suppress_non_video_streams_consistently() {
         // setup
         let reference = Path::new("ref.mkv");

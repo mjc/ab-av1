@@ -764,10 +764,55 @@ fn parse_enc_arg_adds_leading_dash() {
     assert_eq!(arg, "-x265-params=lossless=1");
 }
 
+// ab-kgc.30: CLI docs promise 0.1 increment for libvpx-vp9
+#[test]
+fn libvpx_vp9_default_crf_increment_matches_docs() {
+    let enc = Encoder::for_test("libvpx-vp9");
+    assert_eq!(
+        enc.default_crf_increment(),
+        0.1,
+        "libvpx-vp9 should use 0.1 crf increment per Args docs"
+    );
+}
+
+#[test]
+fn hevc_videotoolbox_default_max_crf_matches_encoder() {
+    let enc = Encoder::for_test("hevc_videotoolbox");
+    assert_eq!(enc.default_max_crf(), 100.0);
+    assert_eq!(enc.default_min_crf(), 10.0);
+}
+
+#[test]
+fn to_ffmpeg_args_libvpx_vp9_constant_quality_default() {
+    let enc = Encode {
+        encoder: Encoder("libvpx-vp9".into()),
+        input: "vid.webm".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+    let args = enc
+        .to_ffmpeg_args(32.0, &test_probe(120, 24.0))
+        .expect("to_ffmpeg_args");
+    assert!(
+        args.output_args
+            .windows(2)
+            .any(|w| w[0].as_str() == "-b:v" && w[1].as_str() == "0"),
+        "libvpx-vp9 needs -b:v 0 for CRF mode: {:?}",
+        args.output_args
+    );
+}
+
 #[rstest]
 #[case::libx264("libx264", 0.1, 10.0, 46.0)]
 #[case::libx265("libx265", 0.1, 10.0, 46.0)]
 #[case::libsvtav1("libsvtav1", 0.25, 5.0, 70.0)]
+#[case::libvpx_vp9("libvpx-vp9", 0.1, 10.0, 55.0)]
 #[case::mpeg2("mpeg2video", 1.0, 2.0, 30.0)]
 #[case::librav1e("librav1e", 1.0, 10.0, 255.0)]
 fn encoder_defaults_matrix(

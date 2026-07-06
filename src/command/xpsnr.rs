@@ -177,3 +177,13 @@ fn test_lavfi_all() {
          [ref][dis]xpsnr"
     );
 }
+
+// ab-kgc.96: XPSNR lavfi should sync timestamps like VMAF analysis graphs
+#[test]
+fn xpsnr_lavfi_includes_timestamp_sync_filters() {
+    let filter = lavfi(None, Some(PixelFormat::Yuv420p));
+    assert!(
+        filter.contains("setpts=PTS-STARTPTS") && filter.contains("settb=AVTB"),
+        "xpsnr lavfi must sync presentation timestamps: {filter}"
+    );
+}

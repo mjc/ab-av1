@@ -317,8 +317,11 @@ mod tests {
         }
     }
 
+    // ab-kgc.89: default output extension must preserve input container for webm/mov
     #[test_case("clip.mp4", false, "mp4"; "video mp4 keeps mp4")]
     #[test_case("clip.mkv", false, "mkv"; "video mkv keeps mkv")]
+    #[test_case("clip.webm", false, "webm"; "video webm keeps webm")]
+    #[test_case("clip.mov", false, "mov"; "video mov keeps mov")]
     #[test_case("still.png", true, "avif"; "image uses encoder default")]
     fn default_output_ext_cases(input_name: &str, is_image: bool, expected: &str) {
         // setup
@@ -343,6 +346,35 @@ mod tests {
 
         // assert
         assert_eq!(out, Path::new("movie.av1.mkv"));
+    }
+
+    #[tokio::test]
+    async fn run_cleans_temp_output_after_encode_failure() {
+        // setup
+        let input = temp_input("encode-fail");
+        let output = env::temp_dir().join(format!(
+            "ab-av1-encode-fail-out-{}.mkv",
+            std::process::id()
+        ));
+        let args = encode_args(input.clone(), Some(output.clone()));
+        let bar = ProgressBar::new(1);
+        let _guard = FixtureGuard::set("stderr-badness-exit-7");
+
+        // execute
+        let err = run(args, test_probe(), &bar)
+            .await
+            .expect_err("expected encode failure");
+
+        // assert
+        assert!(!err.to_string().is_empty());
+        assert!(
+            !output.exists(),
+            "failed encode must remove temporary output file"
+        );
+
+        // cleanup
+        temporary::clean_all().await;
+        let _ = fs::remove_file(input);
     }
 
     #[tokio::test]

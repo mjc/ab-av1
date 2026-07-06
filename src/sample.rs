@@ -271,6 +271,19 @@ mod tests {
         assert!(!unknown_timestamp_retry(b"other failure"));
     }
 
+    // ab-kgc.42: partial message match must not miss alternate ffmpeg wording
+    #[test]
+    fn unknown_timestamp_retry_is_case_insensitive() {
+        // setup
+        let stderr = b"can't write packet with unknown timestamp\n";
+
+        // execute / assert
+        assert!(
+            unknown_timestamp_retry(stderr),
+            "retry detection should tolerate ffmpeg message casing changes"
+        );
+    }
+
     #[test]
     fn copy_command_uses_ffmpeg_program_by_default() {
         // setup

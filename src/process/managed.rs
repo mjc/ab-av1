@@ -877,6 +877,40 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // ab-kgc.45: terminate-on-drop must surface replay gaps for delayed subscribers
+    #[tokio::test]
+    async fn terminate_on_drop_stderr_stream_yields_replay_gap_for_delayed_subscriber() {
+        // setup
+        let cmd = fixture_command("vmaf-progress-score");
+        let process =
+            ManagedProcess::spawn("replay gap fixture", cmd).expect("spawn fixture");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut events = Box::pin(process.terminate_on_drop().stderr_events());
+
+        // execute
+        let mut saw_gap = false;
+        let mut saw_score = false;
+        while let Some(event) = events.next().await {
+            match event.expect("managed event") {
+                ManagedEvent::RawStderr(chunk) => {
+                    if String::from_utf8_lossy(chunk.as_bytes()).contains("VMAF score:") {
+                        saw_score = true;
+                        break;
+                    }
+                }
+                ManagedEvent::ReplayGap(_) => saw_gap = true,
+                ManagedEvent::ProcessDone(_) => break,
+            }
+        }
+
+        // assert
+        assert!(
+            saw_gap,
+            "delayed subscriber must be notified when replay buffer skipped data"
+        );
+        assert!(saw_score, "fixture should still yield a parseable score");
+    }
+
     #[tokio::test]
     async fn managed_process_collects_stderr_and_waits() {
         let cmd = fixture_command("stderr-progress");

@@ -191,6 +191,46 @@ mod tests {
         );
     }
 
+    // ab-kgc.65: leftover process dirs from interrupted runs must be tracked for cleanup
+    #[tokio::test]
+    async fn preexisting_process_dir_is_tracked_for_cleanup() {
+        // setup — simulate a previous run leaving the per-process temp dir on disk
+        let parent = temp_path("preexist-parent");
+        fs::create_dir_all(&parent).expect("create parent");
+        let run_dir = process_dir(Some(parent.clone()), None);
+        clean_all().await;
+        fs::create_dir_all(&run_dir).expect("recreate leftover process dir");
+
+        // execute — new run reuses the same process dir path
+        let run_dir_again = process_dir(Some(parent.clone()), None);
+        assert_eq!(run_dir, run_dir_again);
+
+        // assert — full cleanup must remove the pre-existing directory
+        clean(false).await;
+        assert!(
+            !run_dir.exists(),
+            "process_dir must register pre-existing run directories for cleanup"
+        );
+    }
+
+    // ab-kgc.66: nested temp dirs must not leave orphaned files when only the parent is registered
+    #[tokio::test]
+    async fn clean_all_removes_nested_temp_directory_contents() {
+        // setup
+        let parent = temp_path("nested-parent");
+        fs::create_dir_all(&parent).expect("create parent");
+        let nested = parent.join("inner.mkv");
+        fs::write(&nested, b"nested").expect("write nested file");
+        add(&parent, TempKind::NotKeepable);
+
+        // execute
+        clean_all().await;
+
+        // assert
+        assert!(!nested.exists(), "nested files must be removed with their temp dir");
+        assert!(!parent.exists(), "registered temp dir must be removed");
+    }
+
     #[test]
     fn explicit_temp_dir_overrides_input_directory_ab_kgc_11() {
         // setup

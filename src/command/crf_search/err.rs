@@ -108,6 +108,46 @@ mod tests {
     }
 
     #[test]
+    fn from_join_error_is_other_with_message() {
+        // setup
+        let join_err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                tokio::spawn(async { panic!("task boom") })
+                    .await
+                    .expect_err("spawned task should panic")
+            });
+
+        // execute
+        let err: Error = join_err.into();
+
+        // assert
+        assert!(matches!(err, Error::Other(_)));
+        assert!(
+            err.to_string().contains("task"),
+            "JoinError should surface in Display: {}",
+            err
+        );
+    }
+
+    // ab-kgc.34: NoGoodCrf should include the last attempted crf for actionable errors
+    #[test]
+    fn no_good_crf_display_includes_last_crf() {
+        // setup
+        let last = search_sample(37.5);
+        let err = Error::NoGoodCrf { last };
+
+        // execute
+        let message = err.to_string();
+
+        // assert
+        assert!(
+            message.contains("37.5") || message.contains("37"),
+            "NoGoodCrf display should mention last crf, got: {message}"
+        );
+    }
+
+    #[test]
     fn ensure_or_no_good_crf_ok_when_condition_true() {
         // setup
         let last = search_sample(28.0);
