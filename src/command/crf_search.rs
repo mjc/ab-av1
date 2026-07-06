@@ -338,6 +338,7 @@ pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
         .set_extension_from_input(&config.args.input, &config.args.encoder, &probe);
 
     let min_score = config.min_score();
+    let use_xpsnr = config.min_xpsnr.is_some();
     let max_encoded_percent = config.max_encoded_percent;
     let thorough = config.thorough;
     let enc_args = config.args.clone();
@@ -347,7 +348,7 @@ pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
     while let Some(update) = run.next().await {
         let update = update.inspect_err(|e| {
             if let Error::NoGoodCrf { last } = e {
-                last.print_attempt(&bar, min_score, max_encoded_percent);
+                last.print_attempt(&bar, min_score, max_encoded_percent, use_xpsnr);
             }
         })?;
         match update {
@@ -389,7 +390,9 @@ pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
                     result.print_attempt(&bar, sample, Some(crf))
                 }
             }
-            Update::RunResult(result) => result.print_attempt(&bar, min_score, max_encoded_percent),
+            Update::RunResult(result) => {
+                result.print_attempt(&bar, min_score, max_encoded_percent, use_xpsnr)
+            }
             Update::Done(best) => {
                 info!("crf {} successful", best.crf);
                 bar.finish_with_message("");
@@ -561,13 +564,21 @@ impl Sample {
         bar: &ProgressBar,
         min_score: f32,
         max_encoded_percent: MaxEncodedPercent,
+        use_xpsnr: bool,
     ) {
+        let score_v = output_search_score(&self.enc, use_xpsnr);
+        let score_kind = match (use_xpsnr, self.enc.xpsnr_score, self.enc.vmaf_score) {
+            (true, Some(_), _) => sample_encode::ScoreKind::Xpsnr,
+            (false, _, Some(_)) | (true, None, Some(_)) => sample_encode::ScoreKind::Vmaf,
+            (_, _, None) => sample_encode::ScoreKind::Xpsnr,
+        };
+
         if bar.is_hidden() {
             info!(
                 "crf {} {} {:.2} ({:.0}%){}",
                 TerseF32(self.crf),
-                self.enc.single_score_kind(),
-                self.enc.single_score(),
+                score_kind,
+                score_v,
                 self.enc.encode_percent,
                 if self.enc.from_cache { " (cache)" } else { "" }
             );
@@ -577,9 +588,8 @@ impl Sample {
         let crf_label = style("- crf").dim();
         let mut crf = style(TerseF32(self.crf));
 
-        let score_v = self.enc.single_score();
         let mut score = style(score_v);
-        let score_label = style(self.enc.single_score_kind()).dim();
+        let score_label = style(score_kind).dim();
         let mut percent = style!("{:.0}%", self.enc.encode_percent);
         let open = style("(").dim();
         let close = style(")").dim();
@@ -1156,6 +1166,22 @@ mod crf_search_tests {
 
         // assert
         assert!((26..=28).contains(&q));
+    }
+
+    #[test]
+    fn vmaf_lerp_q_falls_back_to_midpoint_for_non_monotonic_scores() {
+        let worse = Sample {
+            crf: 30.0,
+            q: 30,
+            enc: mock_output(Some(90.0), None, 50.0),
+        };
+        let better = Sample {
+            crf: 20.0,
+            q: 20,
+            enc: mock_output(Some(90.0), None, 50.0),
+        };
+
+        assert_eq!(vmaf_lerp_q(92.0, &worse, &better, false), 25);
     }
 
     #[tokio::test]

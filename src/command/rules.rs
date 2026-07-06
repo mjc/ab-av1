@@ -118,8 +118,13 @@ where
                 .map(|(arg, hint)| ValidationError::ReservedEncoderArg { arg, hint })
         }))
         .chain(output_args.into_iter().filter_map(|arg| {
-            reserved_output_arg(arg.as_ref())
-                .map(|(arg, hint)| ValidationError::ReservedEncoderArg { arg, hint })
+            let arg = arg.as_ref();
+            if !svtav1 && arg.trim_start_matches('-') == "svtav1-params" {
+                Some(ValidationError::Svtav1ParamsInEncoderArg)
+            } else {
+                reserved_output_arg(arg)
+                    .map(|(arg, hint)| ValidationError::ReservedEncoderArg { arg, hint })
+            }
         }))
         .next()
         .map_or(Ok(()), Err)

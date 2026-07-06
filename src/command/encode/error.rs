@@ -17,11 +17,12 @@ pub enum EncodePlanError {
 
 impl PartialEq for EncodePlanError {
     fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
+        match (self, other) {
             (Self::SameInputOutput, Self::SameInputOutput)
-                | (Self::StereoDownmixWithCopy, Self::StereoDownmixWithCopy)
-        )
+            | (Self::StereoDownmixWithCopy, Self::StereoDownmixWithCopy) => true,
+            (Self::FfmpegArgs(a), Self::FfmpegArgs(b)) => a.to_string() == b.to_string(),
+            _ => false,
+        }
     }
 }
 

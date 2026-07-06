@@ -19,6 +19,8 @@ use std::{
     time::Duration,
 };
 
+const MAX_SAMPLE_COUNT: u64 = 10_000;
+
 /// Encoding args that apply when encoding to an output.
 #[derive(Parser, Clone)]
 pub struct EncodeToOutput {
@@ -98,12 +100,19 @@ impl Sample {
         let computed_samples = {
             let every = self.sample_every.get().as_secs_f64();
             (input_duration.as_secs_f64() / every).ceil() as u64
-        };
+        }
+        .min(MAX_SAMPLE_COUNT);
 
         SampleCountRules {
-            samples: self.samples.map(SampleCountOverride::get),
+            samples: self
+                .samples
+                .map(SampleCountOverride::get)
+                .map(|samples| samples.min(MAX_SAMPLE_COUNT)),
             computed_samples,
-            min_samples: self.min_samples.map(MinSampleCount::get),
+            min_samples: self
+                .min_samples
+                .map(MinSampleCount::get)
+                .map(|samples| samples.min(MAX_SAMPLE_COUNT)),
         }
         .sample_count()
     }
@@ -245,6 +254,8 @@ pub enum FrameRateOverrideError {
     Parse(#[from] std::num::ParseFloatError),
     #[error("frame rate override must be finite")]
     NonFinite,
+    #[error("frame rate override must be non-negative")]
+    Negative,
 }
 
 impl FrameRateOverride {
@@ -282,6 +293,9 @@ impl std::str::FromStr for FrameRateOverride {
         let fps: f32 = s.parse()?;
         if !fps.is_finite() {
             return Err(FrameRateOverrideError::NonFinite);
+        }
+        if fps.is_sign_negative() {
+            return Err(FrameRateOverrideError::Negative);
         }
         Ok(Self::new(fps))
     }
@@ -647,6 +661,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sample_count_caps_tiny_sample_every() {
+        let args = sample_args(None, None, Duration::from_millis(1));
+        assert_eq!(
+            args.sample_count(Duration::from_secs(3600)),
+            MAX_SAMPLE_COUNT
+        );
+    }
+
     #[rstest]
     #[case(60.0, Some(60.0))]
     #[case(0.0, None)]
@@ -660,6 +683,11 @@ mod tests {
         // execute
         // assert
         assert_eq!(xpsnr.fps(), expected);
+    }
+
+    #[test]
+    fn parse_xpsnr_fps_rejects_negative_values() {
+        assert!("-1".parse::<FrameRateOverride>().is_err());
     }
 
     #[test]

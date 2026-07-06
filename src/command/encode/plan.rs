@@ -67,9 +67,7 @@ impl EncodePlan {
         let audio = audio_config(&encode_to, &probe)?;
 
         // Validate ffmpeg arg construction during preflight.
-        let mut enc_args = encode.to_ffmpeg_args(crf, &probe)?;
-        enc_args.video_only = encode_to.video_only;
-        drop(enc_args);
+        encode.to_ffmpeg_args(crf, &probe)?;
 
         Ok(Self {
             input: encode.input.clone(),

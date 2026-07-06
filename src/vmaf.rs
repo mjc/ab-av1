@@ -66,10 +66,11 @@ impl VmafOut {
         }
     }
 
-    fn try_parse_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<ScoreStreamParse> {
-        parse_score_chunk(chunk, chunks, parse_vmaf_score_line)
-            .ok()
-            .flatten()
+    fn try_parse_chunk(
+        chunk: &[u8],
+        chunks: &mut Chunks,
+    ) -> anyhow::Result<Option<ScoreStreamParse>> {
+        parse_score_chunk(chunk, chunks, parse_vmaf_score_line).map_err(Into::into)
     }
 
     #[cfg(test)]

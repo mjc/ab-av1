@@ -107,7 +107,7 @@ pub(crate) fn sample_encode_cache_path(cache_dir: Option<PathBuf>) -> anyhow::Re
 pub struct Key(blake3::Hash);
 
 /// Source file identity for sample-encode cache keys.
-#[derive(Clone, Copy, Hash)]
+#[derive(Clone, Copy)]
 struct SourceIdentity<'a> {
     sample: &'a Path,
     source_input: &'a Path,
@@ -116,6 +116,21 @@ struct SourceIdentity<'a> {
     input_size: u64,
     full_pass: bool,
     dest_ext: &'a str,
+}
+
+impl Hash for SourceIdentity<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sample
+            .file_name()
+            .map_or(self.sample.as_os_str(), |name| name)
+            .hash(state);
+        self.source_input.hash(state);
+        self.input_duration.hash(state);
+        self.input_extension.hash(state);
+        self.input_size.hash(state);
+        self.full_pass.hash(state);
+        self.dest_ext.hash(state);
+    }
 }
 
 /// Encode and scoring configuration identity for sample-encode cache keys.
@@ -386,6 +401,30 @@ mod tests {
         assert_eq!(
             key_a, key_b,
             "identical work must produce stable cache keys"
+        );
+    }
+
+    #[test]
+    fn identical_sample_name_reuses_cache_key_across_temp_dirs() {
+        let sample_a = Path::new("/tmp/.ab-av1-a/sample0+20f.mkv");
+        let sample_b = Path::new("/tmp/.ab-av1-b/sample0+20f.mkv");
+        let input = Path::new("/movies/a/clip.mkv");
+        let duration = Duration::from_secs(3600);
+        let extension = Some(std::ffi::OsStr::new("mkv"));
+        let size = 1_000_000_u64;
+        let enc = minimal_enc_args(input);
+        let scoring = default_scoring(false);
+
+        let key_a = encode_cache_key(
+            sample_a, input, duration, extension, size, false, "mkv", &enc, &scoring,
+        );
+        let key_b = encode_cache_key(
+            sample_b, input, duration, extension, size, false, "mkv", &enc, &scoring,
+        );
+
+        assert_eq!(
+            key_a, key_b,
+            "temporary sample parent dirs must not invalidate identical work"
         );
     }
 

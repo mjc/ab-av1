@@ -86,6 +86,7 @@ pub async fn auto_encode(config: AutoEncodeConfig) -> anyhow::Result<()> {
     }
 
     let min_score = search.min_score();
+    let use_xpsnr = search.min_xpsnr.is_some();
     let max_encoded_percent = search.max_encoded_percent;
     let enc_args = search.args.clone();
     let thorough = search.thorough;
@@ -161,7 +162,7 @@ pub async fn auto_encode(config: AutoEncodeConfig) -> anyhow::Result<()> {
                     .log_level()
                     .is_some_and(|lvl| lvl > log::Level::Error)
                 {
-                    result.print_attempt(&bar, min_score, max_encoded_percent)
+                    result.print_attempt(&bar, min_score, max_encoded_percent, use_xpsnr)
                 }
             }
             Ok(crf_search::Update::Done(result)) => best = Some(result),

@@ -121,10 +121,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Full Verification
-Use the devshell for the slower end-to-end test pass:
+Use the devshell for the slower end-to-end test pass when one is available:
 
 ```sh
-nix develop /home/mjc/cfg/devshells#ab-av1 -c cargo test -- --test-threads=1
+nix develop -c cargo test -- --test-threads=1
 ```
 
 ## Minimum supported rust compiler

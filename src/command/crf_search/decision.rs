@@ -116,10 +116,10 @@ pub fn decide_next_transition(
 pub fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr: bool) -> i64 {
     let worse_score = output_search_score(&worse_q.enc, use_xpsnr);
     let better_score = output_search_score(&better_q.enc, use_xpsnr);
-    assert!(
-        worse_score <= min_vmaf && worse_score < better_score && worse_q.q > better_q.q,
-        "invalid vmaf_lerp_crf usage: ({min_vmaf}, {worse_q:?}, {better_q:?})"
-    );
+    if !(worse_score <= min_vmaf && worse_score < better_score && worse_q.q > better_q.q) {
+        return ((worse_q.q + better_q.q) / 2)
+            .clamp(better_q.q.min(worse_q.q), better_q.q.max(worse_q.q));
+    }
 
     let vmaf_diff = better_score - worse_score;
     let vmaf_factor = (min_vmaf - worse_score) / vmaf_diff;

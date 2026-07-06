@@ -13,7 +13,6 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use time::macros::format_description;
 use tokio_stream::{Stream, StreamExt};
 
 pub fn ensure_success(name: &'static str, out: &Output) -> anyhow::Result<()> {
@@ -139,17 +138,17 @@ pub(crate) fn parse_ffmpeg_progress(line: &str) -> Option<FfmpegProgress> {
 
     let frame = parse_label_substr("frame=", line)?.parse().ok()?;
     let fps = parse_label_substr("fps=", line)?.parse().ok()?;
-    let (h, m, s, ns) = time::Time::parse(
-        parse_label_substr("time=", line)?,
-        &format_description!("[hour]:[minute]:[second].[subsecond]"),
-    )
-    .ok()?
-    .as_hms_nano();
+    let progress_time = parse_label_substr("time=", line)?;
+    let (h, rest) = progress_time.split_once(':')?;
+    let (m, s) = rest.split_once(':')?;
+    let h = h.parse::<u64>().ok()?;
+    let m = m.parse::<u64>().ok()?;
+    let s = s.parse::<f64>().ok()?;
 
     Some(FfmpegProgress {
         frame,
         fps,
-        time: Duration::new(h as u64 * 60 * 60 + m as u64 * 60 + s as u64, ns),
+        time: Duration::from_secs(h * 60 * 60 + m * 60).checked_add(Duration::from_secs_f64(s))?,
     })
 }
 
@@ -415,6 +414,19 @@ fn parse_ffmpeg_progress_chunk() {
             frame: 288,
             fps: 94.0,
             time: Duration::new(60 * 60 + 23 * 60 + 12, 340_000_000),
+        })
+    );
+}
+
+#[test]
+fn parse_ffmpeg_progress_accepts_elapsed_hours_over_23() {
+    let out = "frame=  288 fps= 94 q=-0.0 size=N/A time=25:00:00.00 bitrate=N/A speed=3.94x    \r";
+    assert_eq!(
+        FfmpegOut::try_parse(out),
+        Some(FfmpegOut::Progress {
+            frame: 288,
+            fps: 94.0,
+            time: Duration::from_secs(25 * 60 * 60),
         })
     );
 }

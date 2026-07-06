@@ -425,8 +425,10 @@ impl Encode {
             .iter()
             .filter_map(|arg| {
                 let parsed = PassthroughArg::parse(arg.as_str());
-                if parsed.is_svtav1_params() {
-                    svtav1_params.push(arg.as_str().to_owned());
+                if svtav1 && parsed.is_svtav1_params() {
+                    if let Some(value) = parsed.value {
+                        svtav1_params.push(value.to_owned());
+                    }
                     None
                 } else {
                     Some(parsed)
@@ -470,7 +472,7 @@ impl Encode {
         }
 
         validate_encoder_passthrough(
-            true,
+            svtav1,
             false,
             input_args.args.iter().map(|arg| arg.as_str()),
             args.iter().map(|arg| arg.as_str()),
@@ -1345,6 +1347,28 @@ fn to_ffmpeg_args_merges_enc_svtav1_params() {
     assert!(svt.contains("tune=0"));
     assert!(svt.contains("film-grain=8"));
     assert!(svt.contains("crf=32"));
+    assert!(!svt.contains("-svtav1-params"));
+    assert!(!svt.contains("svtav1-params="));
+}
+
+#[test]
+fn to_ffmpeg_args_rejects_svtav1_params_for_non_svt_encoder() {
+    // setup
+    let enc = Encode {
+        encoder: Encoder("libx264".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: None,
+        svt_args: vec![],
+        enc_args: vec!["svtav1-params=tune=0".into()],
+        enc_input_args: vec![],
+    };
+
+    // execute / assert
+    assert!(enc.to_ffmpeg_args(32.0, &test_probe(60, 24.0)).is_err());
 }
 
 #[test]

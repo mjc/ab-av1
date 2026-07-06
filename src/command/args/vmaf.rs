@@ -137,13 +137,9 @@ impl VmafConfig {
         match (self.vmaf_scale, distorted_res) {
             (VmafScale::Auto, Some((w, h))) => match model {
                 // upscale small resolutions to 1k for use with the 1k model
-                VmafModel::Vmaf1K if w < 1728 || h < 972 => {
-                    Some(minimally_scale((w, h), (1920, 1080)))
-                }
+                VmafModel::Vmaf1K if w < 1728 || h < 972 => auto_upscale((w, h), (1920, 1080)),
                 // upscale small resolutions to 4k for use with the 4k model
-                VmafModel::Vmaf4K if w < 3456 && h < 1944 => {
-                    Some(minimally_scale((w, h), (3840, 2160)))
-                }
+                VmafModel::Vmaf4K if w < 3456 && h < 1944 => auto_upscale((w, h), (3840, 2160)),
                 _ => None,
             },
             (VmafScale::Custom(resolution), Some((w, h))) => Some(minimally_scale(
@@ -272,6 +268,14 @@ fn minimally_scale((from_w, from_h): (u32, u32), (target_w, target_h): (u32, u32
     }
 }
 
+fn auto_upscale(from: (u32, u32), target: (u32, u32)) -> Option<(i32, i32)> {
+    match minimally_scale(from, target) {
+        (w, -1) if w > from.0 as i32 => Some((w, -1)),
+        (-1, h) if h > from.1 as i32 => Some((-1, h)),
+        _ => None,
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VmafScale {
     None,
@@ -379,6 +383,18 @@ fn vmaf_config_from_args_does_not_allocate() {
     crate::test_support::assert_no_allocations(|| {
         std::hint::black_box(VmafConfig::from(vmaf));
     });
+}
+
+#[test]
+fn vmaf_auto_scale_does_not_downscale_wide_short_sources() {
+    let config = VmafConfig {
+        and_vmaf: None,
+        vmaf_args: vec![],
+        vmaf_scale: VmafScale::Auto,
+        vmaf_fps: FrameRateOverride::new(0.0),
+    };
+
+    assert_eq!(config.vf_scale(VmafModel::Vmaf1K, Some((2560, 720))), None);
 }
 
 #[test]
@@ -596,14 +612,14 @@ fn vmaf_lavfi_exact_2k_boundary_uses_1k_model() {
     );
 }
 
-// ab-kgc.81: portrait 720p must upscale height for the 1k model
+// ab-kgc.81: auto scale must not downscale portrait inputs just to hit model bounds
 #[test]
-fn vmaf_lavfi_portrait_720x1280_auto_upscales_height() {
+fn vmaf_lavfi_portrait_720x1280_does_not_auto_downscale() {
     let vmaf = Vmaf::default();
     let lavfi = vmaf.ffmpeg_lavfi(Some((720, 1280)), Some(PixelFormat::Yuv420p), None);
     assert!(
-        lavfi.contains("scale=-1:1080:flags=bicubic"),
-        "portrait sources should upscale to 1080p height: {lavfi}"
+        !lavfi.contains("scale="),
+        "portrait sources should not downscale to 1080p height: {lavfi}"
     );
 }
 

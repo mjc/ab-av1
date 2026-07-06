@@ -201,12 +201,32 @@ impl ManagedProcess {
         Ok((output.status, output.stderr))
     }
 
-    pub async fn output(self) -> anyhow::Result<Output> {
-        let output = self.stderr_output().await?;
+    pub async fn output(mut self) -> anyhow::Result<Output> {
+        let options = self.options;
+        let shutdown = Self::graceful_shutdown_for(options);
+        let output = self
+            .handle
+            .wait_for_completion(options.wait_timeout)
+            .with_raw_output(
+                DEFAULT_OUTPUT_EOF_TIMEOUT,
+                RawOutputOptions::symmetric(RawCollectionOptions::Bounded {
+                    max_bytes: options.stderr_limit.bytes(),
+                    overflow_behavior: CollectionOverflowBehavior::DropOldestData,
+                }),
+            )
+            .or_terminate(shutdown)
+            .await?;
+        let Some(output) = output.into_completed() else {
+            bail!(
+                "process exceeded {:?} and was terminated",
+                options.wait_timeout
+            );
+        };
+
         Ok(Output {
             status: output.status,
-            stdout: Vec::new(),
-            stderr: output.stderr,
+            stdout: output.stdout.bytes,
+            stderr: output.stderr.bytes,
         })
     }
 
@@ -620,8 +640,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_process_output_returns_status_and_stderr() {
-        let cmd = fixture_command("stderr-warning");
+    async fn managed_process_output_returns_status_stdout_and_stderr() {
+        let cmd = fixture_command("stdout-noise-stderr-ffmpeg-progress");
 
         let output = ManagedProcess::spawn("output fixture", cmd)
             .expect("spawn shell fixture")
@@ -630,8 +650,8 @@ mod tests {
             .expect("collect output");
 
         assert!(output.status.success());
-        assert!(output.stdout.is_empty());
-        assert_eq!(output.stderr, b"warning");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("stdout-noise"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("frame="));
     }
 
     #[tokio::test]

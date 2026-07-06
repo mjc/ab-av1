@@ -16,7 +16,17 @@ fn top_level_help_mentions_all_commands() {
 
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("Usage: ab-av1 <COMMAND>"));
-    assert!(help.contains("print-completions"));
+    for cmd in [
+        "sample-encode",
+        "vmaf",
+        "xpsnr",
+        "encode",
+        "crf-search",
+        "auto-encode",
+        "print-completions",
+    ] {
+        assert!(help.contains(cmd), "missing command: {cmd}");
+    }
 }
 
 #[test]
@@ -39,7 +49,7 @@ fn bash_completion_contains_expected_command_paths() {
     assert!(output.status.success());
 
     let completions = String::from_utf8_lossy(&output.stdout);
-    assert!(completions.contains("_ab-av1()"));
+    assert!(completions.contains("_ab_av1()"));
     assert!(completions.contains("ab__av1__subcmd__crf__subcmd__search"));
     assert!(completions.contains("ab__av1__subcmd__print__subcmd__completions"));
 }

@@ -78,8 +78,11 @@ impl XpsnrOut {
         }
     }
 
-    fn try_parse_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<ScoreStreamParse> {
-        try_parse_xpsnr_score_chunk(chunk, chunks).ok().flatten()
+    fn try_parse_chunk(
+        chunk: &[u8],
+        chunks: &mut Chunks,
+    ) -> anyhow::Result<Option<ScoreStreamParse>> {
+        try_parse_xpsnr_score_chunk(chunk, chunks).map_err(Into::into)
     }
 
     #[cfg(test)]

@@ -160,11 +160,8 @@ pub fn lavfi(ref_vfilter: Option<&str>, pix_fmt: Option<PixelFormat>) -> String 
                 lavfi.push(',');
             }
             lavfi.push_str(vf);
-            has_filter = true;
         }
-        if has_filter {
-            lavfi.push_str(",setpts=PTS-STARTPTS,settb=AVTB");
-        }
+        lavfi.push_str(",setpts=PTS-STARTPTS,settb=AVTB");
         lavfi.push_str(new_name);
         lavfi.push(';');
         new_name

@@ -190,8 +190,15 @@ impl SamplePlan {
             });
         }
 
+        let sample_duration = frame_rate
+            .map(FrameRate::one_frame_duration)
+            .map_or(requested_sample_duration, |one_frame| {
+                requested_sample_duration.max(one_frame)
+            });
+        let grid = SampleGrid::try_new(sample_count)?;
+
         if requested_sample_duration.is_zero()
-            || requested_sample_duration * samples as _ >= input_duration.mul_f64(0.85)
+            || sample_duration * samples as _ >= input_duration.mul_f64(0.85)
         {
             return Ok(Self {
                 input_duration,
@@ -203,12 +210,6 @@ impl SamplePlan {
             });
         }
 
-        let sample_duration = frame_rate
-            .map(FrameRate::one_frame_duration)
-            .map_or(requested_sample_duration, |one_frame| {
-                requested_sample_duration.max(one_frame)
-            });
-        let grid = SampleGrid::try_new(sample_count)?;
         let frame_count = sample_frame_count(sample_duration, frame_rate)?;
 
         Ok(Self {
@@ -347,6 +348,21 @@ mod tests {
         );
 
         assert!(plan.sample_duration() >= Duration::from_secs_f64(1.0 / 60.0));
+    }
+
+    #[test]
+    fn sample_plan_full_pass_uses_effective_one_frame_duration() {
+        let plan = valid_sample_plan(
+            Duration::from_secs(10),
+            0.1,
+            SampleCount::new(2),
+            Duration::from_nanos(1),
+            false,
+        );
+
+        assert!(plan.full_pass());
+        assert_eq!(plan.sample_count().get(), 1);
+        assert_eq!(plan.sample_duration(), Duration::from_secs(10));
     }
 
     #[test]

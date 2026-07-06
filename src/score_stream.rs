@@ -163,7 +163,7 @@ pub fn run_score_stream<Out>(
     process: ManagedProcess,
     name: &'static str,
     cmd_str: String,
-    parse_chunk: fn(&[u8], &mut Chunks) -> Option<ScoreStreamParse>,
+    parse_chunk: fn(&[u8], &mut Chunks) -> anyhow::Result<Option<ScoreStreamParse>>,
     into_out: fn(ScoreStreamParse) -> Out,
     into_err: fn(anyhow::Error) -> Out,
 ) -> impl Stream<Item = Out> {
@@ -177,26 +177,38 @@ pub fn run_score_stream<Out>(
     async_stream::stream! {
         let mut chunks = Chunks::default();
         let mut logical_score = LogicalScoreCompletion::Pending;
+        let mut terminal_error = false;
         tokio::pin!(events);
         while let Some(next) = events.next().await {
             match next {
                 Ok(ManagedEvent::RawStderr(chunk)) => {
-                    if let Some(event) = parse_chunk(chunk.as_bytes(), &mut chunks) {
-                        logical_score.record(&event);
-                        yield into_out(event);
+                    match parse_chunk(chunk.as_bytes(), &mut chunks) {
+                        Ok(Some(event)) => {
+                            logical_score.record(&event);
+                            yield into_out(event);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            terminal_error = true;
+                            yield into_err(err);
+                        }
                     }
                 }
                 Ok(ManagedEvent::ReplayGap(_)) => {}
                 Ok(ManagedEvent::ProcessDone(done)) => {
                     let status = done.status();
                     if let Err(err) = exit_ok_stderr(name, Ok(status), &cmd_str, &chunks) {
+                        terminal_error = true;
                         yield into_err(err);
                     }
                 }
-                Err(err) => yield into_err(err),
+                Err(err) => {
+                    terminal_error = true;
+                    yield into_err(err);
+                }
             }
         }
-        if !logical_score.is_done() {
+        if !logical_score.is_done() && !terminal_error {
             yield into_err(cmd_err(
                 format!("could not parse {name} score"),
                 &cmd_str,
