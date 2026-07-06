@@ -28,10 +28,7 @@ const DEFAULT_MIN_VMAF: f32 = 95.0;
 /// is also present (e.g. `--and-vmaf`).
 fn output_search_score(enc: &sample_encode::Output, use_xpsnr: bool) -> f32 {
     match use_xpsnr {
-        true => enc
-            .xpsnr_score
-            .or(enc.vmaf_score)
-            .unwrap_or_default(),
+        true => enc.xpsnr_score.or(enc.vmaf_score).unwrap_or_default(),
         false => enc.vmaf_score.or(enc.xpsnr_score).unwrap_or_default(),
     }
 }
@@ -151,9 +148,7 @@ pub struct Args {
 
 impl Args {
     pub fn min_score(&self) -> f32 {
-        self.min_xpsnr
-            .or(self.min_vmaf)
-            .unwrap_or(DEFAULT_MIN_VMAF)
+        self.min_xpsnr.or(self.min_vmaf).unwrap_or(DEFAULT_MIN_VMAF)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -575,8 +570,7 @@ pub fn guess_progress(run: usize, sample_progress: f32, thorough: bool) -> f64 {
         _ => run as f64,
     };
     let sample_progress = sample_progress.clamp(0.0, 1.0) as f64;
-    (((run - 1) as f64 + sample_progress) * BAR_LEN as f64 / total_runs_guess)
-        .min(BAR_LEN as f64)
+    (((run - 1) as f64 + sample_progress) * BAR_LEN as f64 / total_runs_guess).min(BAR_LEN as f64)
 }
 
 /// Conversion logic for integer "q" values used in the crf search.

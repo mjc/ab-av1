@@ -485,8 +485,7 @@ async fn sample(
 
     let grid_divisor = ((samples.saturating_add(1)).min(u64::from(u32::MAX)) as u32).max(1);
 
-    let sample_start = (duration.saturating_sub(sample_duration * samples as _)
-        / grid_divisor)
+    let sample_start = (duration.saturating_sub(sample_duration * samples as _) / grid_divisor)
         * sample_n as _
         + sample_duration * sample_idx as _;
 
@@ -863,9 +862,7 @@ pub struct Output {
 impl Output {
     /// Extract vmaf or xpsnr score. Use when it is expected to have only 1 of these.
     pub fn single_score(&self) -> f32 {
-        self.vmaf_score
-            .or(self.xpsnr_score)
-            .unwrap_or(f32::NAN)
+        self.vmaf_score.or(self.xpsnr_score).unwrap_or(f32::NAN)
     }
 
     /// Extract vmaf or xpsnr kind. Use when it is expected to have only 1 of these.

@@ -20,12 +20,10 @@ pub struct Ffprobe {
 impl Ffprobe {
     pub fn pixel_format(&self) -> Option<PixelFormat> {
         let pf = self.pix_fmt.as_deref()?;
-        PixelFormat::try_from(pf)
-            .ok()
-            .or_else(|| {
-                let lower = pf.to_ascii_lowercase();
-                PixelFormat::try_from(lower.as_str()).ok()
-            })
+        PixelFormat::try_from(pf).ok().or_else(|| {
+            let lower = pf.to_ascii_lowercase();
+            PixelFormat::try_from(lower.as_str()).ok()
+        })
     }
 
     pub fn nframes(&self) -> Result<u64, ProbeError> {

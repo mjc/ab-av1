@@ -17,6 +17,13 @@ use std::{
 };
 use tokio::process::Command;
 
+/// Encode output registered for cleanup until the run succeeds.
+///
+/// Only [`crate::command::encode::PartialOutput`] implements this in production code.
+pub trait EncodeDestination {
+    fn encode_destination(&self) -> &Path;
+}
+
 /// Exposed ffmpeg encoding args.
 #[derive(Debug, Clone)]
 pub struct FfmpegEncodeArgs<'a> {
@@ -122,11 +129,12 @@ pub fn encode(
         input_args,
         video_only,
     }: FfmpegEncodeArgs,
-    output: &Path,
+    output: &impl EncodeDestination,
     has_audio: bool,
     audio_codec: Option<&str>,
     downmix_to_stereo: bool,
 ) -> anyhow::Result<FfmpegOutStream> {
+    let output = output.encode_destination();
     let oargs: HashSet<_> = output_args.iter().map(|a| a.as_str()).collect();
     let output_ext = output.extension().and_then(|e| e.to_str());
 

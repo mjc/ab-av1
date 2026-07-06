@@ -205,6 +205,7 @@ pub(crate) mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::{env, fs};
 
     mod helpers {
@@ -222,7 +223,8 @@ mod tests {
 
         /// 1×1 GIF — valid media for real ffmpeg copy e2e (see ffprobe minimal gif test).
         pub fn temp_gif_input(name: &str) -> PathBuf {
-            const MINIMAL_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\
+            const MINIMAL_GIF: &[u8] =
+                b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\
 \x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
             let path = env::temp_dir().join(format!(
                 "ab-av1-sample-test-{}-{}.gif",
@@ -351,6 +353,7 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial]
     #[tokio::test]
     async fn copy_succeeds_with_process_fixture() {
         // setup
@@ -371,6 +374,7 @@ mod tests {
     }
 
     /// Real ffmpeg copy against a minimal GIF input (devshell provides ffmpeg-full).
+    #[serial]
     #[tokio::test]
     async fn copy_e2e_real_ffmpeg() {
         // setup

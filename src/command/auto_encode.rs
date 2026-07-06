@@ -1,7 +1,7 @@
 use crate::{
     command::{
         PROGRESS_CHARS, args, crf_search,
-        encode::{self, default_output_name},
+        encode::{self, EncodePlanError},
         sample_encode::{self, Work},
     },
     console_ext::style,
@@ -14,7 +14,6 @@ use clap::Parser;
 use console::style;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use same_file::is_same_file;
 use std::{pin::pin, sync::Arc, time::Duration};
 
 const BAR_LEN: u64 = 1024 * 1024 * 1024;
@@ -46,23 +45,15 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
     let defaulting_output = encode.output.is_none();
     let input_probe = Arc::new(ffprobe::probe(&search.args.input));
 
-    let output = encode.output.unwrap_or_else(|| {
-        default_output_name(
-            &search.args.input,
-            &search.args.encoder,
-            input_probe.is_image,
-        )
-    });
-
-    anyhow::ensure!(
-        encode.overwrite_input || !is_same_file(&output, &search.args.input).unwrap_or(false),
-        "Input and Output are specified as the same file. Not proceeding. \
-         Pass in `--overwrite-input` to allow this."
-    );
-
-    if encode.downmix_to_stereo && encode.audio_codec.as_deref() == Some("copy") {
-        anyhow::bail!("--stereo-downmix cannot be used with --acodec copy");
-    }
+    let resolved = encode::resolve_output(
+        &search.args.input,
+        &search.args.encoder,
+        &encode,
+        &input_probe,
+    )
+    .map_err(encode::EncodePlanError::into_anyhow)?;
+    encode::audio_config(&encode, &input_probe).map_err(encode::EncodePlanError::into_anyhow)?;
+    let output = resolved.planned.path().to_path_buf();
 
     search.sample.set_extension_from_output(&output);
     search.validate()?;

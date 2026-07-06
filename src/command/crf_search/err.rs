@@ -40,7 +40,11 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoGoodCrf { last } => {
-                write!(f, "Failed to find a suitable crf (last crf {})", TerseF32(last.crf))
+                write!(
+                    f,
+                    "Failed to find a suitable crf (last crf {})",
+                    TerseF32(last.crf)
+                )
             }
             Self::Other(err) => err.fmt(f),
         }
@@ -95,7 +99,10 @@ mod tests {
         // assert
         assert!(ok.is_ok());
         assert!(matches!(err, Error::NoGoodCrf { .. }));
-        assert_eq!(err.to_string(), "Failed to find a suitable crf (last crf 32)");
+        assert_eq!(
+            err.to_string(),
+            "Failed to find a suitable crf (last crf 32)"
+        );
     }
 
     #[test]

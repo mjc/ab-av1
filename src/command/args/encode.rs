@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::ensure;
 use clap::{Parser, ValueHint};
+#[cfg(test)]
 use rstest::rstest;
 use std::{
     collections::HashMap,
@@ -808,6 +809,7 @@ fn to_ffmpeg_args_libvpx_vp9_constant_quality_default() {
     );
 }
 
+#[cfg(test)]
 #[rstest]
 #[case::libx264("libx264", 0.1, 10.0, 46.0)]
 #[case::libx265("libx265", 0.1, 10.0, 46.0)]
@@ -830,6 +832,7 @@ fn encoder_defaults_matrix(
     assert_eq!(enc.default_max_crf(), max_crf);
 }
 
+#[cfg(test)]
 #[rstest]
 #[case::svt_alias("svt-av1", "libsvtav1")]
 #[case::passthrough("libaom-av1", "libaom-av1")]

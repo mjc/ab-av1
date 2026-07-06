@@ -278,6 +278,70 @@ mod tests {
         assert_eq!(args.extension.as_deref(), Some("avif"));
     }
 
+    // ab-kgc.10: default extension must follow input container when ffprobe fails
+    #[test]
+    fn set_extension_from_input_uses_input_container_on_probe_failure() {
+        // setup
+        let mut args = sample_args(None, None, Duration::from_secs(60));
+        let input = Path::new("clip.webm");
+        let encoder = Encoder::for_test("libsvtav1");
+        let probe = Ffprobe {
+            duration: Err(anyhow::anyhow!("ffprobe: missing").into()),
+            has_audio: false,
+            max_audio_channels: None,
+            fps: Err(anyhow::anyhow!("ffprobe: missing").into()),
+            resolution: None,
+            is_image: false,
+            pix_fmt: None,
+        };
+
+        // execute
+        args.set_extension_from_input(input, &encoder, &probe);
+
+        // assert
+        assert_eq!(
+            args.extension.as_deref(),
+            Some("webm"),
+            "probe failure must not block default extension from input path"
+        );
+    }
+
+    #[test]
+    fn set_extension_from_input_uses_mkv_fallback_for_unknown_extension_on_probe_failure() {
+        // setup
+        let mut args = sample_args(None, None, Duration::from_secs(60));
+        let input = Path::new("clip.unknown");
+        let encoder = Encoder::for_test("libsvtav1");
+        let probe = Ffprobe {
+            duration: Err(anyhow::anyhow!("ffprobe: missing").into()),
+            has_audio: false,
+            max_audio_channels: None,
+            fps: Err(anyhow::anyhow!("ffprobe: missing").into()),
+            resolution: None,
+            is_image: false,
+            pix_fmt: None,
+        };
+
+        // execute
+        args.set_extension_from_input(input, &encoder, &probe);
+
+        // assert
+        assert_eq!(args.extension.as_deref(), Some("mkv"));
+    }
+
+    // ab-kgc.10: min_samples must apply even when sample_every would yield fewer
+    #[test]
+    fn sample_count_min_samples_wins_over_short_duration() {
+        // setup — 30s input / 60s sample_every => 1 sample, but min_samples=3
+        let args = sample_args(None, Some(3), Duration::from_secs(60));
+
+        // execute
+        let count = args.sample_count(Duration::from_secs(30));
+
+        // assert
+        assert_eq!(count, 3);
+    }
+
     // ab-kgc.43: extensionless outputs should inherit the input container for sample encoding
     #[test]
     fn set_extension_from_output_without_extension_falls_back_to_input_container() {

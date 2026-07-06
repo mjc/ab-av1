@@ -27,38 +27,32 @@ pub fn unadd(file: &Path) -> bool {
     TEMPS.lock().unwrap().remove(file).is_some()
 }
 
-/// Tracks an encode output that may be deleted on failure.
-///
-/// Call [`Self::register`] immediately before writing begins; call [`Self::commit`]
-/// after a successful encode so the file is kept.
-pub struct NotKeepableOutput {
+/// Tracks a path registered for cleanup on failure.
+pub struct CleanupGuard {
     path: PathBuf,
     registered: bool,
 }
 
-impl NotKeepableOutput {
-    pub fn new(path: PathBuf) -> Self {
+impl CleanupGuard {
+    pub fn arm(path: PathBuf) -> Self {
+        add(&path, TempKind::NotKeepable);
         Self {
             path,
-            registered: false,
+            registered: true,
         }
     }
 
-    /// Register the path for cleanup on process exit.
-    pub fn register(&mut self) {
-        if !self.registered {
-            add(&self.path, TempKind::NotKeepable);
-            self.registered = true;
-        }
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    /// Successful encode: remove from cleanup registry and keep the file.
-    pub fn commit(mut self) {
+    /// Successful completion: unregister and return the kept path.
+    pub fn disarm(mut self) -> PathBuf {
         if self.registered {
             unadd(&self.path);
         }
         self.registered = false;
-        std::mem::forget(self);
+        self.path
     }
 }
 
@@ -135,12 +129,14 @@ pub fn process_dir(conf_parent: Option<PathBuf>, default_parent: Option<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::{env, fs};
 
     fn temp_path(label: &str) -> PathBuf {
         env::temp_dir().join(format!("ab-av1-temp-test-{}-{}", label, std::process::id()))
     }
 
+    #[serial]
     #[tokio::test]
     async fn add_and_clean_all_removes_not_keepable() {
         // setup
@@ -155,6 +151,7 @@ mod tests {
         assert!(!path.exists(), "NotKeepable file should be deleted");
     }
 
+    #[serial]
     #[tokio::test]
     async fn clean_with_keep_keepables_preserves_keepable_files() {
         // setup
@@ -176,6 +173,7 @@ mod tests {
         clean_all().await;
     }
 
+    #[serial]
     #[tokio::test]
     async fn unadd_prevents_later_deletion() {
         // setup
@@ -193,61 +191,31 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[serial]
     #[tokio::test]
-    async fn not_keepable_output_register_and_commit_prevents_deletion() {
-        // setup
-        let path = temp_path("not-keepable-guard");
+    async fn cleanup_guard_arm_and_disarm_prevents_deletion() {
+        let path = temp_path("cleanup-guard");
         fs::write(&path, b"stay").expect("write file");
-        let mut guard = NotKeepableOutput::new(path.clone());
-
-        // execute
-        guard.register();
-        guard.commit();
+        let guard = CleanupGuard::arm(path.clone());
+        let path = guard.disarm();
         clean_all().await;
-
-        // assert
-        assert!(path.exists(), "committed output must not be deleted");
-
-        // cleanup
+        assert!(path.exists(), "disarmed output must not be deleted");
         let _ = fs::remove_file(path);
     }
 
+    #[serial]
     #[tokio::test]
-    async fn not_keepable_output_drop_after_register_cleans_up() {
-        // setup
-        let path = temp_path("not-keepable-guard-drop");
+    async fn cleanup_guard_drop_after_arm_cleans_up() {
+        let path = temp_path("cleanup-guard-drop");
         fs::write(&path, b"temp").expect("write file");
         {
-            let mut guard = NotKeepableOutput::new(path.clone());
-            guard.register();
+            let _guard = CleanupGuard::arm(path.clone());
         }
-
-        // execute
         clean_all().await;
-
-        // assert
-        assert!(!path.exists(), "uncommitted output must be deleted");
+        assert!(!path.exists(), "uncommitted guard must be deleted");
     }
 
-    #[test]
-    fn not_keepable_output_unregistered_drop_does_not_track_path() {
-        // setup
-        let path = temp_path("not-keepable-guard-unregistered");
-        fs::write(&path, b"stay").expect("write file");
-        {
-            let _guard = NotKeepableOutput::new(path.clone());
-        }
-
-        // execute
-        let removed = unadd(&path);
-
-        // assert
-        assert!(!removed, "path must not be registered before register()");
-
-        // cleanup
-        let _ = fs::remove_file(path);
-    }
-
+    #[serial]
     #[test]
     fn default_temp_dir_uses_input_directory_ab_kgc_11() {
         // setup
@@ -279,6 +247,7 @@ mod tests {
     }
 
     // ab-kgc.65: leftover process dirs from interrupted runs must be tracked for cleanup
+    #[serial]
     #[tokio::test]
     async fn preexisting_process_dir_is_tracked_for_cleanup() {
         // setup — simulate a previous run leaving the per-process temp dir on disk
@@ -301,6 +270,7 @@ mod tests {
     }
 
     // ab-kgc.66: nested temp dirs must not leave orphaned files when only the parent is registered
+    #[serial]
     #[tokio::test]
     async fn clean_all_removes_nested_temp_directory_contents() {
         // setup
@@ -321,6 +291,7 @@ mod tests {
         assert!(!parent.exists(), "registered temp dir must be removed");
     }
 
+    #[serial]
     #[test]
     fn explicit_temp_dir_overrides_input_directory_ab_kgc_11() {
         // setup
