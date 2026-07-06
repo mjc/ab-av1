@@ -2,6 +2,7 @@ use crate::{
     command::{
         PROGRESS_CHARS, SmallDuration,
         args::{self, Encoder},
+        crf_search::Crf,
     },
     console_ext::style,
     ffmpeg,
@@ -47,7 +48,7 @@ pub struct Args {
 
     /// Encoder constant rate factor (1-63). Lower means better quality.
     #[arg(long)]
-    pub crf: f32,
+    pub crf: Crf,
 
     #[clap(flatten)]
     pub encode: args::EncodeToOutput,
@@ -130,6 +131,14 @@ mod tests {
     use std::{env, fs};
     use test_case::test_case;
     use test_support::{arc_probe, encode_args, temp_input};
+
+    #[test]
+    fn parse_crf_uses_checked_newtype() {
+        let args = Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "30"]);
+
+        assert!(matches!(args.as_ref().map(|args| args.crf.get()), Ok(30.0)));
+        assert!(Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "NaN"]).is_err());
+    }
 
     // ab-kgc.89: default output extension must preserve input container for webm/mov
     #[test_case("clip.mp4", false, "mp4"; "video mp4 keeps mp4")]

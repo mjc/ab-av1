@@ -8,6 +8,7 @@ use crate::{
     command::{
         PROGRESS_CHARS, SmallDuration,
         args::{self, PixelFormat, ScoreConfig, VmafConfig, XpsnrConfig},
+        crf_search::Crf,
     },
     ffmpeg::{self, FfmpegEncodeArgs, remove_arg},
     ffprobe::{self, Ffprobe},
@@ -49,7 +50,7 @@ pub struct Args {
 
     /// Encoder constant rate factor (1-63). Lower means better quality.
     #[arg(long)]
-    pub crf: f32,
+    pub crf: Crf,
 
     #[clap(flatten)]
     pub sample: args::Sample,
@@ -120,7 +121,7 @@ impl From<Args> for SampleEncodeConfig {
     ) -> Self {
         Self {
             args,
-            crf,
+            crf: crf.get(),
             sample,
             cache,
             scoring: ScoringConfig {
@@ -414,7 +415,7 @@ pub async fn sample_encode(mut args: Args) -> anyhow::Result<()> {
         .set_extension_from_input(&args.args.input, &args.args.encoder, &probe);
 
     let enc_args = args.args.clone();
-    let crf = args.crf;
+    let crf = args.crf.get();
     let stdout_fmt = args.stdout_format;
     let input_is_image = probe.is_image;
 
@@ -485,7 +486,7 @@ pub fn run(
             duration,
             input_fps,
             SampleCount::new(sample_args.sample_count(duration)),
-            sample_args.sample_duration,
+            sample_args.sample_duration.get(),
             input_is_image,
         )?;
         let temp_dir = sample_args.temp_dir;
@@ -1181,6 +1182,14 @@ mod tests {
             args.sample.temp_dir.as_deref(),
             Some(Path::new("/tmp/ab-av1-temp"))
         );
+    }
+
+    #[test]
+    fn parse_crf_uses_checked_newtype() {
+        let args = Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "30"]);
+
+        assert!(matches!(args.as_ref().map(|args| args.crf.get()), Ok(30.0)));
+        assert!(Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "NaN"]).is_err());
     }
 
     fn valid_sample_plan(

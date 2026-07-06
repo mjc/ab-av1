@@ -1,6 +1,9 @@
 use super::Args;
 use crate::{
-    command::args::{Encode, EncodeToOutput},
+    command::{
+        args::{Encode, EncodeToOutput},
+        crf_search::Crf,
+    },
     ffprobe::Ffprobe,
 };
 use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
@@ -86,7 +89,10 @@ pub fn encode_args(input: PathBuf, output: Option<PathBuf>) -> Args {
             enc_args: vec![],
             enc_input_args: vec![],
         },
-        crf: 32.0,
+        crf: match Crf::try_new(32.0) {
+            Ok(crf) => crf,
+            Err(err) => panic!("invalid test CRF: {err}"),
+        },
         encode: EncodeToOutput {
             output,
             audio_codec: None,

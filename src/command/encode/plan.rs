@@ -37,7 +37,7 @@ impl From<Args> for EncodeConfig {
 
         Self {
             encode,
-            crf,
+            crf: crf.get(),
             encode_to,
         }
     }

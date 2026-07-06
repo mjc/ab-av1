@@ -21,7 +21,7 @@ pub struct Vmaf {
     ///
     /// Also see https://ffmpeg.org/ffmpeg-filters.html#libvmaf.
     #[arg(long = "vmaf", value_parser = parse_vmaf_arg)]
-    pub vmaf_args: Vec<Arc<str>>,
+    pub vmaf_args: Vec<VmafArg>,
 
     /// Video resolution scale to use in VMAF analysis. If set, video streams will be bicubic
     /// scaled to this during VMAF analysis. `auto` (default) automatically sets
@@ -63,7 +63,7 @@ impl Default for Vmaf {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct VmafConfig {
     pub and_vmaf: Option<bool>,
-    pub vmaf_args: Vec<Arc<str>>,
+    pub vmaf_args: Vec<VmafArg>,
     pub vmaf_scale: VmafScale,
     pub vmaf_fps: FrameRateOverride,
 }
@@ -81,7 +81,7 @@ impl VmafConfig {
         ref_vfilter: Option<&str>,
     ) -> String {
         let mut args = self.vmaf_args.clone();
-        if !args.iter().any(|a| a.contains("n_threads")) {
+        if !args.iter().any(|arg| arg.as_str().contains("n_threads")) {
             // default n_threads to all cores
             args.push(
                 format!(
@@ -91,7 +91,11 @@ impl VmafConfig {
                 .into(),
             );
         }
-        let mut lavfi = args.join(":");
+        let mut lavfi = args
+            .iter()
+            .map(VmafArg::as_str)
+            .collect::<Vec<_>>()
+            .join(":");
         lavfi.insert_str(0, "libvmaf=shortest=true:ts_sync_mode=nearest:");
 
         let mut model = VmafModel::from_args(&args);
@@ -174,8 +178,39 @@ impl std::hash::Hash for Vmaf {
     }
 }
 
-fn parse_vmaf_arg(arg: &str) -> anyhow::Result<Arc<str>> {
-    Ok(arg.to_owned().into())
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VmafArg(Arc<str>);
+
+impl VmafArg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn is_model_override(&self) -> bool {
+        is_vmaf_model_override(self.as_str())
+    }
+}
+
+impl AsRef<str> for VmafArg {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for VmafArg {
+    fn from(arg: &str) -> Self {
+        Self(Arc::from(arg))
+    }
+}
+
+impl From<String> for VmafArg {
+    fn from(arg: String) -> Self {
+        Self(arg.into())
+    }
+}
+
+fn parse_vmaf_arg(arg: &str) -> anyhow::Result<VmafArg> {
+    Ok(arg.into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -284,15 +319,15 @@ enum VmafModel {
 }
 
 impl VmafModel {
-    fn from_args(args: &[Arc<str>]) -> Option<Self> {
+    fn from_args(args: &[VmafArg]) -> Option<Self> {
         let mut using_custom_model: Vec<_> =
-            args.iter().filter(|v| is_vmaf_model_override(v)).collect();
+            args.iter().filter(|arg| arg.is_model_override()).collect();
 
         match using_custom_model.len() {
             0 => None,
             1 => Some(match using_custom_model.remove(0) {
-                v if v.ends_with("version=vmaf_v0.6.1") => Self::Vmaf1K,
-                v if v.ends_with("version=vmaf_4k_v0.6.1") => Self::Vmaf4K,
+                arg if arg.as_str().ends_with("version=vmaf_v0.6.1") => Self::Vmaf1K,
+                arg if arg.as_str().ends_with("version=vmaf_4k_v0.6.1") => Self::Vmaf4K,
                 _ => Self::Custom,
             }),
             _ => Some(Self::Custom),
@@ -303,6 +338,33 @@ impl VmafModel {
 /// True when a libvmaf arg explicitly selects a model (not e.g. `phone_model=1`).
 fn is_vmaf_model_override(arg: &str) -> bool {
     arg.split(':').any(|part| part.starts_with("model="))
+}
+
+#[test]
+fn parse_vmaf_arg_returns_typed_model_arg() {
+    let args = crate::command::crf_search::Args::try_parse_from([
+        "ab-av1",
+        "--input",
+        "test.mp4",
+        "--vmaf",
+        "model=version=foo",
+    ]);
+
+    assert!(matches!(
+        args.as_ref().ok().and_then(|args| args
+            .vmaf
+            .vmaf_args
+            .first()
+            .map(|arg| (arg.as_str(), arg.is_model_override()))),
+        Some(("model=version=foo", true))
+    ));
+
+    fn assert_vmaf_arg(_: &VmafArg) {}
+    if let Ok(args) = args
+        && let Some(arg) = args.vmaf.vmaf_args.first()
+    {
+        assert_vmaf_arg(arg);
+    }
 }
 
 #[test]

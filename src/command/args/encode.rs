@@ -11,6 +11,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Write},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -79,7 +80,7 @@ pub struct Encode {
     ///
     /// See https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/svt-av1_encoder_user_guide.md#options
     #[arg(long = "svt", value_parser = parse_svt_arg)]
-    pub svt_args: Vec<Arc<str>>,
+    pub svt_args: Vec<SvtArg>,
 
     /// Additional ffmpeg encoder arg(s). E.g. `--enc x265-params=lossless=1`
     /// These are added as ffmpeg output file options.
@@ -87,7 +88,7 @@ pub struct Encode {
     /// The first '=' symbol will be used to infer that this is an option with a value.
     /// Passed to ffmpeg like "x265-params=lossless=1" -> ['-x265-params', 'lossless=1']
     #[arg(long = "enc", allow_hyphen_values = true, value_parser = parse_enc_arg)]
-    pub enc_args: Vec<String>,
+    pub enc_args: Vec<EncoderArg>,
 
     /// Additional ffmpeg input encoder arg(s). E.g. `--enc-input r=1`
     /// These are added as ffmpeg input file options.
@@ -101,11 +102,11 @@ pub struct Encode {
     ///
     /// Disable defaults by setting them to "none"
     /// e.g. `-enc-input hwaccel=none --enc-input hwaccel_output_format=none`
-    #[arg(long = "enc-input", allow_hyphen_values = true, value_parser = parse_enc_arg)]
-    pub enc_input_args: Vec<String>,
+    #[arg(long = "enc-input", allow_hyphen_values = true, value_parser = parse_enc_input_arg)]
+    pub enc_input_args: Vec<EncoderInputArg>,
 }
 
-fn parse_svt_arg(arg: &str) -> anyhow::Result<Arc<str>> {
+fn parse_svt_arg(arg: &str) -> anyhow::Result<SvtArg> {
     let arg = arg.trim_start_matches('-').to_owned();
 
     for deny in ["crf", "preset", "keyint", "scd", "input-depth"] {
@@ -115,7 +116,34 @@ fn parse_svt_arg(arg: &str) -> anyhow::Result<Arc<str>> {
     Ok(arg.into())
 }
 
-fn parse_enc_arg(arg: &str) -> anyhow::Result<String> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SvtArg(Arc<str>);
+
+impl SvtArg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SvtArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl From<String> for SvtArg {
+    fn from(arg: String) -> Self {
+        Self(arg.into())
+    }
+}
+
+impl From<&str> for SvtArg {
+    fn from(arg: &str) -> Self {
+        Self(Arc::from(arg))
+    }
+}
+
+fn parse_enc_arg(arg: &str) -> anyhow::Result<EncoderArg> {
     let mut arg = arg.to_owned();
     if !arg.starts_with('-') {
         arg.insert(0, '-');
@@ -126,7 +154,76 @@ fn parse_enc_arg(arg: &str) -> anyhow::Result<String> {
         "'svtav1-params' cannot be set here, use `--svt`"
     );
 
-    Ok(arg)
+    Ok(arg.into())
+}
+
+fn parse_enc_input_arg(arg: &str) -> anyhow::Result<EncoderInputArg> {
+    let arg = parse_enc_arg(arg)?;
+    Ok(arg.as_str().into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EncoderArg(Arc<str>);
+
+impl EncoderArg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EncoderArg {
+    fn from(arg: String) -> Self {
+        Self(arg.into())
+    }
+}
+
+impl From<&str> for EncoderArg {
+    fn from(arg: &str) -> Self {
+        Self(Arc::from(arg))
+    }
+}
+
+impl FromStr for EncoderArg {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_enc_arg(s)
+    }
+}
+
+impl AsRef<str> for EncoderArg {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EncoderInputArg(Arc<str>);
+
+impl EncoderInputArg {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for EncoderInputArg {
+    fn from(arg: &str) -> Self {
+        Self(Arc::from(arg))
+    }
+}
+
+impl FromStr for EncoderInputArg {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_enc_input_arg(s)
+    }
+}
+
+impl AsRef<str> for EncoderInputArg {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,9 +259,12 @@ fn owned_arg(arg: &str) -> Arc<String> {
     arg.to_owned().into()
 }
 
-fn collect_passthrough_args<'a>(args: impl IntoIterator<Item = &'a String>) -> Vec<Arc<String>> {
+fn collect_passthrough_args<'a, T>(args: impl IntoIterator<Item = &'a T>) -> Vec<Arc<String>>
+where
+    T: AsRef<str> + 'a,
+{
     args.into_iter()
-        .flat_map(|arg| PassthroughArg::parse(arg).values())
+        .flat_map(|arg| PassthroughArg::parse(arg.as_ref()).values())
         .map(owned_arg)
         .collect()
 }
@@ -213,11 +313,11 @@ impl Encode {
             write!(hint, " --svt {arg}").unwrap();
         }
         for arg in enc_input_args {
-            let arg = arg.trim_start_matches('-');
+            let arg = arg.as_str().trim_start_matches('-');
             write!(hint, " --enc-input {arg}").unwrap();
         }
         for arg in enc_args {
-            let arg = arg.trim_start_matches('-');
+            let arg = arg.as_str().trim_start_matches('-');
             write!(hint, " --enc {arg}").unwrap();
         }
 
@@ -261,9 +361,9 @@ impl Encode {
             .enc_args
             .iter()
             .filter_map(|arg| {
-                let parsed = PassthroughArg::parse(arg);
+                let parsed = PassthroughArg::parse(arg.as_str());
                 if parsed.is_svtav1_params() {
-                    svtav1_params.push(arg.clone());
+                    svtav1_params.push(arg.as_str().to_owned());
                     None
                 } else {
                     Some(parsed)
@@ -786,12 +886,39 @@ fn parse_svt_arg_rejects_reserved_keys() {
 }
 
 #[test]
+fn parse_svt_arg_returns_typed_svt_arg() {
+    // setup
+    // execute
+    let arg = parse_svt_arg("film-grain=8");
+    // assert
+    assert!(matches!(
+        arg.as_ref().map(SvtArg::as_str),
+        Ok("film-grain=8")
+    ));
+}
+
+#[test]
 fn parse_enc_arg_adds_leading_dash() {
     // setup
     // execute
-    let arg = parse_enc_arg("x265-params=lossless=1").expect("parse");
+    let arg = parse_enc_arg("x265-params=lossless=1");
     // assert
-    assert_eq!(arg, "-x265-params=lossless=1");
+    assert!(matches!(
+        arg.as_ref().map(EncoderArg::as_str),
+        Ok("-x265-params=lossless=1")
+    ));
+}
+
+#[test]
+fn parse_enc_input_arg_returns_typed_input_arg() {
+    // setup
+    // execute
+    let arg = parse_enc_input_arg("hwaccel=none");
+    // assert
+    assert!(matches!(
+        arg.as_ref().map(EncoderInputArg::as_str),
+        Ok("-hwaccel=none")
+    ));
 }
 
 #[test]

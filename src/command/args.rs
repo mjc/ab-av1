@@ -8,7 +8,10 @@ pub use vmaf::*;
 use crate::{command::encode::default_output_ext, ffprobe::Ffprobe};
 use clap::{Parser, ValueHint};
 use std::{
+    fmt,
+    num::ParseIntError,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -54,23 +57,23 @@ pub struct Sample {
     /// Number of samples to use across the input video. Overrides --sample-every.
     /// More samples take longer but may provide a more accurate result.
     #[arg(long)]
-    pub samples: Option<u64>,
+    pub samples: Option<SampleCountOverride>,
 
     /// Calculate number of samples by dividing the input duration by this value.
     /// So "12m" would mean with an input 25-36 minutes long, 3 samples would be used.
     /// More samples take longer but may provide a more accurate result.
     ///
     /// Setting --samples overrides this value.
-    #[arg(long, default_value = "12m", value_parser = humantime::parse_duration)]
-    pub sample_every: Duration,
+    #[arg(long, default_value = "12m")]
+    pub sample_every: SampleDuration,
 
     /// Minimum number of samples. So at least this many samples will be used.
     #[arg(long)]
-    pub min_samples: Option<u64>,
+    pub min_samples: Option<MinSampleCount>,
 
     /// Duration of each sample.
-    #[arg(long, default_value = "20s", value_parser = humantime::parse_duration)]
-    pub sample_duration: Duration,
+    #[arg(long, default_value = "20s")]
+    pub sample_duration: SampleDuration,
 
     /// Keep temporary files after exiting.
     #[arg(long)]
@@ -90,20 +93,18 @@ impl Sample {
     /// Calculate the desired sample count using `samples` or `sample_every` & `min_samples`.
     pub fn sample_count(&self, input_duration: Duration) -> u64 {
         let count = match self.samples {
-            Some(s) => s,
+            Some(samples) => samples.get(),
             None => {
-                let every = self.sample_every.as_secs_f64();
-                if every <= 0.0 {
-                    1
-                } else {
-                    (input_duration.as_secs_f64() / every).ceil() as u64
-                }
+                let every = self.sample_every.get().as_secs_f64();
+                (input_duration.as_secs_f64() / every).ceil() as u64
             }
         };
         if self.samples.is_some() {
-            count.max(self.min_samples.unwrap_or(0))
+            count.max(self.min_samples.map_or(0, MinSampleCount::get))
         } else {
-            count.max(self.min_samples.unwrap_or(1)).max(1)
+            count
+                .max(self.min_samples.map_or(1, MinSampleCount::get))
+                .max(1)
         }
     }
 
@@ -116,6 +117,97 @@ impl Sample {
             .extension()
             .and_then(|e| e.to_str().map(Into::into))
             .or_else(|| Some("mkv".into()));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleCountOverride(u64);
+
+impl SampleCountOverride {
+    pub fn new(samples: u64) -> Self {
+        Self(samples)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl FromStr for SampleCountOverride {
+    type Err = ParseIntError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        raw.parse().map(Self::new)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleDuration(Duration);
+
+#[derive(Debug, thiserror::Error)]
+pub enum SampleDurationError {
+    #[error(transparent)]
+    Parse(#[from] humantime::DurationError),
+    #[error("sample duration must be positive")]
+    Zero,
+}
+
+impl SampleDuration {
+    pub fn new(duration: Duration) -> Result<Self, SampleDurationError> {
+        match duration.is_zero() {
+            true => Err(SampleDurationError::Zero),
+            false => Ok(Self(duration)),
+        }
+    }
+
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl FromStr for SampleDuration {
+    type Err = SampleDurationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(humantime::parse_duration(s)?)
+    }
+}
+
+impl fmt::Display for SampleDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        humantime::format_duration(self.0).fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinSampleCount(u64);
+
+#[derive(Debug, thiserror::Error)]
+pub enum MinSampleCountError {
+    #[error(transparent)]
+    Parse(#[from] ParseIntError),
+    #[error("--min-samples must be positive")]
+    Zero,
+}
+
+impl MinSampleCount {
+    pub fn new(samples: u64) -> Result<Self, MinSampleCountError> {
+        match samples {
+            0 => Err(MinSampleCountError::Zero),
+            samples => Ok(Self(samples)),
+        }
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl FromStr for MinSampleCount {
+    type Err = MinSampleCountError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s.parse()?)
     }
 }
 
@@ -147,6 +239,14 @@ impl From<ScoreArgs> for ScoreConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameRateOverride(Option<f32>);
 
+#[derive(Debug, thiserror::Error)]
+pub enum FrameRateOverrideError {
+    #[error(transparent)]
+    Parse(#[from] std::num::ParseFloatError),
+    #[error("frame rate override must be finite")]
+    NonFinite,
+}
+
 impl FrameRateOverride {
     pub fn new(fps: f32) -> Self {
         Self(Some(fps).filter(|r| *r > 0.0 && r.is_finite()))
@@ -176,10 +276,13 @@ impl std::hash::Hash for FrameRateOverride {
 }
 
 impl std::str::FromStr for FrameRateOverride {
-    type Err = std::num::ParseFloatError;
+    type Err = FrameRateOverrideError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let fps: f32 = s.parse()?;
+        if !fps.is_finite() {
+            return Err(FrameRateOverrideError::NonFinite);
+        }
         Ok(Self::new(fps))
     }
 }
@@ -247,11 +350,20 @@ mod tests {
         min_samples: Option<u64>,
         sample_every: Duration,
     ) -> Sample {
+        let sample_every = match SampleDuration::new(sample_every) {
+            Ok(duration) => duration,
+            Err(err) => panic!("invalid test sample_every: {err}"),
+        };
+        let sample_duration = match SampleDuration::new(Duration::from_secs(20)) {
+            Ok(duration) => duration,
+            Err(err) => panic!("invalid test sample_duration: {err}"),
+        };
+
         Sample {
-            samples,
+            samples: samples.map(SampleCountOverride::new),
             sample_every,
-            min_samples,
-            sample_duration: Duration::from_secs(20),
+            min_samples: min_samples.and_then(|samples| MinSampleCount::new(samples).ok()),
+            sample_duration,
             keep: false,
             temp_dir: None,
             extension: None,
@@ -293,6 +405,72 @@ mod tests {
         let count = args.sample_count(Duration::from_secs(60));
         // assert
         assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn min_sample_count_is_a_checked_copy_newtype() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<MinSampleCount>();
+        assert!(matches!(
+            MinSampleCount::new(5).map(MinSampleCount::get),
+            Ok(5)
+        ));
+        assert!(matches!(
+            MinSampleCount::new(0),
+            Err(MinSampleCountError::Zero)
+        ));
+    }
+
+    #[test]
+    fn parse_min_samples_rejects_zero() {
+        let args = crate::command::crf_search::Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "test.mp4",
+            "--min-samples",
+            "0",
+        ]);
+
+        assert!(args.is_err());
+    }
+
+    #[test]
+    fn parse_samples_returns_typed_override() {
+        let args = crate::command::crf_search::Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "test.mp4",
+            "--samples",
+            "7",
+        ]);
+
+        assert!(matches!(
+            args.as_ref()
+                .map(|args| args.sample.samples.map(SampleCountOverride::get)),
+            Ok(Some(7))
+        ));
+    }
+
+    #[test]
+    fn parse_sample_durations_reject_zero() {
+        let sample_every = crate::command::crf_search::Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "test.mp4",
+            "--sample-every",
+            "0s",
+        ]);
+        let sample_duration = crate::command::crf_search::Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "test.mp4",
+            "--sample-duration",
+            "0s",
+        ]);
+
+        assert!(sample_every.is_err());
+        assert!(sample_duration.is_err());
     }
 
     mod proptest_sample_count {
@@ -495,6 +673,8 @@ mod tests {
         assert_eq!(FrameRateOverride::new(60.0).fps(), Some(60.0));
         assert_eq!(FrameRateOverride::new(0.0).fps(), None);
         assert_eq!(FrameRateOverride::new(-1.0).fps(), None);
+        assert!("NaN".parse::<FrameRateOverride>().is_err());
+        assert!("inf".parse::<FrameRateOverride>().is_err());
     }
 
     // ab-kgc.82: xpsnr pix_format must participate in args hashing (distinct from cache key ab-kgc.21)

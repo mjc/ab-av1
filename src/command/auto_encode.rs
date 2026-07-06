@@ -179,7 +179,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
     encode::run(
         encode::Args {
             args: enc_args,
-            crf: best.crf,
+            crf: crf_search::Crf::try_new(best.crf).context("crf-search returned invalid CRF")?,
             encode: args::EncodeToOutput {
                 output: Some(output),
                 ..encode
@@ -244,21 +244,27 @@ mod tests {
                         enc_args: vec![],
                         enc_input_args: vec![],
                     },
-                    min_vmaf: Some(95.0),
+                    min_vmaf: crate::command::crf_search::MinScore::new(95.0).ok(),
                     min_xpsnr: None,
                     max_encoded_percent: crate::command::crf_search::MaxEncodedPercent::new(80.0)
                         .unwrap(),
-                    min_crf: Some(20.0),
-                    max_crf: Some(40.0),
+                    min_crf: crate::command::crf_search::Crf::try_new(20.0).ok(),
+                    max_crf: crate::command::crf_search::Crf::try_new(40.0).ok(),
                     crf_increment: Some(crate::command::crf_search::CrfStep::try_new(1.0).unwrap()),
                     high_crf_means_hq: Some(false),
                     thorough: true,
                     cache: false,
                     sample: SampleArgs {
-                        samples: Some(1),
-                        sample_every: Duration::from_secs(720),
+                        samples: Some(args::SampleCountOverride::new(1)),
+                        sample_every: match args::SampleDuration::new(Duration::from_secs(720)) {
+                            Ok(duration) => duration,
+                            Err(err) => panic!("invalid test sample_every: {err}"),
+                        },
                         min_samples: None,
-                        sample_duration: Duration::from_secs(20),
+                        sample_duration: match args::SampleDuration::new(Duration::from_secs(20)) {
+                            Ok(duration) => duration,
+                            Err(err) => panic!("invalid test sample_duration: {err}"),
+                        },
                         keep,
                         temp_dir: None,
                         extension: None,
