@@ -975,7 +975,8 @@ pub enum Update {
 mod crf_search_tests {
     use super::{
         Args, Crf, CrfSearchConfig, CrfStep, Error, MaxEncodedPercent, MinScore, Sample, Update,
-        ValidationError, guess_progress, output_search_score, run, test_hooks, vmaf_lerp_q,
+        ValidationError, guess_progress, output_search_score, positional_vmaf_number, run,
+        test_hooks, vmaf_lerp_q,
     };
     use crate::{
         command::{
@@ -1601,6 +1602,15 @@ mod crf_search_tests {
             args.validate(),
             Err(ValidationError::PositionalVmafNumber { num }) if (num - 95.0).abs() < f32::EPSILON
         ));
+    }
+
+    #[test]
+    fn positional_vmaf_number_normalization_does_not_allocate() {
+        let vmaf_args = ["model=version=vmaf_v0.6.1".into(), "95".into()];
+
+        crate::test_support::assert_no_allocations(|| {
+            assert_eq!(positional_vmaf_number(&vmaf_args), Some(95.0));
+        });
     }
 
     #[tokio::test]

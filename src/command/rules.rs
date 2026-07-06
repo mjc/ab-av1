@@ -198,6 +198,13 @@ mod tests {
         }
     }
 
+    fn assert_source_excludes(context: &str, source: &str, forbidden: &str) {
+        assert!(
+            !source.contains(forbidden),
+            "{context} contains forbidden `{forbidden}`"
+        );
+    }
+
     #[test]
     fn crf_search_rules_report_first_error_without_clap_or_processes() {
         let cases = [
@@ -444,10 +451,7 @@ mod tests {
         .into_iter()
         .flat_map(|(name, source)| ["ensure!(", "bail!("].map(move |needle| (name, source, needle)))
         .for_each(|(name, source, needle)| {
-            assert!(
-                !source.contains(needle),
-                "{name} bypasses command::rules with {needle}"
-            );
+            assert_source_excludes(name, source, needle);
         });
     }
 
@@ -468,9 +472,10 @@ mod tests {
         ]
         .into_iter()
         .for_each(|forbidden| {
-            assert!(
-                !production_source.contains(forbidden),
-                "command::rules production code depends on boundary concern `{forbidden}`"
+            assert_source_excludes(
+                "command::rules production code",
+                production_source,
+                forbidden,
             );
         });
     }
