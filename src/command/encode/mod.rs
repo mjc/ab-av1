@@ -86,7 +86,7 @@ pub(crate) async fn run_with_spawner(
     bar: &ProgressBar,
     spawner: &impl EncodeSpawner,
 ) -> anyhow::Result<()> {
-    let plan = EncodePlan::build(args, probe).map_err(EncodePlanError::into_anyhow)?;
+    let plan = EncodePlan::build(args.into(), probe).map_err(EncodePlanError::into_anyhow)?;
 
     if plan.defaulting_output() {
         let out = shell_escape::escape(plan.output_path().display().to_string().into());

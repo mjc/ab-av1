@@ -509,10 +509,14 @@ fn vmaf_hash_distinguishes_and_vmaf_flag() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let mut off = Vmaf::default();
-    off.and_vmaf = None;
-    let mut on = Vmaf::default();
-    on.and_vmaf = Some(true);
+    let off = Vmaf {
+        and_vmaf: None,
+        ..Default::default()
+    };
+    let on = Vmaf {
+        and_vmaf: Some(true),
+        ..Default::default()
+    };
 
     let hash = |v: &Vmaf| {
         let mut h = DefaultHasher::new();

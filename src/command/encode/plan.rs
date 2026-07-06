@@ -20,6 +20,29 @@ pub struct SpawnConfig {
     crf: f32,
 }
 
+/// Validated encode inputs lowered from the raw clap surface.
+pub(crate) struct EncodeConfig {
+    encode: args::Encode,
+    crf: f32,
+    encode_to: args::EncodeToOutput,
+}
+
+impl From<Args> for EncodeConfig {
+    fn from(args: Args) -> Self {
+        let Args {
+            args: encode,
+            crf,
+            encode: encode_to,
+        } = args;
+
+        Self {
+            encode,
+            crf,
+            encode_to,
+        }
+    }
+}
+
 /// Preflight encode configuration: validation and ffmpeg args before any spawn or cleanup.
 pub struct EncodePlan {
     input: PathBuf,
@@ -30,12 +53,12 @@ pub struct EncodePlan {
 }
 
 impl EncodePlan {
-    pub fn build(args: Args, probe: Arc<Ffprobe>) -> Result<Self, EncodePlanError> {
-        let Args {
-            args: encode,
+    pub fn build(config: EncodeConfig, probe: Arc<Ffprobe>) -> Result<Self, EncodePlanError> {
+        let EncodeConfig {
+            encode,
             crf,
-            encode: encode_to,
-        } = args;
+            encode_to,
+        } = config;
 
         let ResolvedOutput {
             planned,
@@ -139,7 +162,7 @@ mod tests {
     fn build_rejects_same_input_and_output() {
         let input = temp_input("plan", "same-io");
         let err = match EncodePlan::build(
-            encode_args(input.clone(), Some(input.clone())),
+            encode_args(input.clone(), Some(input.clone())).into(),
             arc_probe(Some(6)),
         ) {
             Err(err) => err,
@@ -157,7 +180,7 @@ mod tests {
         args.encode.downmix_to_stereo = true;
         args.encode.audio_codec = Some("copy".into());
 
-        let err = match EncodePlan::build(args, arc_probe(Some(6))) {
+        let err = match EncodePlan::build(args.into(), arc_probe(Some(6))) {
             Err(err) => err,
             Ok(_) => panic!("expected downmix/copy error"),
         };
@@ -170,7 +193,7 @@ mod tests {
         let input = temp_input("plan", "default-out");
         let mut args = encode_args(input.clone(), None);
         args.args.input = PathBuf::from("movie.mkv");
-        let plan = EncodePlan::build(args, arc_probe(Some(6))).expect("plan build");
+        let plan = EncodePlan::build(args.into(), arc_probe(Some(6))).expect("plan build");
         assert!(plan.defaulting_output());
         assert_eq!(plan.output_path(), Path::new("movie.av1.mkv"));
         let _ = fs::remove_file(input);
@@ -185,7 +208,7 @@ mod tests {
         args.encode.video_only = true;
         args.encode.downmix_to_stereo = true;
 
-        let plan = EncodePlan::build(args, arc_probe(Some(6))).expect("plan build");
+        let plan = EncodePlan::build(args.into(), arc_probe(Some(6))).expect("plan build");
         assert!(plan.spawn_config().video_only);
         assert!(plan.spawn_config().stereo_downmix);
         assert!(plan.spawn_config().has_audio);
@@ -205,7 +228,7 @@ mod tests {
         let mut args = encode_args(input.clone(), Some(output));
         args.encode.downmix_to_stereo = true;
 
-        let plan = EncodePlan::build(args, arc_probe(Some(2))).expect("plan build");
+        let plan = EncodePlan::build(args.into(), arc_probe(Some(2))).expect("plan build");
         assert!(!plan.spawn_config().stereo_downmix);
         let _ = fs::remove_file(input);
     }

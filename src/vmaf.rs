@@ -1,8 +1,8 @@
 //! vmaf logic
 use crate::process::{Chunks, CommandExt, FfmpegOut, managed::ManagedProcess};
 use crate::score_stream::{
-    ParsedScore, Score, ScoreError, ScoreStreamParse, build_score_ffmpeg_command,
-    parse_score_chunk, run_score_stream,
+    ParsedScore, Score, ScoreStreamParse, build_score_ffmpeg_command, parse_score_chunk,
+    run_score_stream,
 };
 use anyhow::Context;
 use log::{debug, info};
@@ -107,6 +107,7 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> 
 mod test {
     use super::*;
     use crate::process::CommandExt;
+    use crate::score_stream::ScoreError;
     use std::env;
     use std::path::Path;
     use std::pin::Pin;

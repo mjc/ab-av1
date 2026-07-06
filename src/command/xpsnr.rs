@@ -1,7 +1,7 @@
 use crate::{
     command::{
         PROGRESS_CHARS,
-        args::{self, PixelFormat},
+        args::{self, PixelFormat, ScoreConfig},
     },
     ffprobe,
     log::ProgressLogger,
@@ -40,14 +40,40 @@ pub struct Args {
     pub xpsnr: args::Xpsnr,
 }
 
-pub async fn xpsnr(
-    Args {
+#[derive(Debug, Clone)]
+pub struct XpsnrConfig {
+    reference: PathBuf,
+    distorted: PathBuf,
+    score: ScoreConfig,
+    xpsnr: args::Xpsnr,
+}
+
+impl From<Args> for XpsnrConfig {
+    fn from(
+        Args {
+            reference,
+            distorted,
+            score,
+            xpsnr,
+        }: Args,
+    ) -> Self {
+        Self {
+            reference,
+            distorted,
+            score: score.into(),
+            xpsnr,
+        }
+    }
+}
+
+pub async fn xpsnr(config: XpsnrConfig) -> anyhow::Result<()> {
+    let XpsnrConfig {
         reference,
         distorted,
         score,
         xpsnr,
-    }: Args,
-) -> anyhow::Result<()> {
+    } = config;
+
     let bar = ProgressBar::new(1).with_style(
         ProgressStyle::default_bar()
             .template("{spinner:.cyan.bold} {elapsed_precise:.bold} {wide_bar:.cyan/blue} ({msg}eta {eta})")?
@@ -192,4 +218,26 @@ fn xpsnr_lavfi_includes_timestamp_sync_filters() {
         filter.contains("setpts=PTS-STARTPTS") && filter.contains("settb=AVTB"),
         "xpsnr lavfi must sync presentation timestamps: {filter}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xpsnr_config_lowers_score_args() {
+        let config = XpsnrConfig::from(Args {
+            reference: PathBuf::from("ref.mkv"),
+            distorted: PathBuf::from("dist.mkv"),
+            score: args::ScoreArgs {
+                reference_vfilter: Some("scale=1280:-1".into()),
+            },
+            xpsnr: args::Xpsnr::default(),
+        });
+
+        assert_eq!(
+            config.score.reference_vfilter.as_deref(),
+            Some("scale=1280:-1")
+        );
+    }
 }

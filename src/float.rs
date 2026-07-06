@@ -20,7 +20,7 @@ impl std::fmt::Display for TerseF32 {
 #[inline]
 fn near_whole(v: f64) -> bool {
     let frac = v.fract().abs();
-    frac < 0.00005 || frac > 0.99995
+    !(0.00005..=0.99995).contains(&frac)
 }
 
 #[cfg(test)]

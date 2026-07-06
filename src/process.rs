@@ -420,6 +420,30 @@ fn parse_ffmpeg_progress_chunk() {
 }
 
 #[test]
+fn parse_ffmpeg_progress_split_chunk() {
+    let mut chunks = Chunks::default();
+    let first = b"frame=  288 fps= 94 q=-0.0 size=N/A time=01:23:";
+    let second = b"12.34 bitrate=N/A speed=3.94x    \r";
+
+    assert_eq!(
+        FfmpegOut::try_parse(std::str::from_utf8(first).unwrap()),
+        None
+    );
+    chunks.push(first);
+    assert_eq!(FfmpegOut::try_parse(chunks.last_line()), None);
+
+    chunks.push(second);
+    assert_eq!(
+        FfmpegOut::try_parse(chunks.last_line()),
+        Some(FfmpegOut::Progress {
+            frame: 288,
+            fps: 94.0,
+            time: Duration::new(60 * 60 + 23 * 60 + 12, 340_000_000),
+        })
+    );
+}
+
+#[test]
 fn parse_ffmpeg_progress_line() {
     let out = "frame=  161 fps= 73 q=-0.0 size=  978076kB time=00:00:06.71 bitrate=1193201.6kbits/s dup=13 drop=0 speed=3.03x    ";
     assert_eq!(

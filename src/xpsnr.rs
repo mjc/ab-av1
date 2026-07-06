@@ -74,6 +74,7 @@ impl XpsnrOut {
         }
     }
 
+    #[cfg(test)]
     fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
         match try_parse_xpsnr_score_chunk(chunk, chunks) {
             Ok(Some(event)) => Some(Self::from_parse(event)),
@@ -99,8 +100,7 @@ fn try_parse_xpsnr_score_chunk(
     Ok(FfmpegOut::try_parse(chunks.last_line()).map(ScoreStreamParse::Progress))
 }
 
-// E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
-// E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
+#[cfg(test)]
 fn score_from_line(line: &str) -> Option<f32> {
     match parse_xpsnr_score_line(line) {
         ParsedScore::Score(score) => Some(score.get()),
@@ -108,6 +108,7 @@ fn score_from_line(line: &str) -> Option<f32> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_xpsnr_score_line(line: &str) -> ParsedScore {
     match score_from_minimum_line(line) {
         ParsedScore::Miss => score_from_average_line(line),

@@ -129,6 +129,46 @@ fn parse_enc_arg(arg: &str) -> anyhow::Result<String> {
     Ok(arg)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PassthroughArg<'a> {
+    option: &'a str,
+    value: Option<&'a str>,
+}
+
+impl<'a> PassthroughArg<'a> {
+    fn parse(raw: &'a str) -> Self {
+        match raw.split_once('=') {
+            Some((option, value)) => Self {
+                option,
+                value: Some(value),
+            },
+            None => Self {
+                option: raw,
+                value: None,
+            },
+        }
+    }
+
+    fn values(self) -> impl Iterator<Item = &'a str> {
+        [Some(self.option), self.value].into_iter().flatten()
+    }
+
+    fn is_svtav1_params(self) -> bool {
+        self.option.trim_start_matches('-') == "svtav1-params"
+    }
+}
+
+fn owned_arg(arg: &str) -> Arc<String> {
+    arg.to_owned().into()
+}
+
+fn collect_passthrough_args<'a>(args: impl IntoIterator<Item = &'a String>) -> Vec<Arc<String>> {
+    args.into_iter()
+        .flat_map(|arg| PassthroughArg::parse(arg).values())
+        .map(owned_arg)
+        .collect()
+}
+
 impl Encode {
     pub fn encode_hint(&self, crf: f32) -> String {
         let Self {
@@ -220,22 +260,21 @@ impl Encode {
         let mut args: Vec<Arc<String>> = self
             .enc_args
             .iter()
-            .flat_map(|arg| {
-                if let Some((opt, val)) = arg.split_once('=') {
-                    if opt == "svtav1-params" {
-                        svtav1_params.push(arg.clone());
-                        vec![]
-                    } else {
-                        vec![opt.to_owned().into(), val.to_owned().into()]
-                    }
+            .filter_map(|arg| {
+                let parsed = PassthroughArg::parse(arg);
+                if parsed.is_svtav1_params() {
+                    svtav1_params.push(arg.clone());
+                    None
                 } else {
-                    vec![arg.clone().into()]
+                    Some(parsed)
                 }
             })
+            .flat_map(PassthroughArg::values)
+            .map(owned_arg)
             .collect();
 
         if !svtav1_params.is_empty() {
-            args.push("-svtav1-params".to_owned().into());
+            args.push(owned_arg("-svtav1-params"));
             args.push(svtav1_params.join(":").into());
         }
 
@@ -243,7 +282,7 @@ impl Encode {
         if let Some(keyint) = keyint
             && !args.iter().any(|a| &**a == "-g")
         {
-            args.push("-g".to_owned().into());
+            args.push(owned_arg("-g"));
             args.push(keyint.to_string().into());
         }
 
@@ -259,17 +298,7 @@ impl Encode {
             _ => None,
         });
 
-        let mut input_args: Vec<Arc<String>> = self
-            .enc_input_args
-            .iter()
-            .flat_map(|arg| {
-                if let Some((opt, val)) = arg.split_once('=') {
-                    vec![opt.to_owned().into(), val.to_owned().into()].into_iter()
-                } else {
-                    vec![arg.clone().into()].into_iter()
-                }
-            })
-            .collect();
+        let mut input_args = collect_passthrough_args(&self.enc_input_args);
 
         for (name, val) in self.encoder.default_ffmpeg_input_args() {
             if !input_args.iter().any(|arg| &**arg == name) {
@@ -765,6 +794,26 @@ fn parse_enc_arg_adds_leading_dash() {
     assert_eq!(arg, "-x265-params=lossless=1");
 }
 
+#[test]
+fn passthrough_arg_values_split_once_and_keep_hyphen_values() {
+    assert_eq!(
+        PassthroughArg::parse("-metadata=title=a=b")
+            .values()
+            .collect::<Vec<_>>(),
+        ["-metadata", "title=a=b"]
+    );
+    assert_eq!(
+        PassthroughArg::parse("-profile=-1")
+            .values()
+            .collect::<Vec<_>>(),
+        ["-profile", "-1"]
+    );
+    assert_eq!(
+        PassthroughArg::parse("-dn").values().collect::<Vec<_>>(),
+        ["-dn"]
+    );
+}
+
 // ab-kgc.30: CLI docs promise 0.1 increment for libvpx-vp9
 #[test]
 fn libvpx_vp9_default_crf_increment_matches_docs() {
@@ -847,6 +896,7 @@ fn encoder_from_str_matrix(#[case] input: &str, #[case] expected: &str) {
     assert_eq!(enc.as_str(), expected);
 }
 
+#[cfg(test)]
 fn test_probe(duration_secs: u64, fps: f64) -> Ffprobe {
     Ffprobe {
         duration: Ok(Duration::from_secs(duration_secs)),

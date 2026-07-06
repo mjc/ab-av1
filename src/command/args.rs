@@ -130,6 +130,20 @@ pub struct ScoreArgs {
     pub reference_vfilter: Option<Arc<str>>,
 }
 
+/// Normalized score configuration lowered from clap parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScoreConfig {
+    pub reference_vfilter: Option<Arc<str>>,
+}
+
+impl From<ScoreArgs> for ScoreConfig {
+    fn from(score: ScoreArgs) -> Self {
+        Self {
+            reference_vfilter: score.reference_vfilter,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameRateOverride(Option<f32>);
 
@@ -188,6 +202,15 @@ pub struct Xpsnr {
 impl Xpsnr {
     pub fn fps(&self) -> Option<f32> {
         self.xpsnr_fps.fps()
+    }
+}
+
+impl Default for Xpsnr {
+    fn default() -> Self {
+        Self {
+            xpsnr_fps: FrameRateOverride::new(60.0),
+            xpsnr_pix_format: None,
+        }
     }
 }
 
@@ -432,11 +455,18 @@ mod tests {
         // setup
         let xpsnr = Xpsnr {
             xpsnr_fps: FrameRateOverride::new(fps),
-            xpsnr_pix_format: None,
+            ..Default::default()
         };
         // execute
         // assert
         assert_eq!(xpsnr.fps(), expected);
+    }
+
+    #[test]
+    fn xpsnr_default_matches_cli_defaults() {
+        let xpsnr = Xpsnr::default();
+        assert_eq!(xpsnr.fps(), Some(60.0));
+        assert_eq!(xpsnr.xpsnr_pix_format, None);
     }
 
     #[test]
@@ -453,12 +483,12 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let a = Xpsnr {
-            xpsnr_fps: FrameRateOverride::new(60.0),
             xpsnr_pix_format: Some(PixelFormat::Yuv420p),
+            ..Default::default()
         };
         let b = Xpsnr {
-            xpsnr_fps: FrameRateOverride::new(60.0),
             xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+            ..Default::default()
         };
 
         let mut hash_a = DefaultHasher::new();
