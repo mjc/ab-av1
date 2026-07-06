@@ -1,14 +1,13 @@
 use crate::{
+    command::rules::{validate_enc_arg, validate_encoder_passthrough, validate_svt_arg},
     ffmpeg::FfmpegEncodeArgs,
     ffprobe::{Ffprobe, ProbeError},
     float::TerseF32,
 };
-use anyhow::ensure;
 use clap::{Parser, ValueHint};
 #[cfg(test)]
 use rstest::rstest;
 use std::{
-    collections::HashMap,
     fmt::{self, Write},
     path::PathBuf,
     str::FromStr,
@@ -109,9 +108,7 @@ pub struct Encode {
 fn parse_svt_arg(arg: &str) -> anyhow::Result<SvtArg> {
     let arg = arg.trim_start_matches('-').to_owned();
 
-    for deny in ["crf", "preset", "keyint", "scd", "input-depth"] {
-        ensure!(!arg.starts_with(deny), "'{deny}' cannot be used here");
-    }
+    validate_svt_arg(arg.as_str()).map_err(anyhow::Error::new)?;
 
     Ok(arg.into())
 }
@@ -149,10 +146,7 @@ fn parse_enc_arg(arg: &str) -> anyhow::Result<EncoderArg> {
         arg.insert(0, '-');
     }
 
-    ensure!(
-        !arg.starts_with("-svtav1-params"),
-        "'svtav1-params' cannot be set here, use `--svt`"
-    );
+    validate_enc_arg(arg.as_str()).map_err(anyhow::Error::new)?;
 
     Ok(arg.into())
 }
@@ -331,10 +325,13 @@ impl Encode {
     ) -> anyhow::Result<FfmpegEncodeArgs<'_>> {
         let vcodec = &self.encoder.0;
         let svtav1 = vcodec.as_ref() == "libsvtav1";
-        ensure!(
-            svtav1 || self.svt_args.is_empty(),
-            "--svt may only be used with svt-av1"
-        );
+        validate_encoder_passthrough(
+            svtav1,
+            !self.svt_args.is_empty(),
+            std::iter::empty::<&str>(),
+            std::iter::empty::<&str>(),
+        )
+        .map_err(anyhow::Error::new)?;
 
         let preset = match &self.preset {
             Some(n) => Some(n.clone()),
@@ -417,41 +414,13 @@ impl Encode {
             }
         }
 
-        // ban usage of the bits we already set via other args & logic
-        let input_reserved = HashMap::from([
-            ("-i", ""),
-            ("-y", ""),
-            ("-n", ""),
-            ("-pix_fmt", " use --pix-format"),
-            ("-crf", ""),
-            ("-preset", " use --preset"),
-            ("-vf", " use --vfilter"),
-            ("-filter:v", " use --vfilter"),
-        ]);
-        for arg in &input_args {
-            if let Some(hint) = input_reserved.get(arg.as_str()) {
-                anyhow::bail!("Encoder argument `{arg}` not allowed{hint}");
-            }
-        }
-        let output_reserved = {
-            let mut r = input_reserved;
-            r.extend([
-                ("-c:a", " use --acodec"),
-                ("-codec:a", " use --acodec"),
-                ("-acodec", " use --acodec"),
-                ("-c:v", " use --encoder"),
-                ("-c:v:0", " use --encoder"),
-                ("-codec:v", " use --encoder"),
-                ("-codec:v:0", " use --encoder"),
-                ("-vcodec", " use --encoder"),
-            ]);
-            r
-        };
-        for arg in &args {
-            if let Some(hint) = output_reserved.get(arg.as_str()) {
-                anyhow::bail!("Encoder argument `{arg}` not allowed{hint}");
-            }
-        }
+        validate_encoder_passthrough(
+            true,
+            false,
+            input_args.iter().map(|arg| arg.as_str()),
+            args.iter().map(|arg| arg.as_str()),
+        )
+        .map_err(anyhow::Error::new)?;
 
         Ok(FfmpegEncodeArgs {
             input: &self.input,

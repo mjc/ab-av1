@@ -1,10 +1,13 @@
 mod err;
 
+pub use crate::command::rules::ValidationError;
 pub use err::Error;
 
 use crate::{
     command::{
         PROGRESS_CHARS, args,
+        args::VmafArg,
+        rules::CrfSearchRules,
         sample_encode::{self, Work},
     },
     console_ext::style,
@@ -173,25 +176,14 @@ impl CrfSearchConfig {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.min_vmaf.is_some() && self.min_xpsnr.is_some() {
-            return Err(ValidationError::BothMinScores);
+        CrfSearchRules {
+            min_vmaf: self.min_vmaf,
+            min_xpsnr: self.min_xpsnr,
+            min_crf: self.min_crf,
+            max_crf: self.max_crf,
+            positional_vmaf_number: positional_vmaf_number(&self.scoring.vmaf.vmaf_args),
         }
-        if let (Some(min_crf), Some(max_crf)) = (self.min_crf, self.max_crf)
-            && min_crf.get() >= max_crf.get()
-        {
-            return Err(ValidationError::InvalidCrfBounds);
-        }
-        if self.min_vmaf.is_none()
-            && let Some(num) = self
-                .scoring
-                .vmaf
-                .vmaf_args
-                .iter()
-                .find_map(|arg| arg.as_str().parse::<f32>().ok())
-        {
-            return Err(ValidationError::PositionalVmafNumber { num });
-        }
-        Ok(())
+        .validate()
     }
 }
 
@@ -236,20 +228,6 @@ impl From<Args> for CrfSearchConfig {
             verbose,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
-pub enum ValidationError {
-    #[error("Only one of --min-vmaf and --min-xpsnr may be set")]
-    BothMinScores,
-    #[error("Invalid --min-crf & --max-crf")]
-    InvalidCrfBounds,
-    #[error("Minimum score must be finite")]
-    InvalidMinScore,
-    #[error("--max-encoded-percent must be positive")]
-    NonPositiveMaxEncodedPercent,
-    #[error("Invalid use of --vmaf NUMBER, did you mean: --min-vmaf {num}")]
-    PositionalVmafNumber { num: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -320,25 +298,19 @@ impl Args {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.min_vmaf.is_some() && self.min_xpsnr.is_some() {
-            return Err(ValidationError::BothMinScores);
+        CrfSearchRules {
+            min_vmaf: self.min_vmaf,
+            min_xpsnr: self.min_xpsnr,
+            min_crf: self.min_crf,
+            max_crf: self.max_crf,
+            positional_vmaf_number: positional_vmaf_number(&self.vmaf.vmaf_args),
         }
-        if let (Some(min_crf), Some(max_crf)) = (self.min_crf, self.max_crf)
-            && min_crf.get() >= max_crf.get()
-        {
-            return Err(ValidationError::InvalidCrfBounds);
-        }
-        if self.min_vmaf.is_none()
-            && let Some(num) = self
-                .vmaf
-                .vmaf_args
-                .iter()
-                .find_map(|arg| arg.as_str().parse::<f32>().ok())
-        {
-            return Err(ValidationError::PositionalVmafNumber { num });
-        }
-        Ok(())
+        .validate()
     }
+}
+
+fn positional_vmaf_number(args: &[VmafArg]) -> Option<f32> {
+    args.iter().find_map(|arg| arg.as_str().parse().ok())
 }
 
 pub async fn crf_search(mut args: Args) -> anyhow::Result<()> {

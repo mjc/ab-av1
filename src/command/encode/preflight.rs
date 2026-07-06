@@ -1,5 +1,11 @@
 use super::{default_output_name, error::EncodePlanError, lifecycle::PlannedOutput};
-use crate::{command::args, ffprobe::Ffprobe};
+use crate::{
+    command::{
+        args,
+        rules::{EncodeRules, ValidationError},
+    },
+    ffprobe::Ffprobe,
+};
 use same_file::is_same_file;
 use std::{path::Path, sync::Arc};
 
@@ -30,9 +36,14 @@ pub fn resolve_output(
         .clone()
         .unwrap_or_else(|| default_output_name(input, encoder, probe.is_image));
 
-    if !encode_to.overwrite_input && is_same_file(&output_path, input).unwrap_or(false) {
-        return Err(EncodePlanError::SameInputOutput);
+    EncodeRules {
+        overwrite_input: encode_to.overwrite_input,
+        same_input_output: is_same_file(&output_path, input).unwrap_or(false),
+        downmix_to_stereo: false,
+        audio_codec: None,
     }
+    .validate()
+    .map_err(encode_rule_error)?;
 
     Ok(ResolvedOutput {
         planned: PlannedOutput::new(output_path),
@@ -44,9 +55,15 @@ pub fn audio_config(
     encode_to: &args::EncodeToOutput,
     probe: &Ffprobe,
 ) -> Result<AudioConfig, EncodePlanError> {
-    if encode_to.downmix_to_stereo && encode_to.audio_codec.as_deref() == Some("copy") {
-        return Err(EncodePlanError::StereoDownmixWithCopy);
+    EncodeRules {
+        overwrite_input: true,
+        same_input_output: false,
+        downmix_to_stereo: encode_to.downmix_to_stereo,
+        audio_codec: encode_to.audio_codec.as_deref(),
     }
+    .validate()
+    .map_err(encode_rule_error)?;
+
     let stereo_downmix =
         encode_to.downmix_to_stereo && probe.max_audio_channels.is_some_and(|c| c > 3);
     let audio_codec = encode_to.audio_codec.clone().map(Into::into);
@@ -55,6 +72,14 @@ pub fn audio_config(
         stereo_downmix,
         audio_codec,
     })
+}
+
+fn encode_rule_error(error: ValidationError) -> EncodePlanError {
+    match error {
+        ValidationError::SameInputOutput => EncodePlanError::SameInputOutput,
+        ValidationError::StereoDownmixWithCopy => EncodePlanError::StereoDownmixWithCopy,
+        other => EncodePlanError::FfmpegArgs(anyhow::Error::new(other)),
+    }
 }
 
 #[cfg(test)]

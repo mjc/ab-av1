@@ -1,4 +1,5 @@
 //! temp file logic
+use crate::command::rules::choose_temp_parent;
 use std::{
     collections::HashMap,
     env, iter,
@@ -111,8 +112,8 @@ pub fn process_dir(conf_parent: Option<PathBuf>, default_parent: Option<PathBuf>
         subdir
     });
 
-    let mut temp_dir = conf_parent
-        .or(default_parent)
+    let mut temp_dir = choose_temp_parent(conf_parent.as_deref(), default_parent.as_deref())
+        .map(Path::to_path_buf)
         .unwrap_or_else(|| env::current_dir().expect("current working directory"));
     temp_dir.push(&*SUBDIR);
 

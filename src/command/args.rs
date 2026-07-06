@@ -5,7 +5,10 @@ mod vmaf;
 pub use encode::*;
 pub use vmaf::*;
 
-use crate::{command::encode::default_output_ext, ffprobe::Ffprobe};
+use crate::{
+    command::{encode::default_output_ext, rules::SampleCountRules},
+    ffprobe::Ffprobe,
+};
 use clap::{Parser, ValueHint};
 use std::{
     fmt,
@@ -92,20 +95,17 @@ pub struct Sample {
 impl Sample {
     /// Calculate the desired sample count using `samples` or `sample_every` & `min_samples`.
     pub fn sample_count(&self, input_duration: Duration) -> u64 {
-        let count = match self.samples {
-            Some(samples) => samples.get(),
-            None => {
-                let every = self.sample_every.get().as_secs_f64();
-                (input_duration.as_secs_f64() / every).ceil() as u64
-            }
+        let computed_samples = {
+            let every = self.sample_every.get().as_secs_f64();
+            (input_duration.as_secs_f64() / every).ceil() as u64
         };
-        if self.samples.is_some() {
-            count.max(self.min_samples.map_or(0, MinSampleCount::get))
-        } else {
-            count
-                .max(self.min_samples.map_or(1, MinSampleCount::get))
-                .max(1)
+
+        SampleCountRules {
+            samples: self.samples.map(SampleCountOverride::get),
+            computed_samples,
+            min_samples: self.min_samples.map(MinSampleCount::get),
         }
+        .sample_count()
     }
 
     pub fn set_extension_from_input(&mut self, input: &Path, encoder: &Encoder, probe: &Ffprobe) {
