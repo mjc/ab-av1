@@ -47,21 +47,6 @@ pub(crate) fn test_ffmpeg_stream(
     ))
 }
 
-pub struct FixtureGuard;
-
-impl FixtureGuard {
-    pub fn set(name: &'static str) -> Self {
-        test_hooks::set_fixture(name);
-        Self
-    }
-}
-
-impl Drop for FixtureGuard {
-    fn drop(&mut self) {
-        test_hooks::clear();
-    }
-}
-
 pub fn test_probe(max_audio_channels: Option<i64>) -> Ffprobe {
     Ffprobe {
         duration: Ok(Duration::from_secs(120)),

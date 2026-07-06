@@ -38,8 +38,10 @@ pub(crate) mod test_hooks {
     use super::sample_encode;
     use std::cell::RefCell;
 
+    type SampleEncodeMock = Box<dyn Fn(f32) -> sample_encode::Output>;
+
     thread_local! {
-        static MOCK: RefCell<Option<Box<dyn Fn(f32) -> sample_encode::Output>>> =
+        static MOCK: RefCell<Option<SampleEncodeMock>> =
             const { RefCell::new(None) };
     }
 
@@ -417,15 +419,17 @@ pub fn run(
                 &sample,
                 score,
                 &crf_attempts,
-                min_score,
-                higher_tolerance,
-                thorough,
-                cut_on_iter2,
-                run,
-                min_q,
-                max_q,
-                use_xpsnr,
-                max_encoded_percent,
+                SearchDecision {
+                    min_score,
+                    higher_tolerance,
+                    thorough,
+                    cut_on_iter2,
+                    run,
+                    min_q,
+                    max_q,
+                    use_xpsnr,
+                    max_encoded_percent,
+                },
             )? {
                 SearchTransition::Continue { next_q } => {
                     q = next_q;
@@ -460,10 +464,8 @@ enum SearchTransition {
     RunResultThenDone { run_result: Sample, done: Sample },
 }
 
-fn decide_next_transition(
-    sample: &Sample,
-    score: f32,
-    crf_attempts: &[Sample],
+#[derive(Clone, Copy)]
+struct SearchDecision {
     min_score: f32,
     higher_tolerance: f32,
     thorough: bool,
@@ -473,7 +475,25 @@ fn decide_next_transition(
     max_q: i64,
     use_xpsnr: bool,
     max_encoded_percent: MaxEncodedPercent,
+}
+
+fn decide_next_transition(
+    sample: &Sample,
+    score: f32,
+    crf_attempts: &[Sample],
+    decision: SearchDecision,
 ) -> Result<SearchTransition, Error> {
+    let SearchDecision {
+        min_score,
+        higher_tolerance,
+        thorough,
+        cut_on_iter2,
+        run,
+        min_q,
+        max_q,
+        use_xpsnr,
+        max_encoded_percent,
+    } = decision;
     let sample_small_enough = sample.enc.encode_percent <= max_encoded_percent.get();
 
     if score >= min_score {
@@ -953,10 +973,7 @@ mod crf_search_tests {
                 score: args::ScoreArgs {
                     reference_vfilter: None,
                 },
-                xpsnr: args::Xpsnr {
-                    xpsnr_fps: args::FrameRateOverride::new(60.0),
-                    xpsnr_pix_format: None,
-                },
+                xpsnr: args::Xpsnr::default(),
                 verbose: clap_verbosity_flag::Verbosity::new(0, 0),
             }
         }

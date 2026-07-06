@@ -1,11 +1,14 @@
 mod cache;
+mod result;
+
+pub(crate) use result::EncodeResults;
+pub use result::{EncodeResult, Output, ScoreKind, StdoutFormat};
 
 use crate::{
     command::{
         PROGRESS_CHARS, SmallDuration,
         args::{self, PixelFormat},
     },
-    console_ext::style,
     ffmpeg::{self, FfmpegEncodeArgs, remove_arg},
     ffprobe::{self, Ffprobe},
     log::ProgressLogger,
@@ -21,7 +24,6 @@ use futures_util::Stream;
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use log::info;
 use std::{
-    fmt::Display,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     pin::pin,
@@ -176,10 +178,6 @@ impl SampleWindow {
         self.start
     }
 
-    pub fn duration(self) -> Duration {
-        self.duration
-    }
-
     pub fn frames(self) -> FrameCount {
         self.frames
     }
@@ -322,8 +320,9 @@ impl SamplePlan {
         let available_gap = self
             .input_duration
             .saturating_sub(self.sample_duration * samples as _);
-        (0..samples).filter_map(move |idx| {
-            (!self.full_pass).then(|| {
+        (0..samples)
+            .filter(move |_| !self.full_pass)
+            .map(move |idx| {
                 let sample_n = idx + 1;
                 let start = (available_gap / grid_divisor) * sample_n as _
                     + self.sample_duration * idx as _;
@@ -335,7 +334,6 @@ impl SamplePlan {
                     floor_to_sec: self.sample_duration >= Duration::from_secs(2),
                 }
             })
-        })
     }
 }
 
@@ -750,250 +748,6 @@ async fn copy_sample_window(
     Ok((sample.into(), sample_size))
 }
 
-mod score_json {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(score: &Option<f32>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match score {
-            Some(v) if v.is_nan() => serializer.serialize_str("NaN"),
-            Some(v) => serializer.serialize_some(v),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-        match value {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(serde_json::Value::String(s)) if s.eq_ignore_ascii_case("nan") => {
-                Ok(Some(f32::NAN))
-            }
-            Some(serde_json::Value::Number(n)) => n
-                .as_f64()
-                .map(|v| Some(v as f32))
-                .ok_or_else(|| serde::de::Error::custom("invalid score number")),
-            Some(other) => Err(serde::de::Error::custom(format!(
-                "invalid score value: {other}"
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EncodeResult {
-    pub sample_size: u64,
-    pub encoded_size: u64,
-    #[serde(
-        serialize_with = "score_json::serialize",
-        deserialize_with = "score_json::deserialize"
-    )]
-    pub vmaf_score: Option<f32>,
-    #[serde(
-        serialize_with = "score_json::serialize",
-        deserialize_with = "score_json::deserialize"
-    )]
-    pub xpsnr_score: Option<f32>,
-    pub encode_time: Duration,
-    /// Duration of the sample.
-    ///
-    /// This should be close to `SAMPLE_SIZE` but may deviate due to how samples are cut.
-    pub sample_duration: Duration,
-    /// Result read from cache.
-    pub from_cache: bool,
-}
-
-impl EncodeResult {
-    pub fn print_attempt(&self, bar: &ProgressBar, sample_n: u64, crf: Option<f32>) {
-        let Self {
-            sample_size,
-            encoded_size,
-            vmaf_score,
-            xpsnr_score,
-            from_cache,
-            ..
-        } = self;
-        let percent = if *sample_size == 0 {
-            0.0
-        } else {
-            100.0 * *encoded_size as f32 / *sample_size as f32
-        };
-        bar.println(
-            style!(
-                "- {}Sample {sample_n} ({percent:.0}%){}{}{}",
-                crf.map(|crf| format!("crf {crf}: ")).unwrap_or_default(),
-                vmaf_score
-                    .map(|s| format!(" VMAF {s:.2}"))
-                    .unwrap_or_default(),
-                xpsnr_score
-                    .map(|s| format!(" XPSNR {s:.2}"))
-                    .unwrap_or_default(),
-                if *from_cache { " (cache)" } else { "" },
-            )
-            .dim()
-            .to_string(),
-        );
-    }
-
-    pub fn log_attempt(&self, sample_n: u64, samples: u64, crf: f32) {
-        let Self {
-            sample_size,
-            encoded_size,
-            vmaf_score,
-            xpsnr_score,
-            from_cache,
-            ..
-        } = self;
-        let percent = if *sample_size == 0 {
-            0.0
-        } else {
-            100.0 * *encoded_size as f32 / *sample_size as f32
-        };
-        info!(
-            "sample {sample_n}/{samples} crf {crf}{}{} ({percent:.0}%){}",
-            vmaf_score
-                .map(|s| format!(" VMAF {s:.2}"))
-                .unwrap_or_default(),
-            xpsnr_score
-                .map(|s| format!(" XPSNR {s:.2}"))
-                .unwrap_or_default(),
-            if *from_cache { " (cache)" } else { "" }
-        );
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ScoreKind {
-    Vmaf,
-    Xpsnr,
-}
-
-impl ScoreKind {
-    /// Display label for fps in progress bar.
-    pub fn fps_label(&self) -> &'static str {
-        match self {
-            Self::Vmaf => "vmaf",
-            Self::Xpsnr => "xpsnr",
-        }
-    }
-
-    /// General display name.
-    pub fn display_str(&self) -> &'static str {
-        match self {
-            Self::Vmaf => "VMAF",
-            Self::Xpsnr => "XPSNR",
-        }
-    }
-}
-
-impl Display for ScoreKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.display_str())
-    }
-}
-
-trait EncodeResults {
-    fn encoded_percent_size(&self) -> f64;
-
-    fn mean_vmaf_score(&self) -> Option<f32>;
-
-    fn mean_xpsnr_score(&self) -> Option<f32>;
-
-    /// Return estimated encoded **video stream** size by multiplying sample size by duration.
-    fn estimate_encode_size_by_duration(
-        &self,
-        input_duration: Duration,
-        single_full_pass: bool,
-    ) -> u64;
-
-    fn estimate_encode_time(&self, input_duration: Duration, single_full_pass: bool) -> Duration;
-}
-
-impl EncodeResults for Vec<EncodeResult> {
-    fn encoded_percent_size(&self) -> f64 {
-        if self.is_empty() {
-            return 0.0;
-        }
-        let encoded = self.iter().map(|r| r.encoded_size).sum::<u64>() as f64;
-        let sample = self.iter().map(|r| r.sample_size).sum::<u64>() as f64;
-        if sample <= 0.0 {
-            return 0.0;
-        }
-        encoded * 100.0 / sample
-    }
-
-    fn mean_vmaf_score(&self) -> Option<f32> {
-        let scores: Vec<f32> = self
-            .iter()
-            .filter_map(|r| r.vmaf_score)
-            .filter(|s| s.is_finite())
-            .collect();
-        if scores.is_empty() {
-            return None;
-        }
-        Some(scores.iter().sum::<f32>() / scores.len() as f32)
-    }
-
-    fn mean_xpsnr_score(&self) -> Option<f32> {
-        let scores: Vec<f32> = self
-            .iter()
-            .filter_map(|r| r.xpsnr_score)
-            .filter(|s| s.is_finite())
-            .collect();
-        if scores.is_empty() {
-            return None;
-        }
-        Some(scores.iter().sum::<f32>() / scores.len() as f32)
-    }
-
-    fn estimate_encode_size_by_duration(
-        &self,
-        input_duration: Duration,
-        single_full_pass: bool,
-    ) -> u64 {
-        if self.is_empty() {
-            return 0;
-        }
-        if single_full_pass {
-            return self[0].encoded_size;
-        }
-
-        let sample_duration: Duration = self.iter().map(|s| s.sample_duration).sum();
-        let sample_secs = sample_duration.as_secs_f64();
-        if sample_secs <= 0.0 {
-            return 0;
-        }
-        let sample_factor = input_duration.as_secs_f64() / sample_secs;
-        let sample_encode_size: f64 = self.iter().map(|r| r.encoded_size as f64).sum();
-
-        (sample_encode_size * sample_factor).round() as _
-    }
-
-    fn estimate_encode_time(&self, input_duration: Duration, single_full_pass: bool) -> Duration {
-        if self.is_empty() {
-            return Duration::ZERO;
-        }
-        if single_full_pass {
-            return self[0].encode_time;
-        }
-
-        let sample_duration: Duration = self.iter().map(|s| s.sample_duration).sum();
-        let sample_secs = sample_duration.as_secs_f64();
-        if sample_secs <= 0.0 {
-            return Duration::ZERO;
-        }
-        let sample_factor = input_duration.as_secs_f64() / sample_secs;
-        let sample_encode_time: Duration = self.iter().map(|r| r.encode_time).sum();
-
-        sample_encode_time.mul_f64(sample_factor)
-    }
-}
-
 /// Return estimated encoded **video stream** size by applying the sample percentage
 /// change to the input file size.
 ///
@@ -1012,114 +766,6 @@ async fn estimate_encode_size_by_file_percent(
     let encode_proportion = results.encoded_percent_size() / 100.0;
 
     Ok((fs::metadata(input).await?.len() as f64 * encode_proportion).round() as _)
-}
-
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum StdoutFormat {
-    Human,
-    Json,
-}
-
-impl StdoutFormat {
-    fn print_result(
-        self,
-        Output {
-            vmaf_score,
-            xpsnr_score,
-            predicted_encode_size,
-            encode_percent,
-            predicted_encode_time,
-            from_cache: _,
-        }: &Output,
-        image: bool,
-    ) {
-        match self {
-            Self::Human => {
-                let vmaf_fmt = match *vmaf_score {
-                    None => format_args!(""),
-                    Some(s) => match s {
-                        _ if s >= 95.0 => format_args!("VMAF {} ", style(s).bold().green()),
-                        _ if s < 80.0 => format_args!("VMAF {} ", style(s).bold().red()),
-                        _ => format_args!("VMAF {} ", style(s).bold()),
-                    },
-                };
-                let xpsnr_fmt = match *xpsnr_score {
-                    None => format_args!(""),
-                    Some(s) => format_args!("XPSNR {} ", style(s).bold()),
-                };
-                let percent = encode_percent.round();
-                let size = match *predicted_encode_size {
-                    v if percent < 80.0 => style(HumanBytes(v)).bold().green(),
-                    v if percent >= 100.0 => style(HumanBytes(v)).bold().red(),
-                    v => style(HumanBytes(v)).bold(),
-                };
-                let percent = match percent {
-                    v if v < 80.0 => style!("{}%", v).bold().green(),
-                    v if v >= 100.0 => style!("{}%", v).bold().red(),
-                    v => style!("{}%", v).bold(),
-                };
-                let time = style(HumanDuration(*predicted_encode_time)).bold();
-                let enc_description = match image {
-                    true => "image",
-                    false => "video stream",
-                };
-                println!(
-                    "{vmaf_fmt}{xpsnr_fmt}predicted {enc_description} size {size} ({percent}) taking {time}"
-                );
-            }
-            Self::Json => {
-                let mut json = serde_json::json!({
-                    "predicted_encode_size": predicted_encode_size,
-                    "predicted_encode_percent": encode_percent,
-                    "predicted_encode_seconds": predicted_encode_time.as_secs_f64(),
-                });
-                if let Some(score) = *vmaf_score {
-                    json["vmaf"] = score.into();
-                }
-                if let Some(score) = *xpsnr_score {
-                    json["xpsnr"] = score.into();
-                }
-                println!("{json}");
-            }
-        }
-    }
-}
-
-/// Sample encode result.
-#[derive(Debug, Clone)]
-pub struct Output {
-    /// Sample mean VMAF score.
-    pub vmaf_score: Option<f32>,
-    /// Sample mean XPSNR score.
-    pub xpsnr_score: Option<f32>,
-    /// Estimated full encoded **video stream** size.
-    ///
-    /// Encoded sample size multiplied by duration.
-    pub predicted_encode_size: u64,
-    /// Sample mean encoded percentage.
-    pub encode_percent: f64,
-    /// Estimated full encode time.
-    ///
-    /// Sample encode time multiplied by duration.
-    pub predicted_encode_time: Duration,
-    /// All sample results were read from the cache.
-    pub from_cache: bool,
-}
-
-impl Output {
-    /// Extract vmaf or xpsnr score. Use when it is expected to have only 1 of these.
-    pub fn single_score(&self) -> f32 {
-        self.vmaf_score.or(self.xpsnr_score).unwrap_or(f32::NAN)
-    }
-
-    /// Extract vmaf or xpsnr kind. Use when it is expected to have only 1 of these.
-    pub fn single_score_kind(&self) -> ScoreKind {
-        match (self.vmaf_score, self.xpsnr_score) {
-            (Some(_), _) => ScoreKind::Vmaf,
-            (None, Some(_)) => ScoreKind::Xpsnr,
-            (None, None) => ScoreKind::Vmaf,
-        }
-    }
 }
 
 /// Kinds of sample-encode work.

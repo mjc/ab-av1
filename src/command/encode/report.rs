@@ -2,13 +2,12 @@ use super::{lifecycle::CompletedOutput, progress::StreamSizes};
 use crate::console_ext::style;
 use console::style;
 use indicatif::HumanBytes;
-use std::{io::Write, path::Path, path::PathBuf};
+use std::{io::Write, path::Path};
 use tokio::fs;
 
 /// Pure encoded output size metrics.
 pub struct EncodeMetrics {
     pub output_bytes: u64,
-    pub input_bytes: u64,
     pub percent: f64,
     pub stream_sizes: Option<StreamSizes>,
 }
@@ -29,7 +28,6 @@ impl EncodeMetrics {
     ) -> Self {
         Self {
             output_bytes,
-            input_bytes,
             percent: Self::percent_of_input(output_bytes, input_bytes),
             stream_sizes,
         }
@@ -48,23 +46,17 @@ impl EncodeMetrics {
 
 /// Successful encode with computed summary metrics.
 pub struct FinishedEncode {
-    pub input: PathBuf,
-    pub output: CompletedOutput,
     pub metrics: EncodeMetrics,
 }
 
 impl FinishedEncode {
     pub async fn load(
-        input: PathBuf,
+        input: impl AsRef<Path>,
         output: CompletedOutput,
         stream_sizes: Option<StreamSizes>,
     ) -> anyhow::Result<Self> {
-        let metrics = EncodeMetrics::load(&input, &output, stream_sizes).await?;
-        Ok(Self {
-            input,
-            output,
-            metrics,
-        })
+        let metrics = EncodeMetrics::load(input.as_ref(), &output, stream_sizes).await?;
+        Ok(Self { metrics })
     }
 
     pub fn render_summary(&self, out: &mut impl Write) -> std::io::Result<()> {

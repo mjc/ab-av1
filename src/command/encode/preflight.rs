@@ -1,10 +1,7 @@
 use super::{default_output_name, error::EncodePlanError, lifecycle::PlannedOutput};
 use crate::{command::args, ffprobe::Ffprobe};
 use same_file::is_same_file;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 /// Resolved output path and whether the CLI omitted `--output`.
 #[derive(Debug)]
@@ -64,7 +61,7 @@ pub fn audio_config(
 mod tests {
     use super::*;
     use crate::command::args::{EncodeToOutput, Encoder};
-    use std::{env, fs, time::Duration};
+    use std::{env, fs, path::PathBuf, time::Duration};
 
     fn probe(channels: Option<i64>) -> Ffprobe {
         Ffprobe {

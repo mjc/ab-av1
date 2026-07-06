@@ -1,6 +1,6 @@
 use super::{
     lifecycle::CompletedOutput,
-    plan::{EncodePlan, EncodeSession},
+    plan::EncodePlan,
     progress::{BarUpdate, ProgressState, StreamSizes, apply_ffmpeg_event},
     sink::ProgressSink,
     spawner::EncodeSpawner,

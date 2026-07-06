@@ -95,14 +95,11 @@ impl EncodePlan {
         self.defaulting_output
     }
 
-    pub fn planned(&self) -> &PlannedOutput {
-        &self.planned
-    }
-
     pub fn output_path(&self) -> &Path {
         self.planned.path()
     }
 
+    #[cfg(test)]
     pub fn spawn_config(&self) -> &SpawnConfig {
         &self.spawn
     }
@@ -145,10 +142,6 @@ impl EncodeSession {
 
     pub fn audio_codec(&self) -> Option<&str> {
         self.spawn.audio_codec.as_deref()
-    }
-
-    pub fn video_only(&self) -> bool {
-        self.spawn.video_only
     }
 }
 
@@ -213,7 +206,6 @@ mod tests {
         assert!(plan.spawn_config().stereo_downmix);
         assert!(plan.spawn_config().has_audio);
         let (_partial, session) = plan.begin();
-        assert!(session.video_only());
         assert!(session.ffmpeg_args().expect("ffmpeg args").video_only);
         let _ = fs::remove_file(input);
     }

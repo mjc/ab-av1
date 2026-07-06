@@ -8,14 +8,12 @@ use crate::{
     ffprobe::{self, Ffprobe},
 };
 use clap::Parser;
-use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tokio_stream::StreamExt;
 
 mod error;
 mod lifecycle;
@@ -34,13 +32,11 @@ mod test_support;
 pub(crate) use test_support::test_hooks;
 
 pub use error::EncodePlanError;
-pub use lifecycle::{CompletedOutput, PartialOutput, PlannedOutput};
 pub use plan::EncodePlan;
 pub use preflight::{audio_config, resolve_output};
-pub use progress::StreamSizes;
-pub use report::{EncodeMetrics, FinishedEncode};
+pub use report::FinishedEncode;
 pub use sink::ProgressSink;
-pub use spawner::{EncodeSpawner, FfmpegSpawner};
+pub use spawner::EncodeSpawner;
 
 /// Invoke ffmpeg to encode a video or image.
 #[derive(Parser)]
@@ -76,7 +72,7 @@ pub async fn run(args: Args, probe: Arc<Ffprobe>, bar: &ProgressBar) -> anyhow::
     }
     #[cfg(not(test))]
     {
-        run_with_spawner(args, probe, bar, &FfmpegSpawner).await
+        run_with_spawner(args, probe, bar, &spawner::FfmpegSpawner).await
     }
 }
 
