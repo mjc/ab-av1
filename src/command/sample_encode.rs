@@ -142,10 +142,9 @@ impl From<Args> for SampleEncodeConfig {
     }
 }
 
-pub async fn sample_encode(args: Args) -> anyhow::Result<()> {
+pub async fn sample_encode(mut config: SampleEncodeConfig) -> anyhow::Result<()> {
     const BAR_LEN: u64 = 1024 * 1024 * 1024;
     const BAR_LEN_F: f32 = BAR_LEN as _;
-    let mut config = SampleEncodeConfig::from(args);
 
     let bar = ProgressBar::new(BAR_LEN).with_style(
         ProgressStyle::default_bar()

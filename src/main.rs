@@ -50,12 +50,14 @@ async fn main() {
 
     let local = tokio::task::LocalSet::new();
     let command = local.run_until(match action {
-        Command::SampleEncode(args) => command::sample_encode(args).boxed_local(),
+        Command::SampleEncode(args) => command::sample_encode(command::sample_encode::SampleEncodeConfig::from(args)).boxed_local(),
         Command::Vmaf(args) => command::vmaf(args.into()).boxed_local(),
         Command::Xpsnr(args) => command::xpsnr(args.into()).boxed_local(),
-        Command::Encode(args) => command::encode(args).boxed_local(),
-        Command::CrfSearch(args) => command::crf_search(args).boxed_local(),
-        Command::AutoEncode(args) => command::auto_encode(args).boxed_local(),
+        Command::Encode(args) => command::encode(command::encode::EncodeConfig::from(args)).boxed_local(),
+        Command::CrfSearch(args) => {
+            command::crf_search(command::crf_search::CrfSearchConfig::from(args)).boxed_local()
+        }
+        Command::AutoEncode(args) => command::auto_encode(command::auto_encode::AutoEncodeConfig::from(args)).boxed_local(),
         Command::PrintCompletions(args) => return command::print_completions(args.into()),
     });
 

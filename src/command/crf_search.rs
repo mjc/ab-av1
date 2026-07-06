@@ -302,6 +302,7 @@ impl Args {
             .map_or(DEFAULT_MIN_VMAF, MinScore::get)
     }
 
+    #[cfg(test)]
     pub fn validate(&self) -> Result<(), ValidationError> {
         CrfSearchRules {
             min_vmaf: self.min_vmaf,
@@ -320,8 +321,8 @@ fn positional_vmaf_score(args: &[VmafArg]) -> Option<PositionalVmafScore> {
         .map(PositionalVmafScore::new)
 }
 
-pub async fn crf_search(mut args: Args) -> anyhow::Result<()> {
-    args.validate()?;
+pub async fn crf_search(mut config: CrfSearchConfig) -> anyhow::Result<()> {
+    config.validate()?;
 
     let bar = ProgressBar::new(BAR_LEN).with_style(
         ProgressStyle::default_bar()
@@ -330,12 +331,11 @@ pub async fn crf_search(mut args: Args) -> anyhow::Result<()> {
     );
     bar.enable_steady_tick(Duration::from_millis(100));
 
-    let probe = ffprobe::probe(&args.args.input);
+    let probe = ffprobe::probe(&config.args.input);
     let input_is_image = probe.is_image;
-    args.sample
-        .set_extension_from_input(&args.args.input, &args.args.encoder, &probe);
-    let config = CrfSearchConfig::from(args);
-    config.validate()?;
+    config
+        .sample
+        .set_extension_from_input(&config.args.input, &config.args.encoder, &probe);
 
     let min_score = config.min_score();
     let max_encoded_percent = config.max_encoded_percent;

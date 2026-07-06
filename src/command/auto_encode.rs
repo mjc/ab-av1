@@ -37,7 +37,7 @@ pub struct Args {
 }
 
 #[derive(Clone)]
-struct AutoEncodeConfig {
+pub(crate) struct AutoEncodeConfig {
     search: crf_search::CrfSearchConfig,
     encode: args::EncodeToOutput,
 }
@@ -51,8 +51,8 @@ impl From<Args> for AutoEncodeConfig {
     }
 }
 
-pub async fn auto_encode(args: Args) -> anyhow::Result<()> {
-    let AutoEncodeConfig { mut search, encode } = AutoEncodeConfig::from(args);
+pub async fn auto_encode(config: AutoEncodeConfig) -> anyhow::Result<()> {
+    let AutoEncodeConfig { mut search, encode } = config;
     const SPINNER_RUNNING: &str = "{spinner:.cyan.bold} {elapsed_precise:.bold} {prefix} {wide_bar:.cyan/blue} ({msg}eta {eta})";
     const SPINNER_FINISHED: &str =
         "{spinner:.cyan.bold} {elapsed_precise:.bold} {prefix} {wide_bar:.cyan/blue} ({msg})";
@@ -198,7 +198,8 @@ pub async fn auto_encode(args: Args) -> anyhow::Result<()> {
                 output: Some(output),
                 ..encode
             },
-        },
+        }
+        .into(),
         input_probe,
         &bar,
     )
@@ -433,7 +434,7 @@ mod tests {
         let _guard = MockGuard::crf(|_crf| mock_output(96.0));
 
         // execute
-        let err = auto_encode(args)
+        let err = auto_encode(args.into())
             .await
             .expect_err("expected downmix/copy rejection before crf search");
 
@@ -456,7 +457,7 @@ mod tests {
         let args = auto_args(input.clone(), Some(input.clone()), false);
 
         // execute
-        let err = auto_encode(args)
+        let err = auto_encode(args.into())
             .await
             .expect_err("expected same-file error");
 
@@ -482,7 +483,7 @@ mod tests {
         let _guard = MockGuard::crf(|_crf| mock_output(80.0));
 
         // execute
-        let err = auto_encode(args).await.expect_err("expected NoGoodCrf");
+        let err = auto_encode(args.into()).await.expect_err("expected NoGoodCrf");
 
         // assert
         assert!(err.to_string().contains("Failed to find a suitable crf"));
@@ -513,7 +514,7 @@ mod tests {
         let _guard = MockGuard::both(|_crf| mock_output(96.0), "stderr-ffmpeg-progress");
 
         // execute
-        auto_encode(args).await.expect("auto encode");
+        auto_encode(args.into()).await.expect("auto encode");
 
         // assert
         assert!(
@@ -550,7 +551,7 @@ mod tests {
         let _guard = MockGuard::both(|_crf| mock_output(96.0), "stderr-ffmpeg-progress");
 
         // execute
-        auto_encode(args).await.expect("auto encode");
+        auto_encode(args.into()).await.expect("auto encode");
 
         // assert
         assert!(

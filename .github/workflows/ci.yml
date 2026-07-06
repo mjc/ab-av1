@@ -23,6 +23,13 @@ jobs:
     - run: cargo run --locked -- print-completions fish
     - run: cargo run --locked -- print-completions zsh
 
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+    - run: rustup update stable
+    - uses: actions/checkout@v6
+    - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
   coverage:
     runs-on: ubuntu-latest
     env:
