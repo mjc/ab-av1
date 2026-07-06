@@ -302,6 +302,7 @@ pub struct Xpsnr {
     pub xpsnr_pix_format: Option<PixelFormat>,
 }
 
+#[cfg(test)]
 impl Xpsnr {
     pub fn fps(&self) -> Option<f32> {
         self.xpsnr_fps.fps()
@@ -662,10 +663,33 @@ mod tests {
     }
 
     #[test]
+    fn score_config_from_args_does_not_allocate() {
+        let score = ScoreArgs {
+            reference_vfilter: Some("scale=1280:-1".into()),
+        };
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(ScoreConfig::from(score));
+        });
+    }
+
+    #[test]
     fn xpsnr_default_matches_cli_defaults() {
         let xpsnr = Xpsnr::default();
         assert_eq!(xpsnr.fps(), Some(60.0));
         assert_eq!(xpsnr.xpsnr_pix_format, None);
+    }
+
+    #[test]
+    fn xpsnr_config_from_args_does_not_allocate() {
+        let xpsnr = Xpsnr {
+            xpsnr_fps: FrameRateOverride::new(0.0),
+            xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+        };
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(XpsnrConfig::from(xpsnr));
+        });
     }
 
     #[test]

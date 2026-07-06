@@ -152,6 +152,18 @@ mod tests {
     use std::{env, fs};
 
     #[test]
+    fn encode_config_from_args_does_not_allocate() {
+        let args = encode_args(
+            PathBuf::from("input.mkv"),
+            Some(PathBuf::from("output.mkv")),
+        );
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(EncodeConfig::from(args));
+        });
+    }
+
+    #[test]
     fn build_rejects_same_input_and_output() {
         let input = temp_input("plan", "same-io");
         let err = match EncodePlan::build(

@@ -7,6 +7,7 @@ use crate::score_stream::{
 use anyhow::Context;
 use log::{debug, info};
 use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
 use tokio_stream::Stream;
 
@@ -21,7 +22,6 @@ pub(crate) fn build_ffmpeg_command(
 }
 
 /// Calculate XPSNR score using ffmpeg.
-// TODO: fix progress update to account for fps
 pub fn run(
     reference: &Path,
     distorted: &Path,
@@ -50,6 +50,17 @@ fn stream_process(process: ManagedProcess, cmd_str: String) -> impl Stream<Item 
         XpsnrOut::from_parse,
         XpsnrOut::Err,
     )
+}
+
+pub(crate) fn progress_time(
+    time: Duration,
+    source_fps: f64,
+    override_fps: Option<f32>,
+) -> Duration {
+    match (source_fps.is_finite() && source_fps > 0.0, override_fps) {
+        (true, Some(override_fps)) => time.mul_f64(override_fps as f64 / source_fps),
+        _ => time,
+    }
 }
 
 #[derive(Debug)]
@@ -230,6 +241,22 @@ mod test {
         assert!(
             !cmd_str.split_whitespace().any(|arg| arg == "-r"),
             "native frame rate must omit -r: `{cmd_str}`"
+        );
+    }
+
+    #[test]
+    fn progress_time_without_fps_override_uses_ffmpeg_time() {
+        assert_eq!(
+            progress_time(Duration::from_secs(10), 30.0, None),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn progress_time_scales_override_time_to_source_time() {
+        assert_eq!(
+            progress_time(Duration::from_secs(10), 30.0, Some(60.0)),
+            Duration::from_secs(20)
         );
     }
 

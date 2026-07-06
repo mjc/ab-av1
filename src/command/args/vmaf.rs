@@ -368,6 +368,20 @@ fn parse_vmaf_arg_returns_typed_model_arg() {
 }
 
 #[test]
+fn vmaf_config_from_args_does_not_allocate() {
+    let vmaf = Vmaf {
+        and_vmaf: Some(true),
+        vmaf_args: vec!["n_subsample=4".into()],
+        vmaf_scale: VmafScale::Auto,
+        vmaf_fps: FrameRateOverride::new(24.0),
+    };
+
+    crate::test_support::assert_no_allocations(|| {
+        std::hint::black_box(VmafConfig::from(vmaf));
+    });
+}
+
+#[test]
 fn vmaf_lavfi() {
     let vmaf = Vmaf {
         vmaf_args: vec!["n_threads=5".into(), "n_subsample=4".into()],

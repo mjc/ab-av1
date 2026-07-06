@@ -7,7 +7,7 @@ use crate::{
     command::{
         PROGRESS_CHARS, args,
         args::VmafArg,
-        rules::CrfSearchRules,
+        rules::{CrfSearchRules, PositionalVmafScore},
         sample_encode::{self, Work},
     },
     console_ext::style,
@@ -181,7 +181,7 @@ impl CrfSearchConfig {
             min_xpsnr: self.min_xpsnr,
             min_crf: self.min_crf,
             max_crf: self.max_crf,
-            positional_vmaf_number: positional_vmaf_number(&self.scoring.vmaf.vmaf_args),
+            positional_vmaf_score: positional_vmaf_score(&self.scoring.vmaf.vmaf_args),
         }
         .validate()
     }
@@ -303,14 +303,16 @@ impl Args {
             min_xpsnr: self.min_xpsnr,
             min_crf: self.min_crf,
             max_crf: self.max_crf,
-            positional_vmaf_number: positional_vmaf_number(&self.vmaf.vmaf_args),
+            positional_vmaf_score: positional_vmaf_score(&self.vmaf.vmaf_args),
         }
         .validate()
     }
 }
 
-fn positional_vmaf_number(args: &[VmafArg]) -> Option<f32> {
-    args.iter().find_map(|arg| arg.as_str().parse().ok())
+fn positional_vmaf_score(args: &[VmafArg]) -> Option<PositionalVmafScore> {
+    args.iter()
+        .find_map(|arg| arg.as_str().parse().ok())
+        .map(PositionalVmafScore::new)
 }
 
 pub async fn crf_search(mut args: Args) -> anyhow::Result<()> {
@@ -975,12 +977,13 @@ pub enum Update {
 mod crf_search_tests {
     use super::{
         Args, Crf, CrfSearchConfig, CrfStep, Error, MaxEncodedPercent, MinScore, Sample, Update,
-        ValidationError, guess_progress, output_search_score, positional_vmaf_number, run,
+        ValidationError, guess_progress, output_search_score, positional_vmaf_score, run,
         test_hooks, vmaf_lerp_q,
     };
     use crate::{
         command::{
             args::{self, Encode, Sample as SampleArgs, Vmaf},
+            rules::PositionalVmafScore,
             sample_encode::{self},
         },
         ffprobe::Ffprobe,
@@ -1186,6 +1189,18 @@ mod crf_search_tests {
                 .collect::<Vec<_>>(),
             ["n_subsample=4"]
         );
+    }
+
+    #[test]
+    fn crf_search_config_from_args_does_not_allocate() {
+        let mut args = search_args(None, Some(90.0), true);
+        args.score.reference_vfilter = Some("scale=1280:-1".into());
+        args.vmaf.vmaf_args = vec!["n_subsample=4".into()];
+        args.xpsnr.xpsnr_fps = args::FrameRateOverride::new(0.0);
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(CrfSearchConfig::from(args));
+        });
     }
 
     // ab-kgc.17: XPSNR is the search metric when --min-xpsnr --and-vmaf
@@ -1605,11 +1620,14 @@ mod crf_search_tests {
     }
 
     #[test]
-    fn positional_vmaf_number_normalization_does_not_allocate() {
+    fn positional_vmaf_score_normalization_returns_newtype_without_allocating() {
         let vmaf_args = ["model=version=vmaf_v0.6.1".into(), "95".into()];
 
         crate::test_support::assert_no_allocations(|| {
-            assert_eq!(positional_vmaf_number(&vmaf_args), Some(95.0));
+            assert_eq!(
+                positional_vmaf_score(&vmaf_args).map(PositionalVmafScore::get),
+                Some(95.0)
+            );
         });
     }
 

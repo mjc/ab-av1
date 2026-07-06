@@ -33,12 +33,25 @@ pub enum ValidationError {
     Svtav1ParamsInEncoderArg,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PositionalVmafScore(f32);
+
+impl PositionalVmafScore {
+    pub(crate) fn new(value: f32) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn get(self) -> f32 {
+        self.0
+    }
+}
+
 pub(crate) struct CrfSearchRules {
     pub min_vmaf: Option<MinScore>,
     pub min_xpsnr: Option<MinScore>,
     pub min_crf: Option<Crf>,
     pub max_crf: Option<Crf>,
-    pub positional_vmaf_number: Option<f32>,
+    pub positional_vmaf_score: Option<PositionalVmafScore>,
 }
 
 impl CrfSearchRules {
@@ -52,9 +65,9 @@ impl CrfSearchRules {
             )
             .then_some(ValidationError::InvalidCrfBounds),
             (self.min_vmaf.is_none())
-                .then_some(self.positional_vmaf_number)
+                .then_some(self.positional_vmaf_score)
                 .flatten()
-                .map(|num| ValidationError::PositionalVmafNumber { num }),
+                .map(|score| ValidationError::PositionalVmafNumber { num: score.get() }),
         ]
         .into_iter()
         .flatten()
@@ -198,6 +211,10 @@ mod tests {
         }
     }
 
+    fn positional_vmaf_score(value: f32) -> PositionalVmafScore {
+        PositionalVmafScore::new(value)
+    }
+
     fn assert_source_excludes(context: &str, source: &str, forbidden: &str) {
         assert!(
             !source.contains(forbidden),
@@ -214,7 +231,7 @@ mod tests {
                     min_xpsnr: Some(min_score(55.0)),
                     min_crf: Some(crf(20.0)),
                     max_crf: Some(crf(10.0)),
-                    positional_vmaf_number: Some(95.0),
+                    positional_vmaf_score: Some(positional_vmaf_score(95.0)),
                 },
                 ValidationError::BothMinScores,
             ),
@@ -224,7 +241,7 @@ mod tests {
                     min_xpsnr: None,
                     min_crf: Some(crf(20.0)),
                     max_crf: Some(crf(10.0)),
-                    positional_vmaf_number: Some(95.0),
+                    positional_vmaf_score: Some(positional_vmaf_score(95.0)),
                 },
                 ValidationError::InvalidCrfBounds,
             ),
@@ -234,7 +251,7 @@ mod tests {
                     min_xpsnr: None,
                     min_crf: Some(crf(10.0)),
                     max_crf: Some(crf(20.0)),
-                    positional_vmaf_number: Some(95.0),
+                    positional_vmaf_score: Some(positional_vmaf_score(95.0)),
                 },
                 ValidationError::PositionalVmafNumber { num: 95.0 },
             ),
@@ -253,7 +270,7 @@ mod tests {
                 min_xpsnr: None,
                 min_crf: Some(crf(10.0)),
                 max_crf: Some(crf(20.0)),
-                positional_vmaf_number: None,
+                positional_vmaf_score: None,
             }
             .validate(),
             Ok(())
@@ -369,7 +386,7 @@ mod tests {
                     min_xpsnr: None,
                     min_crf: Some(crf(10.0)),
                     max_crf: Some(crf(20.0)),
-                    positional_vmaf_number: None,
+                    positional_vmaf_score: None,
                 }
                 .validate(),
                 Ok(())
@@ -400,7 +417,7 @@ mod tests {
                     min_xpsnr: Some(min_score(55.0)),
                     min_crf: Some(crf(10.0)),
                     max_crf: Some(crf(20.0)),
-                    positional_vmaf_number: Some(95.0),
+                    positional_vmaf_score: Some(positional_vmaf_score(95.0)),
                 }
                 .validate(),
                 Err(ValidationError::BothMinScores)

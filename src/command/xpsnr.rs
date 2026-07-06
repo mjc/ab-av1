@@ -45,7 +45,7 @@ pub struct XpsnrConfig {
     reference: PathBuf,
     distorted: PathBuf,
     score: ScoreConfig,
-    xpsnr: args::Xpsnr,
+    xpsnr: args::XpsnrConfig,
 }
 
 impl From<Args> for XpsnrConfig {
@@ -61,7 +61,7 @@ impl From<Args> for XpsnrConfig {
             reference,
             distorted,
             score: score.into(),
-            xpsnr,
+            xpsnr: xpsnr.into(),
         }
     }
 }
@@ -86,6 +86,7 @@ pub async fn xpsnr(config: XpsnrConfig) -> anyhow::Result<()> {
     let rprobe = ffprobe::probe(&reference);
     let nframes = dprobe.nframes().or_else(|_| rprobe.nframes());
     let duration = dprobe.duration.as_ref().or(rprobe.duration.as_ref());
+    let source_fps = dprobe.fps.as_ref().or(rprobe.fps.as_ref()).ok().copied();
     if let Ok(nframes) = nframes {
         bar.set_length(nframes);
     }
@@ -111,6 +112,9 @@ pub async fn xpsnr(config: XpsnrConfig) -> anyhow::Result<()> {
             XpsnrOut::Progress(FfmpegOut::Progress {
                 frame, fps, time, ..
             }) => {
+                let time = source_fps.map_or(time, |source_fps| {
+                    xpsnr::progress_time(time, source_fps, xpsnr.fps())
+                });
                 if fps > 0.0 {
                     bar.set_message(format!("xpsnr {fps} fps, "));
                 }
@@ -239,5 +243,24 @@ mod tests {
             config.score.reference_vfilter.as_deref(),
             Some("scale=1280:-1")
         );
+    }
+
+    #[test]
+    fn xpsnr_config_from_args_does_not_allocate() {
+        let args = Args {
+            reference: PathBuf::from("ref.mkv"),
+            distorted: PathBuf::from("dist.mkv"),
+            score: args::ScoreArgs {
+                reference_vfilter: Some("scale=1280:-1".into()),
+            },
+            xpsnr: args::Xpsnr {
+                xpsnr_fps: args::FrameRateOverride::new(0.0),
+                xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+            },
+        };
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(XpsnrConfig::from(args));
+        });
     }
 }

@@ -631,6 +631,11 @@ pub fn run(
                                     result.xpsnr_score = Some(s);
                                 }
                                 XpsnrOut::Progress(FfmpegOut::Progress { time, fps, .. }) => {
+                                    let time = xpsnr::progress_time(
+                                        time,
+                                        input_fps,
+                                        scoring.xpsnr_opts.fps(),
+                                    );
                                     let progress = match do_vmaf {
                                         false => (sample_duration_us +
                                             time.as_micros_u64() +
@@ -886,6 +891,13 @@ mod tests {
 
     use helpers::*;
 
+    fn sample_encode_args<const N: usize>(raw: [&str; N]) -> Args {
+        match Args::try_parse_from(raw) {
+            Ok(args) => args,
+            Err(err) => panic!("parse sample encode args: {err}"),
+        }
+    }
+
     /// Mirror progress denominator: `sample_duration_us * samples * 2`.
     fn encode_progress_ratio(
         time_us: u64,
@@ -899,7 +911,7 @@ mod tests {
 
     #[test]
     fn sample_encode_config_lowers_score_args() {
-        let args = Args::try_parse_from([
+        let args = sample_encode_args([
             "ab-av1",
             "--input",
             "input.mkv",
@@ -912,8 +924,7 @@ mod tests {
             "0",
             "--vmaf",
             "n_subsample=4",
-        ])
-        .expect("parse sample encode args");
+        ]);
 
         let config = SampleEncodeConfig::from(args);
 
@@ -933,6 +944,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["n_subsample=4"]
         );
+    }
+
+    #[test]
+    fn sample_encode_config_from_args_does_not_allocate() {
+        let args = sample_encode_args([
+            "ab-av1",
+            "--input",
+            "input.mkv",
+            "--crf",
+            "30",
+            "--reference-vfilter",
+            "scale=1280:-1",
+            "--xpsnr",
+            "--xpsnr-fps",
+            "0",
+            "--vmaf",
+            "n_subsample=4",
+        ]);
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(SampleEncodeConfig::from(args));
+        });
     }
 
     // ab-kgc.23: mirrors sample_encode::sample frame math

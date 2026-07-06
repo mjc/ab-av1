@@ -153,4 +153,23 @@ mod tests {
             Some("scale=1280:-1")
         );
     }
+
+    #[test]
+    fn vmaf_config_from_args_does_not_allocate() {
+        let args = Args {
+            reference: PathBuf::from("ref.mkv"),
+            distorted: PathBuf::from("dist.mkv"),
+            vmaf: args::Vmaf {
+                vmaf_args: vec!["n_subsample=4".into()],
+                ..<_>::default()
+            },
+            score: args::ScoreArgs {
+                reference_vfilter: Some("scale=1280:-1".into()),
+            },
+        };
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(VmafConfig::from(args));
+        });
+    }
 }
