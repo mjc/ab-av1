@@ -219,6 +219,19 @@ mod tests {
             fs::write(&path, b"fake-input").expect("write temp input");
             path
         }
+
+        /// 1×1 GIF — valid media for real ffmpeg copy e2e (see ffprobe minimal gif test).
+        pub fn temp_gif_input(name: &str) -> PathBuf {
+            const MINIMAL_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\
+\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+            let path = env::temp_dir().join(format!(
+                "ab-av1-sample-test-{}-{}.gif",
+                name,
+                std::process::id()
+            ));
+            fs::write(&path, MINIMAL_GIF).expect("write minimal gif");
+            path
+        }
     }
 
     use helpers::*;
@@ -357,12 +370,11 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
-    /// Requires ffmpeg-full; run locally with `cargo nextest run --ignored`.
+    /// Real ffmpeg copy against a minimal GIF input (devshell provides ffmpeg-full).
     #[tokio::test]
-    #[ignore = "requires ffmpeg-full in devshell"]
     async fn copy_e2e_real_ffmpeg() {
         // setup
-        let input = temp_input("e2e");
+        let input = temp_gif_input("e2e");
         let temp_dir = env::temp_dir().join(format!("ab-av1-sample-e2e-{}", std::process::id()));
         fs::create_dir_all(&temp_dir).expect("create e2e temp dir");
 

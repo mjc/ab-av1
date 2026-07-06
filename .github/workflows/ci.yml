@@ -15,6 +15,7 @@ jobs:
     steps:
     - run: rustup update stable
     - uses: actions/checkout@v6
+    - run: sudo apt-get update && sudo apt-get install -y ffmpeg
     - run: cargo install cargo-nextest --locked
     - run: cargo nextest run --locked
     # check print-completions don't fail

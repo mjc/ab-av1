@@ -27,6 +27,41 @@ pub fn unadd(file: &Path) -> bool {
     TEMPS.lock().unwrap().remove(file).is_some()
 }
 
+/// Tracks an encode output that may be deleted on failure.
+///
+/// Call [`Self::register`] immediately before writing begins; call [`Self::commit`]
+/// after a successful encode so the file is kept.
+pub struct NotKeepableOutput {
+    path: PathBuf,
+    registered: bool,
+}
+
+impl NotKeepableOutput {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            registered: false,
+        }
+    }
+
+    /// Register the path for cleanup on process exit.
+    pub fn register(&mut self) {
+        if !self.registered {
+            add(&self.path, TempKind::NotKeepable);
+            self.registered = true;
+        }
+    }
+
+    /// Successful encode: remove from cleanup registry and keep the file.
+    pub fn commit(mut self) {
+        if self.registered {
+            unadd(&self.path);
+        }
+        self.registered = false;
+        std::mem::forget(self);
+    }
+}
+
 /// Delete all added temporary files.
 /// If `keep_keepables` true don't delete [`TempKind::Keepable`] temporary files.
 pub async fn clean(keep_keepables: bool) {
@@ -155,6 +190,61 @@ mod tests {
         // assert
         assert!(removed);
         assert!(path.exists(), "unadded file must not be deleted");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn not_keepable_output_register_and_commit_prevents_deletion() {
+        // setup
+        let path = temp_path("not-keepable-guard");
+        fs::write(&path, b"stay").expect("write file");
+        let mut guard = NotKeepableOutput::new(path.clone());
+
+        // execute
+        guard.register();
+        guard.commit();
+        clean_all().await;
+
+        // assert
+        assert!(path.exists(), "committed output must not be deleted");
+
+        // cleanup
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn not_keepable_output_drop_after_register_cleans_up() {
+        // setup
+        let path = temp_path("not-keepable-guard-drop");
+        fs::write(&path, b"temp").expect("write file");
+        {
+            let mut guard = NotKeepableOutput::new(path.clone());
+            guard.register();
+        }
+
+        // execute
+        clean_all().await;
+
+        // assert
+        assert!(!path.exists(), "uncommitted output must be deleted");
+    }
+
+    #[test]
+    fn not_keepable_output_unregistered_drop_does_not_track_path() {
+        // setup
+        let path = temp_path("not-keepable-guard-unregistered");
+        fs::write(&path, b"stay").expect("write file");
+        {
+            let _guard = NotKeepableOutput::new(path.clone());
+        }
+
+        // execute
+        let removed = unadd(&path);
+
+        // assert
+        assert!(!removed, "path must not be registered before register()");
+
+        // cleanup
         let _ = fs::remove_file(path);
     }
 

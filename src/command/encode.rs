@@ -8,7 +8,7 @@ use crate::{
     ffprobe::{self, Ffprobe},
     log::ProgressLogger,
     process::FfmpegOut,
-    temporary::{self, TempKind},
+    temporary::{self, NotKeepableOutput},
 };
 use clap::Parser;
 use console::style;
@@ -119,9 +119,6 @@ pub async fn run(
          Pass in `--overwrite-input` to allow this."
     );
 
-    // output is temporary until encoding has completed successfully
-    temporary::add(&output, TempKind::NotKeepable);
-
     if defaulting_output {
         let out = shell_escape::escape(output.display().to_string().into());
         bar.println(style!("Encoding {out}").dim().to_string());
@@ -141,6 +138,10 @@ pub async fn run(
     if stereo_downmix && audio_codec == Some("copy") {
         anyhow::bail!("--stereo-downmix cannot be used with --acodec copy");
     }
+
+    // output is temporary until encoding has completed successfully
+    let mut temp_output = NotKeepableOutput::new(output.clone());
+    temp_output.register();
 
     info!(
         "encoding {}",
@@ -187,7 +188,7 @@ pub async fn run(
     }
 
     // successful encode, so don't delete it!
-    temporary::unadd(&output);
+    temp_output.commit();
 
     // print output info
     let output_size = fs::metadata(&output).await?.len();
@@ -401,7 +402,7 @@ mod tests {
         // setup
         let input = temp_input("downmix-copy");
         let output = env::temp_dir().join(format!("ab-av1-encode-out-{}", std::process::id()));
-        let mut args = encode_args(input.clone(), Some(output));
+        let mut args = encode_args(input.clone(), Some(output.clone()));
         args.encode.downmix_to_stereo = true;
         args.encode.audio_codec = Some("copy".into());
         let bar = ProgressBar::new(1);
@@ -413,6 +414,10 @@ mod tests {
 
         // assert
         assert!(err.to_string().contains("--stereo-downmix"));
+        assert!(
+            !temporary::unadd(&output),
+            "validation failure must not register output for cleanup"
+        );
 
         // cleanup
         let _ = fs::remove_file(input);
