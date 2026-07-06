@@ -90,3 +90,40 @@ impl Command {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_parse_routes_sample_encode_subcommand() {
+        let command = Command::try_parse_from([
+            "ab-av1",
+            "sample-encode",
+            "--input",
+            "input.mkv",
+            "--crf",
+            "30",
+        ])
+        .expect("parse sample-encode command");
+
+        match command {
+            Command::SampleEncode(args) => {
+                assert!(!args.sample.keep);
+                assert_eq!(args.args.input, std::path::Path::new("input.mkv"));
+            }
+            _ => panic!("expected sample-encode command"),
+        }
+    }
+
+    #[test]
+    fn command_parse_routes_print_completions_subcommand() {
+        let command = Command::try_parse_from(["ab-av1", "print-completions", "bash"])
+            .expect("parse print-completions command");
+
+        match command {
+            Command::PrintCompletions(_) => {}
+            _ => panic!("expected print-completions command"),
+        }
+    }
+}

@@ -94,7 +94,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
                         vmaf = vmaf.red();
                     }
                     let mut percent = style!("{:.0}%", last.enc.encode_percent);
-                    if last.enc.encode_percent > max_encoded_percent as _ {
+                    if last.enc.encode_percent > max_encoded_percent.get() {
                         percent = percent.red();
                     }
                     let score_kind = last.enc.single_score_kind();
@@ -244,10 +244,11 @@ mod tests {
                     },
                     min_vmaf: Some(95.0),
                     min_xpsnr: None,
-                    max_encoded_percent: 80.0,
+                    max_encoded_percent: crate::command::crf_search::MaxEncodedPercent::new(80.0)
+                        .unwrap(),
                     min_crf: Some(20.0),
                     max_crf: Some(40.0),
-                    crf_increment: Some(1.0),
+                    crf_increment: Some(crate::command::crf_search::CrfStep::try_new(1.0).unwrap()),
                     high_crf_means_hq: Some(false),
                     thorough: true,
                     cache: false,
@@ -265,7 +266,7 @@ mod tests {
                         reference_vfilter: None,
                     },
                     xpsnr: args::Xpsnr {
-                        xpsnr_fps: 60.0,
+                        xpsnr_fps: args::FrameRateOverride::new(60.0),
                         xpsnr_pix_format: None,
                     },
                     verbose: clap_verbosity_flag::Verbosity::new(0, 0),
@@ -333,6 +334,7 @@ mod tests {
     }
 
     // ab-kgc.90: auto-encode must reject --stereo-downmix with --acodec copy before search
+    #[serial_test::serial]
     #[tokio::test]
     async fn rejects_stereo_downmix_with_copy_codec_before_search() {
         let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
@@ -363,6 +365,7 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn rejects_same_input_and_output_without_overwrite() {
         let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
@@ -382,6 +385,7 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn propagates_no_good_crf_from_search() {
         let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
@@ -405,6 +409,7 @@ mod tests {
         let _ = fs::remove_file(input);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn successful_run_preserves_keepable_temps_with_keep_ab_kgc_15() {
         let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");
@@ -441,6 +446,7 @@ mod tests {
         let _ = fs::remove_file(keepable);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn successful_run_cleans_keepable_temps_without_keep() {
         let _lock = AUTO_ENCODE_TEST_LOCK.lock().expect("auto_encode test lock");

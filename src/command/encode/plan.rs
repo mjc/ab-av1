@@ -1,14 +1,10 @@
 use super::{
+    Args,
     error::EncodePlanError,
     lifecycle::{PartialOutput, PlannedOutput},
-    preflight::{audio_config, resolve_output, ResolvedOutput},
-    Args,
+    preflight::{ResolvedOutput, audio_config, resolve_output},
 };
-use crate::{
-    command::args,
-    ffprobe::Ffprobe,
-    ffmpeg::FfmpegEncodeArgs,
-};
+use crate::{command::args, ffmpeg::FfmpegEncodeArgs, ffprobe::Ffprobe};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -183,7 +179,8 @@ mod tests {
     #[test]
     fn build_carries_video_only_and_stereo_downmix_decisions() {
         let input = temp_input("plan", "flags");
-        let output = env::temp_dir().join(format!("ab-av1-encode-plan-flags-{}", std::process::id()));
+        let output =
+            env::temp_dir().join(format!("ab-av1-encode-plan-flags-{}", std::process::id()));
         let mut args = encode_args(input.clone(), Some(output));
         args.encode.video_only = true;
         args.encode.downmix_to_stereo = true;

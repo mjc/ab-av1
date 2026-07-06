@@ -130,15 +130,55 @@ pub struct ScoreArgs {
     pub reference_vfilter: Option<Arc<str>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameRateOverride(Option<f32>);
+
+impl FrameRateOverride {
+    pub fn new(fps: f32) -> Self {
+        Self(Some(fps).filter(|r| *r > 0.0 && r.is_finite()))
+    }
+
+    pub fn fps(self) -> Option<f32> {
+        self.0
+    }
+}
+
+impl std::fmt::Display for FrameRateOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(fps) => fps.fmt(f),
+            None => 0.0f32.fmt(f),
+        }
+    }
+}
+
+impl std::hash::Hash for FrameRateOverride {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self.0 {
+            Some(fps) => fps.to_bits().hash(state),
+            None => 0f32.to_bits().hash(state),
+        }
+    }
+}
+
+impl std::str::FromStr for FrameRateOverride {
+    type Err = std::num::ParseFloatError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let fps: f32 = s.parse()?;
+        Ok(Self::new(fps))
+    }
+}
+
 /// Common xpsnr options.
-#[derive(Debug, Parser, Clone, Copy)]
+#[derive(Debug, Parser, Clone, Copy, PartialEq, Hash)]
 pub struct Xpsnr {
     /// Frame rate override used to analyse both reference & distorted videos.
     /// Maps to ffmpeg `-r` input arg.
     ///
     /// Setting to 0 disables use.
-    #[arg(long, default_value_t = 60.0)]
-    pub xpsnr_fps: f32,
+    #[arg(long, default_value_t = FrameRateOverride::new(60.0))]
+    pub xpsnr_fps: FrameRateOverride,
 
     /// Pixel format used in xpsnr analysis only. By default this is inferred from sources.
     #[arg(value_enum, long)]
@@ -147,14 +187,7 @@ pub struct Xpsnr {
 
 impl Xpsnr {
     pub fn fps(&self) -> Option<f32> {
-        Some(self.xpsnr_fps).filter(|r| *r > 0.0)
-    }
-}
-
-impl std::hash::Hash for Xpsnr {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.xpsnr_fps.to_ne_bytes().hash(state);
-        self.xpsnr_pix_format.hash(state);
+        self.xpsnr_fps.fps()
     }
 }
 
@@ -398,12 +431,19 @@ mod tests {
     fn xpsnr_fps_filter(#[case] fps: f32, #[case] expected: Option<f32>) {
         // setup
         let xpsnr = Xpsnr {
-            xpsnr_fps: fps,
+            xpsnr_fps: FrameRateOverride::new(fps),
             xpsnr_pix_format: None,
         };
         // execute
         // assert
         assert_eq!(xpsnr.fps(), expected);
+    }
+
+    #[test]
+    fn frame_rate_override_is_a_checked_newtype() {
+        assert_eq!(FrameRateOverride::new(60.0).fps(), Some(60.0));
+        assert_eq!(FrameRateOverride::new(0.0).fps(), None);
+        assert_eq!(FrameRateOverride::new(-1.0).fps(), None);
     }
 
     // ab-kgc.82: xpsnr pix_format must participate in args hashing (distinct from cache key ab-kgc.21)
@@ -413,11 +453,11 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let a = Xpsnr {
-            xpsnr_fps: 60.0,
+            xpsnr_fps: FrameRateOverride::new(60.0),
             xpsnr_pix_format: Some(PixelFormat::Yuv420p),
         };
         let b = Xpsnr {
-            xpsnr_fps: 60.0,
+            xpsnr_fps: FrameRateOverride::new(60.0),
             xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
         };
 

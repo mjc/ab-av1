@@ -1,8 +1,5 @@
 use super::{default_output_name, error::EncodePlanError, lifecycle::PlannedOutput};
-use crate::{
-    command::args,
-    ffprobe::Ffprobe,
-};
+use crate::{command::args, ffprobe::Ffprobe};
 use same_file::is_same_file;
 use std::{
     path::{Path, PathBuf},
@@ -31,13 +28,12 @@ pub fn resolve_output(
     probe: &Ffprobe,
 ) -> Result<ResolvedOutput, EncodePlanError> {
     let defaulting_output = encode_to.output.is_none();
-    let output_path = encode_to.output.clone().unwrap_or_else(|| {
-        default_output_name(input, encoder, probe.is_image)
-    });
+    let output_path = encode_to
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output_name(input, encoder, probe.is_image));
 
-    if !encode_to.overwrite_input
-        && is_same_file(&output_path, input).unwrap_or(false)
-    {
+    if !encode_to.overwrite_input && is_same_file(&output_path, input).unwrap_or(false) {
         return Err(EncodePlanError::SameInputOutput);
     }
 

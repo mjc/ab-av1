@@ -17,7 +17,7 @@ use console::style;
 use futures_util::{Stream, StreamExt};
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use log::info;
-use std::{io::IsTerminal, pin::pin, sync::Arc, time::Duration};
+use std::{fmt, io::IsTerminal, pin::pin, str::FromStr, sync::Arc, time::Duration};
 
 const BAR_LEN: u64 = 1024 * 1024 * 1024;
 const DEFAULT_MIN_VMAF: f32 = 95.0;
@@ -86,8 +86,8 @@ pub struct Args {
     pub min_xpsnr: Option<f32>,
 
     /// Maximum desired encoded size percentage of the input size.
-    #[arg(long, default_value_t = 80.0)]
-    pub max_encoded_percent: f32,
+    #[arg(long, default_value_t = MaxEncodedPercent::new(80.0).unwrap())]
+    pub max_encoded_percent: MaxEncodedPercent,
 
     /// Minimum (highest quality) crf value to try.
     ///
@@ -111,8 +111,8 @@ pub struct Args {
     /// Constant rate factor search increment precision.
     ///
     /// [default: 1.0, 0.1 for x264,x265,vp9]
-    #[arg(long)]
-    pub crf_increment: Option<f32>,
+    #[arg(long, value_parser = parse_crf_step)]
+    pub crf_increment: Option<CrfStep>,
 
     /// Set the interpretation of crf so that higher crfs mean higher quality.
     /// For most encoders *lower* crfs mean higher quality.
@@ -146,22 +146,65 @@ pub struct Args {
     pub verbose: clap_verbosity_flag::Verbosity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum ValidationError {
+    #[error("Only one of --min-vmaf and --min-xpsnr may be set")]
+    BothMinScores,
+    #[error("Invalid --min-crf & --max-crf")]
+    InvalidCrfBounds,
+    #[error("--max-encoded-percent must be positive")]
+    NonPositiveMaxEncodedPercent,
+    #[error("Invalid use of --vmaf NUMBER, did you mean: --min-vmaf {num}")]
+    PositionalVmafNumber { num: f32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaxEncodedPercent(f64);
+
+impl MaxEncodedPercent {
+    pub fn new(percent: f64) -> Result<Self, ValidationError> {
+        if percent.is_finite() && percent > 0.0 {
+            Ok(Self(percent))
+        } else {
+            Err(ValidationError::NonPositiveMaxEncodedPercent)
+        }
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl fmt::Display for MaxEncodedPercent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for MaxEncodedPercent {
+    type Err = ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let percent: f64 = s
+            .parse()
+            .map_err(|_| ValidationError::NonPositiveMaxEncodedPercent)?;
+        Self::new(percent)
+    }
+}
+
 impl Args {
     pub fn min_score(&self) -> f32 {
         self.min_xpsnr.or(self.min_vmaf).unwrap_or(DEFAULT_MIN_VMAF)
     }
 
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         if self.min_vmaf.is_some() && self.min_xpsnr.is_some() {
-            anyhow::bail!("Only one of --min-vmaf and --min-xpsnr may be set");
+            return Err(ValidationError::BothMinScores);
         }
         if let (Some(min_crf), Some(max_crf)) = (self.min_crf, self.max_crf)
             && min_crf >= max_crf
         {
-            anyhow::bail!("Invalid --min-crf & --max-crf");
-        }
-        if self.max_encoded_percent <= 0.0 {
-            anyhow::bail!("--max-encoded-percent must be positive");
+            return Err(ValidationError::InvalidCrfBounds);
         }
         if self.min_vmaf.is_none()
             && let Some(num) = self
@@ -170,7 +213,7 @@ impl Args {
                 .iter()
                 .find_map(|arg| arg.parse::<f32>().ok())
         {
-            anyhow::bail!("Invalid use of --vmaf NUMBER, did you mean: --min-vmaf {num}");
+            return Err(ValidationError::PositionalVmafNumber { num });
         }
         Ok(())
     }
@@ -303,6 +346,7 @@ pub fn run(
         let cut_on_iter2 = (max_crf - min_crf) > (default_max_crf - default_min_crf) * 0.5;
 
         let crf_increment = crf_increment
+            .map(CrfStep::get)
             .unwrap_or_else(|| args.encoder.default_crf_increment())
             .max(0.001);
 
@@ -368,78 +412,35 @@ pub fn run(
             };
             let score = output_search_score(&sample.enc, use_xpsnr);
             crf_attempts.push(sample.clone());
-            let sample_small_enough = sample.enc.encode_percent <= max_encoded_percent as _;
 
-            if score >= min_score {
-                // good
-                let within_non_thorough_band =
-                    thorough || score <= min_score + 0.11;
-                if sample_small_enough
-                    && score < min_score + higher_tolerance
-                    && within_non_thorough_band
-                {
+            match decide_next_transition(
+                &sample,
+                score,
+                &crf_attempts,
+                min_score,
+                higher_tolerance,
+                thorough,
+                cut_on_iter2,
+                run,
+                min_q,
+                max_q,
+                use_xpsnr,
+                max_encoded_percent,
+            )? {
+                SearchTransition::Continue { next_q } => {
+                    q = next_q;
+                    yield Update::RunResult(sample.clone());
+                }
+                SearchTransition::Done(sample) => {
                     yield Update::Done(sample);
                     return;
                 }
-                let u_bound = crf_attempts
-                    .iter()
-                    .filter(|s| s.q > sample.q)
-                    .min_by_key(|s| s.q);
-
-                match u_bound {
-                    Some(upper) if upper.q == sample.q + 1 => {
-                        Error::ensure_or_no_good_crf(sample_small_enough, &sample)?;
-                        yield Update::Done(sample);
-                        return;
-                    }
-                    Some(upper) => {
-                        q = vmaf_lerp_q(min_score, upper, &sample, use_xpsnr);
-                    }
-                    None if sample.q == max_q => {
-                        Error::ensure_or_no_good_crf(sample_small_enough, &sample)?;
-                        yield Update::Done(sample);
-                        return;
-                    }
-                    None if cut_on_iter2 && run == 1 && sample.q + 1 < max_q => {
-                        q = (sample.q as f32 * 0.4 + max_q as f32 * 0.6).round() as _;
-                    }
-                    None => q = max_q,
-                };
-            } else {
-                // not good enough
-                if !sample_small_enough || sample.q == min_q {
-                    Err(Error::NoGoodCrf { last: sample.clone() })?;
+                SearchTransition::RunResultThenDone { run_result, done } => {
+                    yield Update::RunResult(run_result);
+                    yield Update::Done(done);
+                    return;
                 }
-
-                let l_bound = crf_attempts
-                    .iter()
-                    .filter(|s| s.q < sample.q)
-                    .max_by_key(|s| s.q);
-
-                match l_bound {
-                    Some(lower) if lower.q + 1 == sample.q => {
-                        let lower_score = output_search_score(&lower.enc, use_xpsnr);
-                        if lower_score >= min_score {
-                            Error::ensure_or_no_good_crf(
-                                lower.enc.encode_percent <= max_encoded_percent as _,
-                                &sample,
-                            )?;
-                            yield Update::RunResult(sample.clone());
-                            yield Update::Done(lower.clone());
-                            return;
-                        }
-                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr);
-                    }
-                    Some(lower) => {
-                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr);
-                    }
-                    None if cut_on_iter2 && run == 1 && sample.q > min_q + 1 => {
-                        q = (sample.q as f32 * 0.4 + min_q as f32 * 0.6).round() as _;
-                    }
-                    None => q = min_q,
-                };
             }
-            yield Update::RunResult(sample.clone());
         }
         unreachable!();
     }
@@ -452,8 +453,109 @@ pub struct Sample {
     q: i64,
 }
 
+#[derive(Debug, Clone)]
+enum SearchTransition {
+    Continue { next_q: i64 },
+    Done(Sample),
+    RunResultThenDone { run_result: Sample, done: Sample },
+}
+
+fn decide_next_transition(
+    sample: &Sample,
+    score: f32,
+    crf_attempts: &[Sample],
+    min_score: f32,
+    higher_tolerance: f32,
+    thorough: bool,
+    cut_on_iter2: bool,
+    run: usize,
+    min_q: i64,
+    max_q: i64,
+    use_xpsnr: bool,
+    max_encoded_percent: MaxEncodedPercent,
+) -> Result<SearchTransition, Error> {
+    let sample_small_enough = sample.enc.encode_percent <= max_encoded_percent.get();
+
+    if score >= min_score {
+        let within_non_thorough_band = thorough || score <= min_score + 0.11;
+        if sample_small_enough && score < min_score + higher_tolerance && within_non_thorough_band {
+            return Ok(SearchTransition::Done(sample.clone()));
+        }
+
+        let u_bound = crf_attempts
+            .iter()
+            .filter(|s| s.q > sample.q)
+            .min_by_key(|s| s.q);
+
+        return match u_bound {
+            Some(upper) if upper.q == sample.q + 1 => {
+                Error::ensure_or_no_good_crf(sample_small_enough, sample)?;
+                Ok(SearchTransition::Done(sample.clone()))
+            }
+            Some(upper) => Ok(SearchTransition::Continue {
+                next_q: vmaf_lerp_q(min_score, upper, sample, use_xpsnr),
+            }),
+            None if sample.q == max_q => {
+                Error::ensure_or_no_good_crf(sample_small_enough, sample)?;
+                Ok(SearchTransition::Done(sample.clone()))
+            }
+            None if cut_on_iter2 && run == 1 && sample.q + 1 < max_q => {
+                Ok(SearchTransition::Continue {
+                    next_q: (sample.q as f32 * 0.4 + max_q as f32 * 0.6).round() as _,
+                })
+            }
+            None => Ok(SearchTransition::Continue { next_q: max_q }),
+        };
+    }
+
+    if !sample_small_enough || sample.q == min_q {
+        Err(Error::NoGoodCrf {
+            last: sample.clone(),
+        })?;
+    }
+
+    let l_bound = crf_attempts
+        .iter()
+        .filter(|s| s.q < sample.q)
+        .max_by_key(|s| s.q);
+
+    match l_bound {
+        Some(lower) if lower.q + 1 == sample.q => {
+            let lower_score = output_search_score(&lower.enc, use_xpsnr);
+            if lower_score >= min_score {
+                Error::ensure_or_no_good_crf(
+                    lower.enc.encode_percent <= max_encoded_percent.get(),
+                    sample,
+                )?;
+                Ok(SearchTransition::RunResultThenDone {
+                    run_result: sample.clone(),
+                    done: lower.clone(),
+                })
+            } else {
+                Ok(SearchTransition::Continue {
+                    next_q: vmaf_lerp_q(min_score, sample, lower, use_xpsnr),
+                })
+            }
+        }
+        Some(lower) => Ok(SearchTransition::Continue {
+            next_q: vmaf_lerp_q(min_score, sample, lower, use_xpsnr),
+        }),
+        None if cut_on_iter2 && run == 1 && sample.q > min_q + 1 => {
+            Ok(SearchTransition::Continue {
+                next_q: (sample.q as f32 * 0.4 + min_q as f32 * 0.6).round() as _,
+            })
+        }
+        None => Ok(SearchTransition::Continue { next_q: min_q }),
+    }
+}
+
 impl Sample {
-    pub fn print_attempt(&self, bar: &ProgressBar, min_score: f32, max_encoded_percent: f32) {
+    pub fn print_attempt(
+        &self,
+        bar: &ProgressBar,
+        min_score: f32,
+        max_encoded_percent: MaxEncodedPercent,
+    ) {
         if bar.is_hidden() {
             info!(
                 "crf {} {} {:.2} ({:.0}%){}",
@@ -484,7 +586,7 @@ impl Sample {
             crf = crf.red().bright();
             score = score.red().bright();
         }
-        if self.enc.encode_percent > max_encoded_percent as _ {
+        if self.enc.encode_percent > max_encoded_percent.get() {
             crf = crf.red().bright();
             percent = percent.red().bright();
         }
@@ -588,13 +690,13 @@ struct QualityConverter {
 struct Crf(f32);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct CrfStep(f32);
+pub(crate) struct CrfStep(f32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QualityIndex(i64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum CrfValueError {
+pub(crate) enum CrfValueError {
     #[error("CRF value must be finite")]
     InvalidCrf,
     #[error("CRF step must be finite and positive")]
@@ -614,15 +716,20 @@ impl Crf {
 }
 
 impl CrfStep {
-    fn try_new(step: f32) -> Result<Self, CrfValueError> {
+    pub(crate) fn try_new(step: f32) -> Result<Self, CrfValueError> {
         (step.is_finite() && step > 0.0)
             .then_some(Self(step))
             .ok_or(CrfValueError::InvalidStep)
     }
 
-    fn get(self) -> f32 {
+    pub(crate) fn get(self) -> f32 {
         self.0
     }
+}
+
+fn parse_crf_step(step: &str) -> anyhow::Result<CrfStep> {
+    let parsed: f32 = step.parse()?;
+    CrfStep::try_new(parsed).map_err(Into::into)
 }
 
 impl QualityIndex {
@@ -748,8 +855,8 @@ pub enum Update {
 #[cfg(test)]
 mod crf_search_tests {
     use super::{
-        Args, Error, Sample, Update, guess_progress, output_search_score, run, test_hooks,
-        vmaf_lerp_q,
+        Args, CrfStep, Error, MaxEncodedPercent, Sample, Update, ValidationError, guess_progress,
+        output_search_score, run, test_hooks, vmaf_lerp_q,
     };
     use crate::{
         command::{
@@ -758,9 +865,12 @@ mod crf_search_tests {
         },
         ffprobe::Ffprobe,
     };
+    use clap::Parser;
     use futures_util::StreamExt;
     use rstest::rstest;
+    use serial_test::serial;
     use std::{
+        env,
         path::PathBuf,
         pin::pin,
         sync::{Arc, Mutex},
@@ -823,10 +933,10 @@ mod crf_search_tests {
                 },
                 min_vmaf,
                 min_xpsnr,
-                max_encoded_percent: 80.0,
+                max_encoded_percent: MaxEncodedPercent::new(80.0).unwrap(),
                 min_crf,
                 max_crf,
-                crf_increment: Some(1.0),
+                crf_increment: Some(CrfStep::try_new(1.0).unwrap()),
                 high_crf_means_hq: Some(false),
                 thorough,
                 cache: false,
@@ -844,7 +954,7 @@ mod crf_search_tests {
                     reference_vfilter: None,
                 },
                 xpsnr: args::Xpsnr {
-                    xpsnr_fps: 60.0,
+                    xpsnr_fps: args::FrameRateOverride::new(60.0),
                     xpsnr_pix_format: None,
                 },
                 verbose: clap_verbosity_flag::Verbosity::new(0, 0),
@@ -899,6 +1009,33 @@ mod crf_search_tests {
         // assert
         let done = last_done(&updates).expect("expected Done");
         assert_eq!(done.enc.vmaf_score, Some(min_score));
+    }
+
+    #[test]
+    #[serial]
+    fn crf_search_args_use_cache_env_default() {
+        let key = "AB_AV1_CACHE";
+        let prev = env::var_os(key);
+        unsafe {
+            env::set_var(key, "false");
+        }
+
+        let args = Args::try_parse_from(["ab-av1", "--input", "input.mkv"])
+            .expect("parse crf search args");
+
+        match prev {
+            Some(value) => unsafe {
+                env::set_var(key, value);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+
+        assert!(
+            !args.cache,
+            "env default must disable cache when set to false"
+        );
     }
 
     // ab-kgc.17: XPSNR is the search metric when --min-xpsnr --and-vmaf
@@ -1066,7 +1203,7 @@ mod crf_search_tests {
 
         // execute / assert
         assert!(
-            args.validate().is_err(),
+            matches!(args.validate(), Err(ValidationError::InvalidCrfBounds)),
             "min_crf >= max_crf must fail validation before search starts"
         );
     }
@@ -1187,36 +1324,96 @@ mod crf_search_tests {
         );
     }
 
+    #[test]
+    fn max_encoded_percent_is_a_checked_newtype() {
+        assert_eq!(MaxEncodedPercent::new(80.0).unwrap().get(), 80.0);
+        assert!(matches!(
+            MaxEncodedPercent::new(0.0),
+            Err(ValidationError::NonPositiveMaxEncodedPercent)
+        ));
+        assert!(matches!(
+            MaxEncodedPercent::new(-1.0),
+            Err(ValidationError::NonPositiveMaxEncodedPercent)
+        ));
+        assert!(matches!(
+            MaxEncodedPercent::new(f64::NAN),
+            Err(ValidationError::NonPositiveMaxEncodedPercent)
+        ));
+    }
+
     // ab-kgc.87: max_encoded_percent must be positive
     #[test]
-    fn validate_rejects_non_positive_max_encoded_percent() {
-        let mut args = search_args(Some(95.0), None, true);
-        args.max_encoded_percent = 0.0;
-        let err = args.validate().expect_err("zero max_encoded_percent");
-        assert!(err.to_string().contains("max-encoded-percent"));
+    fn parse_rejects_non_positive_max_encoded_percent() {
+        assert!(
+            Args::try_parse_from([
+                "ab-av1",
+                "--input",
+                "test.mp4",
+                "--max-encoded-percent",
+                "0",
+            ])
+            .is_err()
+        );
 
-        args.max_encoded_percent = -1.0;
-        let err = args.validate().expect_err("negative max_encoded_percent");
-        assert!(err.to_string().contains("max-encoded-percent"));
+        assert!(
+            Args::try_parse_from([
+                "ab-av1",
+                "--input",
+                "test.mp4",
+                "--max-encoded-percent",
+                "-1",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_checked_max_encoded_percent() {
+        let args = search_args(Some(95.0), None, true);
+        assert_eq!(args.max_encoded_percent.get(), 80.0);
+        assert!(matches!(args.validate(), Ok(())));
+    }
+
+    #[test]
+    fn parse_crf_increment_accepts_positive_values() {
+        let args =
+            Args::try_parse_from(["ab-av1", "--input", "test.mp4", "--crf-increment", "0.5"])
+                .expect("parse crf search args");
+
+        assert_eq!(args.crf_increment.unwrap().get(), 0.5);
+    }
+
+    #[test]
+    fn parse_crf_increment_rejects_non_positive_values() {
+        assert!(
+            Args::try_parse_from(["ab-av1", "--input", "test.mp4", "--crf-increment", "0",])
+                .is_err()
+        );
+
+        assert!(
+            Args::try_parse_from(["ab-av1", "--input", "test.mp4", "--crf-increment", "-1",])
+                .is_err()
+        );
     }
 
     // ab-kgc.86: validate must reject both min_vmaf and min_xpsnr set programmatically
     #[test]
     fn validate_rejects_both_min_vmaf_and_min_xpsnr() {
         let args = search_args(Some(95.0), Some(90.0), true);
-        let err = args.validate().expect_err("both min scores set");
-        assert!(
-            err.to_string().contains("min-vmaf") || err.to_string().contains("min-xpsnr"),
-            "{err}"
-        );
+        assert!(matches!(
+            args.validate(),
+            Err(ValidationError::BothMinScores)
+        ));
     }
 
     #[test]
     fn validate_rejects_positional_vmaf_number_without_min_vmaf() {
         let mut args = search_args(None, None, true);
         args.vmaf.vmaf_args = vec!["95".into()];
-        let err = args.validate().expect_err("positional vmaf number");
-        assert!(err.to_string().contains("--min-vmaf 95"));
+        assert!(matches!(
+            args.validate(),
+            Err(ValidationError::PositionalVmafNumber { num }) if (num - 95.0).abs() < f32::EPSILON
+        ));
     }
 
     #[tokio::test]
@@ -1294,7 +1491,7 @@ mod crf_search_tests {
         let mut args = search_args_with_crf_range(Some(95.0), None, true, Some(10.0), Some(50.0));
         args.args.encoder = "hevc_videotoolbox".parse().unwrap();
         args.high_crf_means_hq = Some(true);
-        args.crf_increment = Some(1.0);
+        args.crf_increment = Some(CrfStep::try_new(1.0).unwrap());
         let _guard = MockGuard::set(move |crf| {
             // Higher CRF → higher quality for videotoolbox (high_crf_means_hq).
             let vmaf = 70.0 + crf * 0.5;

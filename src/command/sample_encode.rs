@@ -1170,9 +1170,11 @@ pub enum Update {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use proptest::prelude::*;
     use rstest::rstest;
-    use std::time::Duration;
+    use serial_test::serial;
+    use std::{env, path::Path, time::Duration};
 
     mod helpers {
         use super::*;
@@ -1429,6 +1431,33 @@ mod tests {
                 std::hint::black_box(window);
             });
         });
+    }
+
+    #[test]
+    #[serial]
+    fn sample_encode_args_use_temp_dir_env_default() {
+        let key = "AB_AV1_TEMP_DIR";
+        let prev = env::var_os(key);
+        unsafe {
+            env::set_var(key, "/tmp/ab-av1-temp");
+        }
+
+        let args = Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "30"])
+            .expect("parse sample encode args");
+
+        match prev {
+            Some(value) => unsafe {
+                env::set_var(key, value);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+
+        assert_eq!(
+            args.sample.temp_dir.as_deref(),
+            Some(Path::new("/tmp/ab-av1-temp"))
+        );
     }
 
     fn valid_sample_plan(

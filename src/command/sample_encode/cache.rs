@@ -221,7 +221,7 @@ impl std::hash::Hasher for BlakeStdHasher<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::args::{PixelFormat, ScoreArgs, Vmaf, Xpsnr};
+    use crate::command::args::{FrameRateOverride, PixelFormat, ScoreArgs, Vmaf, Xpsnr};
     use crate::ffmpeg::FfmpegEncodeArgs;
     use std::{path::Path, sync::Arc, time::Duration};
 
@@ -252,7 +252,7 @@ mod tests {
                 Vmaf::default(),
                 use_xpsnr,
                 Xpsnr {
-                    xpsnr_fps: 60.0,
+                    xpsnr_fps: FrameRateOverride::new(60.0),
                     xpsnr_pix_format: None,
                 },
             )
@@ -516,7 +516,7 @@ mod tests {
             Vmaf::default(),
             true,
             Xpsnr {
-                xpsnr_fps: 60.0,
+                xpsnr_fps: FrameRateOverride::new(60.0),
                 xpsnr_pix_format: Some(PixelFormat::Yuv420p),
             },
         );
@@ -527,7 +527,7 @@ mod tests {
             Vmaf::default(),
             true,
             Xpsnr {
-                xpsnr_fps: 60.0,
+                xpsnr_fps: FrameRateOverride::new(60.0),
                 xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
             },
         );
@@ -570,7 +570,7 @@ mod tests {
             sample: &Path,
             input: &Path,
             enc: &FfmpegEncodeArgs<'_>,
-            xpsnr_fps: f32,
+            xpsnr_fps: FrameRateOverride,
         ) -> Key {
             let scoring = (
                 ScoreArgs {
@@ -602,8 +602,8 @@ mod tests {
         let enc = minimal_enc_args(input);
 
         // execute
-        let key_fps_60 = cache_key_for_xpsnr_fps(sample, input, &enc, 60.0);
-        let key_fps_30 = cache_key_for_xpsnr_fps(sample, input, &enc, 30.0);
+        let key_fps_60 = cache_key_for_xpsnr_fps(sample, input, &enc, FrameRateOverride::new(60.0));
+        let key_fps_30 = cache_key_for_xpsnr_fps(sample, input, &enc, FrameRateOverride::new(30.0));
 
         // assert
         assert_ne!(
@@ -684,7 +684,7 @@ mod tests {
             reference_vfilter: None,
         };
         let xpsnr_opts = Xpsnr {
-            xpsnr_fps: 60.0,
+            xpsnr_fps: FrameRateOverride::new(60.0),
             xpsnr_pix_format: None,
         };
 

@@ -107,7 +107,10 @@ mod tests {
         fs::write(&path, b"stay").expect("write file");
         let completed = PlannedOutput::new(path.clone()).begin().commit();
         temporary::clean_all().await;
-        assert!(completed.path().exists(), "completed output must survive cleanup");
+        assert!(
+            completed.path().exists(),
+            "completed output must survive cleanup"
+        );
         let _ = fs::remove_file(path);
     }
 }

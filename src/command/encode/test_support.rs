@@ -3,13 +3,7 @@ use crate::{
     command::args::{Encode, EncodeToOutput},
     ffprobe::Ffprobe,
 };
-use std::{
-    env,
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 
 pub(crate) mod test_hooks {
     use std::cell::RefCell;

@@ -1,14 +1,11 @@
 use super::{
     lifecycle::CompletedOutput,
     plan::{EncodePlan, EncodeSession},
-    progress::{apply_ffmpeg_event, BarUpdate, ProgressState, StreamSizes},
+    progress::{BarUpdate, ProgressState, StreamSizes, apply_ffmpeg_event},
     sink::ProgressSink,
     spawner::EncodeSpawner,
 };
-use crate::{
-    command::SmallDuration,
-    log::ProgressLogger,
-};
+use crate::{command::SmallDuration, log::ProgressLogger};
 use log::info;
 use std::time::Instant;
 use tokio_stream::StreamExt;

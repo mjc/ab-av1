@@ -129,11 +129,11 @@ pub fn default_output_name(input: &Path, encoder: &Encoder, is_image: bool) -> P
 mod tests {
     use super::*;
     use crate::temporary;
+    use serial_test::serial;
+    use spawner::FixtureSpawner;
     use std::{env, fs};
     use test_case::test_case;
     use test_support::{arc_probe, encode_args, temp_input};
-    use serial_test::serial;
-    use spawner::FixtureSpawner;
 
     // ab-kgc.89: default output extension must preserve input container for webm/mov
     #[test_case("clip.mp4", false, "mp4"; "video mp4 keeps mp4")]
@@ -254,7 +254,9 @@ mod tests {
         let spawner = FixtureSpawner::new("stderr-ffmpeg-progress");
 
         // execute
-        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner).await.expect("encode run");
+        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner)
+            .await
+            .expect("encode run");
 
         // assert
         assert!(output.exists());
@@ -279,7 +281,9 @@ mod tests {
         let spawner = FixtureSpawner::new("stderr-ffmpeg-progress");
 
         // execute
-        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner).await.expect("encode run");
+        run_with_spawner(args, arc_probe(Some(6)), &bar, &spawner)
+            .await
+            .expect("encode run");
 
         // assert
         assert!(output.exists());
