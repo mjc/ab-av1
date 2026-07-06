@@ -113,5 +113,25 @@ Enable debug logs by setting env var `RUST_LOG=ab_av1=debug`. This includes all 
 $ RUST_LOG=ab_av1=debug ab-av1 auto-encode -i vid.mkv
 ```
 
+## Fast Checks
+Use the repository task target for the quick clippy gate:
+
+```sh
+./scripts/clippy-fast
+```
+
+This runs:
+
+```sh
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## Full Verification
+Use the devshell for the slower end-to-end test pass:
+
+```sh
+nix develop /home/mjc/cfg/devshells#ab-av1 -c cargo test -- --test-threads=1
+```
+
 ## Minimum supported rust compiler
 Maintained with [latest stable rust](https://gist.github.com/alexheretic/d1e98d8433b602e57f5d0a9637927e0c).
