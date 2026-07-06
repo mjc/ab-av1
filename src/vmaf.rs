@@ -88,8 +88,18 @@ impl VmafOut {
 
         chunks.push(chunk);
 
-        if let Some(line) = chunks.rfind_line(|l| l.contains(SCORE_PREFIX)) {
-            let idx = line.find(SCORE_PREFIX).unwrap();
+        if let Some(line) = chunks.rfind_line(|l| {
+            l.as_bytes()
+                .windows(SCORE_PREFIX.len())
+                .any(|w| w.eq_ignore_ascii_case(SCORE_PREFIX.as_bytes()))
+        }) {
+            let idx = line
+                .find(SCORE_PREFIX)
+                .or_else(|| {
+                    line.to_ascii_lowercase()
+                        .find(&SCORE_PREFIX.to_ascii_lowercase())
+                })
+                .unwrap();
             return Some(Self::Done(
                 line[idx + SCORE_PREFIX.len()..].trim().parse().ok()?,
             ));

@@ -17,9 +17,9 @@ pub(crate) fn build_ffmpeg_command(
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-nostdin")
         .arg2_opt("-r", fps)
-        .arg2("-i", reference)
-        .arg2_opt("-r", fps)
         .arg2("-i", distorted)
+        .arg2_opt("-r", fps)
+        .arg2("-i", reference)
         .arg2("-filter_complex", filter_complex)
         .suppress_non_video_streams()
         .arg2("-f", "null")
@@ -85,7 +85,10 @@ impl XpsnrOut {
     fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
         chunks.push(chunk);
 
-        if let Some(score) = chunks.rfind_line_map(score_from_line) {
+        if let Some(score) = chunks.rfind_line_map(score_from_minimum_line) {
+            return Some(Self::Done(score));
+        }
+        if let Some(score) = chunks.rfind_line_map(score_from_average_line) {
             return Some(Self::Done(score));
         }
         if let Some(progress) = FfmpegOut::try_parse(chunks.last_line()) {
@@ -96,25 +99,40 @@ impl XpsnrOut {
 }
 
 // E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
+// E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
 fn score_from_line(line: &str) -> Option<f32> {
+    score_from_minimum_line(line).or_else(|| score_from_average_line(line))
+}
+
+fn score_from_minimum_line(line: &str) -> Option<f32> {
     const MIN_PREFIX: &str = "minimum: ";
 
     if !line.contains("XPSNR") {
         return None;
     }
 
-    let yidx = line.find(MIN_PREFIX)?;
-    let tail = &line[yidx + MIN_PREFIX.len()..];
+    let tail = line.find(MIN_PREFIX).map(|yidx| &line[yidx + MIN_PREFIX.len()..])?;
     if tail.starts_with("inf") {
         return Some(f32::INFINITY);
     }
+    parse_score_number(tail)
+}
 
-    let end_idx = tail
+fn score_from_average_line(line: &str) -> Option<f32> {
+    if !line.contains("XPSNR average") {
+        return None;
+    }
+    let yidx = line.find("y:")?;
+    parse_score_number(line[yidx + 2..].trim_start())
+}
+
+fn parse_score_number(s: &str) -> Option<f32> {
+    let end_idx = s
         .char_indices()
         .take_while(|(_, c)| *c == '-' || *c == '.' || c.is_numeric())
         .last()?
         .0;
-    tail[..=end_idx].parse().ok()
+    s[..=end_idx].parse().ok()
 }
 
 #[cfg(test)]
@@ -155,19 +173,19 @@ mod test {
     }
 
     #[test]
-    fn xpsnr_build_command_reference_input_is_stream_zero() {
+    fn xpsnr_build_command_distorted_input_is_stream_zero() {
         let cmd = build_ffmpeg_command(
             Path::new("ref.mkv"),
             Path::new("dist.mkv"),
-            "[ref][dis]xpsnr",
+            "[dis][ref]xpsnr",
             Some(25.0),
         );
         let cmd_str = cmd.to_cmd_str();
-        let ref_pos = cmd_str.find("ref.mkv").expect("reference path");
         let dist_pos = cmd_str.find("dist.mkv").expect("distorted path");
+        let ref_pos = cmd_str.find("ref.mkv").expect("reference path");
         assert!(
-            ref_pos < dist_pos,
-            "reference input must precede distorted for [0:v] mapping: `{cmd_str}`"
+            dist_pos < ref_pos,
+            "distorted input must precede reference for [0:v] mapping: `{cmd_str}`"
         );
         assert!(cmd_str.contains("-r 25"));
     }

@@ -20,7 +20,12 @@ pub struct Ffprobe {
 impl Ffprobe {
     pub fn pixel_format(&self) -> Option<PixelFormat> {
         let pf = self.pix_fmt.as_deref()?;
-        PixelFormat::try_from(pf).ok()
+        PixelFormat::try_from(pf)
+            .ok()
+            .or_else(|| {
+                let lower = pf.to_ascii_lowercase();
+                PixelFormat::try_from(lower.as_str()).ok()
+            })
     }
 
     pub fn nframes(&self) -> Result<u64, ProbeError> {
@@ -139,9 +144,10 @@ fn read_fps(probe: &ffprobe::FfProbe) -> anyhow::Result<f64> {
 
 /// parse "x/y" or float strings.
 pub fn parse_frame_rate(rate: &str) -> Option<f64> {
+    let rate = rate.replace(' ', "");
     if let Some((x, y)) = rate.split_once('/') {
-        let x: f64 = x.parse().ok()?;
-        let y: f64 = y.parse().ok()?;
+        let x: f64 = x.trim().parse().ok()?;
+        let y: f64 = y.trim().parse().ok()?;
         if x <= 0.0 || y <= 0.0 {
             return None;
         }

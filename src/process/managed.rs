@@ -390,6 +390,20 @@ impl TerminateOnDropProcess {
                 return;
             };
             let mut stderr = inner.handle.stderr().try_subscribe()?;
+            // Replay is delivered without an explicit gap marker; score streams
+            // may subscribe after ffmpeg has already emitted progress lines.
+            let first = tokio::time::timeout(Duration::ZERO, stderr.next_event()).await;
+            if matches!(first, Ok(Some(_))) {
+                yield ManagedEvent::ReplayGap(OutputReplayGap);
+            }
+            if let Ok(Some(event)) = first {
+                match managed_event_from_stream_event(event)? {
+                    Some(ManagedEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
+                    Some(ManagedEvent::ReplayGap(gap)) => yield ManagedEvent::ReplayGap(gap),
+                    Some(ManagedEvent::ProcessDone(done)) => yield ManagedEvent::ProcessDone(done),
+                    None => {}
+                }
+            }
             while let Some(event) = stderr.next_event().await {
                 match managed_event_from_stream_event(event)? {
                     Some(ManagedEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),

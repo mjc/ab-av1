@@ -193,7 +193,9 @@ pub fn run(
                 (samples, sample_duration, false)
             }
         };
-        let sample_duration_us = sample_duration.as_micros_u64();
+        let sample_duration_us = sample_duration.as_micros_u64().max(1);
+        let encode_progress_denom =
+            (sample_duration_us.saturating_mul(samples).saturating_mul(2)).max(1) as f32;
 
         // Start creating copy samples async, this is IO bound & not cpu intensive
         let (tx, mut sample_tasks) = tokio::sync::mpsc::unbounded_channel();
@@ -250,8 +252,12 @@ pub fn run(
                 input.extension(),
                 input_len,
                 full_pass,
+                sample_args.extension.as_deref().unwrap_or("mkv"),
                 &enc_args,
-                (&score, &vmaf, &xpsnr),
+                &score,
+                &vmaf,
+                xpsnr,
+                &xpsnr_opts,
             )
             .await
             {
@@ -278,7 +284,7 @@ pub fn run(
                                 work: Work::Encode,
                                 fps,
                                 progress: (time.as_micros_u64() + sample_idx * sample_duration_us * 2) as f32
-                                    / (sample_duration_us * samples * 2) as f32,
+                                    / encode_progress_denom,
                                 full_pass,
                                 sample: sample_n,
                                 samples,
@@ -335,11 +341,11 @@ pub fn run(
                                         false => (sample_duration_us +
                                             time.as_micros_u64() +
                                             sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32,
+                                            / encode_progress_denom,
                                         true => (sample_duration_us +
                                             time.as_micros_u64() / 2 +
                                             sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32
+                                            / encode_progress_denom
                                     };
                                     yield Update::Status(Status {
                                         work: Work::Score(ScoreKind::Xpsnr),
@@ -391,11 +397,11 @@ pub fn run(
                                         false => (sample_duration_us +
                                             time.as_micros_u64() +
                                             sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32,
+                                            / encode_progress_denom,
                                         true => (sample_duration_us + sample_duration_us / 2 +
                                             time.as_micros_u64() / 2 +
                                             sample_idx * sample_duration_us * 2) as f32
-                                            / (sample_duration_us * samples * 2) as f32,
+                                            / encode_progress_denom,
                                     };
                                     yield Update::Status(Status {
                                         work: Work::Score(ScoreKind::Vmaf),
@@ -477,12 +483,15 @@ async fn sample(
 ) -> anyhow::Result<(Arc<PathBuf>, u64)> {
     let sample_n = sample_idx + 1;
 
+    let grid_divisor = ((samples.saturating_add(1)).min(u64::from(u32::MAX)) as u32).max(1);
+
     let sample_start = (duration.saturating_sub(sample_duration * samples as _)
-        / (samples as u32 + 1))
+        / grid_divisor)
         * sample_n as _
         + sample_duration * sample_idx as _;
 
-    let sample_frames = ((sample_duration.as_secs_f64() * fps).round() as u32).max(1);
+    let sample_frames_u64 = (sample_duration.as_secs_f64() * fps).round() as u64;
+    let sample_frames = sample_frames_u64.clamp(1, u64::from(u32::MAX)) as u32;
     let floor_to_sec = sample_duration >= Duration::from_secs(2);
 
     let sample = sample::copy(&input, sample_start, floor_to_sec, sample_frames, temp_dir).await?;
@@ -495,11 +504,54 @@ async fn sample(
     Ok((sample.into(), sample_size))
 }
 
+mod score_json {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(score: &Option<f32>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match score {
+            Some(v) if v.is_nan() => serializer.serialize_str("NaN"),
+            Some(v) => serializer.serialize_some(v),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+        match value {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) if s.eq_ignore_ascii_case("nan") => {
+                Ok(Some(f32::NAN))
+            }
+            Some(serde_json::Value::Number(n)) => n
+                .as_f64()
+                .map(|v| Some(v as f32))
+                .ok_or_else(|| serde::de::Error::custom("invalid score number")),
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "invalid score value: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncodeResult {
     pub sample_size: u64,
     pub encoded_size: u64,
+    #[serde(
+        serialize_with = "score_json::serialize",
+        deserialize_with = "score_json::deserialize"
+    )]
     pub vmaf_score: Option<f32>,
+    #[serde(
+        serialize_with = "score_json::serialize",
+        deserialize_with = "score_json::deserialize"
+    )]
     pub xpsnr_score: Option<f32>,
     pub encode_time: Duration,
     /// Duration of the sample.
@@ -520,11 +572,15 @@ impl EncodeResult {
             from_cache,
             ..
         } = self;
+        let percent = if *sample_size == 0 {
+            0.0
+        } else {
+            100.0 * *encoded_size as f32 / *sample_size as f32
+        };
         bar.println(
             style!(
-                "- {}Sample {sample_n} ({:.0}%){}{}{}",
+                "- {}Sample {sample_n} ({percent:.0}%){}{}{}",
                 crf.map(|crf| format!("crf {crf}: ")).unwrap_or_default(),
-                100.0 * *encoded_size as f32 / *sample_size as f32,
                 vmaf_score
                     .map(|s| format!(" VMAF {s:.2}"))
                     .unwrap_or_default(),
@@ -547,15 +603,19 @@ impl EncodeResult {
             from_cache,
             ..
         } = self;
+        let percent = if *sample_size == 0 {
+            0.0
+        } else {
+            100.0 * *encoded_size as f32 / *sample_size as f32
+        };
         info!(
-            "sample {sample_n}/{samples} crf {crf}{}{} ({:.0}%){}",
+            "sample {sample_n}/{samples} crf {crf}{}{} ({percent:.0}%){}",
             vmaf_score
                 .map(|s| format!(" VMAF {s:.2}"))
                 .unwrap_or_default(),
             xpsnr_score
                 .map(|s| format!(" XPSNR {s:.2}"))
                 .unwrap_or_default(),
-            100.0 * *encoded_size as f32 / *sample_size as f32,
             if *from_cache { " (cache)" } else { "" }
         );
     }
@@ -611,23 +671,38 @@ trait EncodeResults {
 impl EncodeResults for Vec<EncodeResult> {
     fn encoded_percent_size(&self) -> f64 {
         if self.is_empty() {
-            return 100.0;
+            return 0.0;
         }
         let encoded = self.iter().map(|r| r.encoded_size).sum::<u64>() as f64;
         let sample = self.iter().map(|r| r.sample_size).sum::<u64>() as f64;
+        if sample <= 0.0 {
+            return 0.0;
+        }
         encoded * 100.0 / sample
     }
 
     fn mean_vmaf_score(&self) -> Option<f32> {
-        let mut scores = self.iter().filter_map(|r| r.vmaf_score).peekable();
-        scores.peek()?;
-        Some(scores.sum::<f32>() / self.len() as f32)
+        let scores: Vec<f32> = self
+            .iter()
+            .filter_map(|r| r.vmaf_score)
+            .filter(|s| s.is_finite())
+            .collect();
+        if scores.is_empty() {
+            return None;
+        }
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
     }
 
     fn mean_xpsnr_score(&self) -> Option<f32> {
-        let mut scores = self.iter().filter_map(|r| r.xpsnr_score).peekable();
-        scores.peek()?;
-        Some(scores.sum::<f32>() / self.len() as f32)
+        let scores: Vec<f32> = self
+            .iter()
+            .filter_map(|r| r.xpsnr_score)
+            .filter(|s| s.is_finite())
+            .collect();
+        if scores.is_empty() {
+            return None;
+        }
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
     }
 
     fn estimate_encode_size_by_duration(
@@ -643,7 +718,11 @@ impl EncodeResults for Vec<EncodeResult> {
         }
 
         let sample_duration: Duration = self.iter().map(|s| s.sample_duration).sum();
-        let sample_factor = input_duration.as_secs_f64() / sample_duration.as_secs_f64();
+        let sample_secs = sample_duration.as_secs_f64();
+        if sample_secs <= 0.0 {
+            return 0;
+        }
+        let sample_factor = input_duration.as_secs_f64() / sample_secs;
         let sample_encode_size: f64 = self.iter().map(|r| r.encoded_size as f64).sum();
 
         (sample_encode_size * sample_factor).round() as _
@@ -658,15 +737,14 @@ impl EncodeResults for Vec<EncodeResult> {
         }
 
         let sample_duration: Duration = self.iter().map(|s| s.sample_duration).sum();
-        let sample_factor = input_duration.as_secs_f64() / sample_duration.as_secs_f64();
+        let sample_secs = sample_duration.as_secs_f64();
+        if sample_secs <= 0.0 {
+            return Duration::ZERO;
+        }
+        let sample_factor = input_duration.as_secs_f64() / sample_secs;
         let sample_encode_time: Duration = self.iter().map(|r| r.encode_time).sum();
 
-        let estimate = sample_encode_time.mul_f64(sample_factor);
-        if estimate < Duration::from_secs(1) {
-            estimate
-        } else {
-            Duration::from_secs(estimate.as_secs())
-        }
+        sample_encode_time.mul_f64(sample_factor)
     }
 }
 
@@ -785,14 +863,17 @@ pub struct Output {
 impl Output {
     /// Extract vmaf or xpsnr score. Use when it is expected to have only 1 of these.
     pub fn single_score(&self) -> f32 {
-        self.vmaf_score.or(self.xpsnr_score).unwrap_or_default()
+        self.vmaf_score
+            .or(self.xpsnr_score)
+            .unwrap_or(f32::NAN)
     }
 
     /// Extract vmaf or xpsnr kind. Use when it is expected to have only 1 of these.
     pub fn single_score_kind(&self) -> ScoreKind {
-        match self.vmaf_score {
-            Some(_) => ScoreKind::Vmaf,
-            _ => ScoreKind::Xpsnr,
+        match (self.vmaf_score, self.xpsnr_score) {
+            (Some(_), _) => ScoreKind::Vmaf,
+            (None, Some(_)) => ScoreKind::Xpsnr,
+            (None, None) => ScoreKind::Vmaf,
         }
     }
 }
@@ -873,9 +954,9 @@ mod tests {
 
     use helpers::*;
 
-    /// Mirror `sample_encode::sample` grid divisor: `(samples as u32 + 1)`.
+    /// Mirror `sample_encode::sample` grid divisor.
     fn sample_grid_divisor(samples: u64) -> u32 {
-        samples as u32 + 1
+        ((samples.saturating_add(1)).min(u64::from(u32::MAX)) as u32).max(1)
     }
 
     /// Mirror progress denominator: `sample_duration_us * samples * 2`.
@@ -885,8 +966,8 @@ mod tests {
         sample_duration_us: u64,
         samples: u64,
     ) -> f32 {
-        (time_us + sample_idx * sample_duration_us * 2) as f32
-            / (sample_duration_us * samples * 2) as f32
+        let denom = (sample_duration_us.saturating_mul(samples).saturating_mul(2)).max(1) as f32;
+        (time_us + sample_idx * sample_duration_us * 2) as f32 / denom
     }
 
     // ab-kgc.23: mirrors sample_encode::sample frame math
@@ -898,11 +979,11 @@ mod tests {
 
         // execute
         let product = sample_duration.as_secs_f64() * fps;
-        let frames = (product.round() as u32).max(1);
+        let frames = (product.round() as u64).max(1);
 
         // assert — wrapping would request far too few frames
         assert!(
-            f64::from(frames) >= product * 0.99,
+            frames as f64 >= product * 0.99,
             "duration*fps product {product} must not truncate via u32 cast (got {frames})"
         );
     }
@@ -1029,7 +1110,11 @@ mod tests {
         let encoded_size = 500_u64;
 
         // execute
-        let percent = 100.0 * encoded_size as f32 / sample_size as f32;
+        let percent = if sample_size == 0 {
+            0.0
+        } else {
+            100.0 * encoded_size as f32 / sample_size as f32
+        };
 
         // assert — ab-kgc.50/63: print_attempt and log_attempt share this math
         assert!(

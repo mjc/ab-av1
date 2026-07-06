@@ -100,8 +100,7 @@ impl Vmaf {
 
         let mut model = VmafModel::from_args(&args);
         if let (None, Some((w, h))) = (model, distorted_res)
-            && w > 2560
-            && h > 1440
+            && (w > 2560 || h > 1440)
         {
             // for >2k resolutions use 4k model
             lavfi.push_str(":model=version=vmaf_4k_v0.6.1");
@@ -138,7 +137,7 @@ impl Vmaf {
         match (self.vmaf_scale, distorted_res) {
             (VmafScale::Auto, Some((w, h))) => match model {
                 // upscale small resolutions to 1k for use with the 1k model
-                VmafModel::Vmaf1K if w < 1728 && h < 972 => {
+                VmafModel::Vmaf1K if w < 1728 || h < 972 => {
                     Some(minimally_scale((w, h), (1920, 1080)))
                 }
                 // upscale small resolutions to 4k for use with the 4k model
@@ -187,6 +186,9 @@ fn parse_vmaf_scale(vs: &str) -> anyhow::Result<VmafScale> {
         _ => {
             let (w, h) = vs.split_once('x').context(ERR)?;
             let (width, height) = (w.parse().context(ERR)?, h.parse().context(ERR)?);
+            if width == 0 || height == 0 {
+                anyhow::bail!("{ERR}");
+            }
             Ok(VmafScale::Custom { width, height })
         }
     }

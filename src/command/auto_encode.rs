@@ -60,6 +60,10 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
          Pass in `--overwrite-input` to allow this."
     );
 
+    if encode.downmix_to_stereo && encode.audio_codec.as_deref() == Some("copy") {
+        anyhow::bail!("--stereo-downmix cannot be used with --acodec copy");
+    }
+
     search.sample.set_extension_from_output(&output);
     search.validate()?;
 

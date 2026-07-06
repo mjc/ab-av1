@@ -31,7 +31,9 @@ enum LogicalScoreCompletion {
 
 impl LogicalScoreCompletion {
     fn record(&mut self, event: &ScoreStreamParse) {
-        if let ScoreStreamParse::LogicalDone(score) = event {
+        if let ScoreStreamParse::LogicalDone(score) = event
+            && !self.is_done()
+        {
             *self = Self::Done(*score);
         }
     }

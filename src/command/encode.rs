@@ -228,6 +228,8 @@ pub fn default_output_ext(input: &Path, encoder: &Encoder, is_image: bool) -> &'
     }
     match input.extension().and_then(|e| e.to_str()) {
         Some("mp4") => "mp4",
+        Some("webm") => "webm",
+        Some("mov") => "mov",
         _ => "mkv",
     }
 }

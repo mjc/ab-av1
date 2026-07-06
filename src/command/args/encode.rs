@@ -387,7 +387,7 @@ impl Encoder {
     /// Generally 0.1 if codec supports decimal crf.
     pub fn default_crf_increment(&self) -> f32 {
         match self.as_str() {
-            "libx264" | "libx265" => 0.1,
+            "libx264" | "libx265" | "libvpx-vp9" => 0.1,
             "libsvtav1" => 0.25,
             _ => 1.0,
         }
@@ -553,7 +553,7 @@ impl TryFrom<&str> for PixelFormat {
     type Error = ();
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
+        match value.to_ascii_lowercase().as_str() {
             "yuv420p10le" => Ok(Self::Yuv420p10le),
             "yuv422p10le" => Ok(Self::Yuv422p10le),
             "yuv444p10le" => Ok(Self::Yuv444p10le),
@@ -1152,7 +1152,7 @@ fn to_ffmpeg_args_enc_input_none_disables_vaapi_defaults() {
 #[test]
 fn to_ffmpeg_args_rejects_reserved_output_and_input_args() {
     // setup
-    let mut enc_output = Encode {
+    let enc_output = Encode {
         encoder: Encoder("libx264".into()),
         input: "vid.mp4".into(),
         vfilter: None,

@@ -89,15 +89,22 @@ pub struct Sample {
 impl Sample {
     /// Calculate the desired sample count using `samples` or `sample_every` & `min_samples`.
     pub fn sample_count(&self, input_duration: Duration) -> u64 {
-        match self.samples {
+        let count = match self.samples {
             Some(s) => s,
             None => {
-                (input_duration.as_secs_f64() / self.sample_every.as_secs_f64().max(1.0)).ceil()
-                    as _
+                let every = self.sample_every.as_secs_f64();
+                if every <= 0.0 {
+                    1
+                } else {
+                    (input_duration.as_secs_f64() / every).ceil() as u64
+                }
             }
+        };
+        if self.samples.is_some() {
+            count.max(self.min_samples.unwrap_or(0))
+        } else {
+            count.max(self.min_samples.unwrap_or(1)).max(1)
         }
-        .max(self.min_samples.unwrap_or(1))
-        .max(1)
     }
 
     pub fn set_extension_from_input(&mut self, input: &Path, encoder: &Encoder, probe: &Ffprobe) {
@@ -105,7 +112,10 @@ impl Sample {
     }
 
     pub fn set_extension_from_output(&mut self, output: &Path) {
-        self.extension = output.extension().and_then(|e| e.to_str().map(Into::into));
+        self.extension = output
+            .extension()
+            .and_then(|e| e.to_str().map(Into::into))
+            .or_else(|| Some("mkv".into()));
     }
 }
 
@@ -144,6 +154,7 @@ impl Xpsnr {
 impl std::hash::Hash for Xpsnr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.xpsnr_fps.to_ne_bytes().hash(state);
+        self.xpsnr_pix_format.hash(state);
     }
 }
 

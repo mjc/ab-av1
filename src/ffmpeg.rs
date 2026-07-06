@@ -186,11 +186,13 @@ pub fn encode(
 }
 
 pub fn pre_extension_name(vcodec: &str) -> &str {
-    match vcodec.strip_prefix("lib").filter(|s| !s.is_empty()) {
-        Some("svtav1") => "av1",
-        Some("vpx-vp9") => "vp9",
-        Some(suffix) => suffix,
-        _ => vcodec,
+    match vcodec {
+        "libsvtav1" | "libaom-av1" | "libdav1d" | "svtav1" => "av1",
+        "libvpx-vp9" | "libvpx" => "vp9",
+        _ => match vcodec.strip_prefix("lib").filter(|s| !s.is_empty()) {
+            Some(suffix) => suffix,
+            None => vcodec,
+        },
     }
 }
 
@@ -239,18 +241,12 @@ impl VCodecSpecific for Arc<str> {
 }
 
 pub fn remove_arg(args: &mut Vec<Arc<String>>, arg: &'static str) {
-    let mut retain_next = true;
-    args.retain(|a| {
-        if **a == arg {
-            retain_next = false;
-            false
-        } else if !retain_next {
-            retain_next = true;
-            false
-        } else {
-            true
+    if let Some(i) = args.iter().position(|a| a.as_str() == arg) {
+        args.remove(i);
+        if i < args.len() && !args[i].as_str().starts_with('-') {
+            args.remove(i);
         }
-    });
+    }
 }
 
 #[cfg(test)]

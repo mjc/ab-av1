@@ -28,7 +28,10 @@ const DEFAULT_MIN_VMAF: f32 = 95.0;
 /// is also present (e.g. `--and-vmaf`).
 fn output_search_score(enc: &sample_encode::Output, use_xpsnr: bool) -> f32 {
     match use_xpsnr {
-        true => enc.xpsnr_score.unwrap_or_default(),
+        true => enc
+            .xpsnr_score
+            .or(enc.vmaf_score)
+            .unwrap_or_default(),
         false => enc.vmaf_score.or(enc.xpsnr_score).unwrap_or_default(),
     }
 }
@@ -148,10 +151,23 @@ pub struct Args {
 
 impl Args {
     pub fn min_score(&self) -> f32 {
-        self.min_vmaf.or(self.min_xpsnr).unwrap_or(DEFAULT_MIN_VMAF)
+        self.min_xpsnr
+            .or(self.min_vmaf)
+            .unwrap_or(DEFAULT_MIN_VMAF)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.min_vmaf.is_some() && self.min_xpsnr.is_some() {
+            anyhow::bail!("Only one of --min-vmaf and --min-xpsnr may be set");
+        }
+        if let (Some(min_crf), Some(max_crf)) = (self.min_crf, self.max_crf)
+            && min_crf >= max_crf
+        {
+            anyhow::bail!("Invalid --min-crf & --max-crf");
+        }
+        if self.max_encoded_percent <= 0.0 {
+            anyhow::bail!("--max-encoded-percent must be positive");
+        }
         if self.min_vmaf.is_none()
             && let Some(num) = self
                 .vmaf
@@ -278,7 +294,7 @@ pub fn run(
         let min_crf = min_crf.unwrap_or(default_min_crf);
         Error::ensure_other(min_crf < max_crf, "Invalid --min-crf & --max-crf")?;
         // by default use vmaf 95, otherwise use whatever is specified
-        let min_score = min_vmaf.or(min_xpsnr).unwrap_or(DEFAULT_MIN_VMAF);
+        let min_score = min_xpsnr.or(min_vmaf).unwrap_or(DEFAULT_MIN_VMAF);
         let use_xpsnr = min_xpsnr.is_some();
 
         // Whether to make the 2nd iteration on the ~20%/~80% crf point instead of the min/max to
@@ -324,7 +340,7 @@ pub fn run(
                 true => 0.05,
                 // increment 1.0 => +0.1, +0.2, +0.4, +0.8 ..
                 // increment 0.1 => +0.1, +0.1, +0.1, +0.16 ..
-                _ => (crf_increment.min(1.0) * 2_f32.powi(run as i32 - 1) * 0.1).max(0.1),
+                false => (crf_increment.min(1.0) * 2_f32.powi(run as i32 - 1) * 0.1).max(0.1),
             };
             args.crf = q_conv.crf(q);
 
@@ -361,7 +377,12 @@ pub fn run(
 
             if score >= min_score {
                 // good
-                if sample_small_enough && score < min_score + higher_tolerance {
+                let within_non_thorough_band =
+                    thorough || score <= min_score + 0.11;
+                if sample_small_enough
+                    && score < min_score + higher_tolerance
+                    && within_non_thorough_band
+                {
                     yield Update::Done(sample);
                     return;
                 }
@@ -402,10 +423,17 @@ pub fn run(
 
                 match l_bound {
                     Some(lower) if lower.q + 1 == sample.q => {
-                        Error::ensure_or_no_good_crf(lower.enc.encode_percent <= max_encoded_percent as _, &sample)?;
-                        yield Update::RunResult(sample.clone());
-                        yield Update::Done(lower.clone());
-                        return;
+                        let lower_score = output_search_score(&lower.enc, use_xpsnr);
+                        if lower_score >= min_score {
+                            Error::ensure_or_no_good_crf(
+                                lower.enc.encode_percent <= max_encoded_percent as _,
+                                &sample,
+                            )?;
+                            yield Update::RunResult(sample.clone());
+                            yield Update::Done(lower.clone());
+                            return;
+                        }
+                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr);
                     }
                     Some(lower) => {
                         q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr);
@@ -524,7 +552,16 @@ fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr: bo
 
     let q_diff = worse_q.q - better_q.q;
     let lerp = (worse_q.q as f32 - q_diff as f32 * vmaf_factor).round() as i64;
-    lerp.clamp(better_q.q + 1, worse_q.q - 1)
+    let lo = better_q.q + 1;
+    let hi = worse_q.q - 1;
+    if lo > hi {
+        // Target score is outside the range between the two samples.
+        if min_vmaf > better_score {
+            return better_q.q - 1;
+        }
+        return worse_q.q;
+    }
+    lerp.clamp(lo, hi)
 }
 
 /// sample_progress: [0, 1]
@@ -532,12 +569,14 @@ pub fn guess_progress(run: usize, sample_progress: f32, thorough: bool) -> f64 {
     let total_runs_guess = match () {
         // Guess 6 iterations for a "thorough" search
         _ if thorough && run < 7 => 6.0,
-        // Guess 4 iterations initially
-        _ if run < 5 => 4.0,
+        // Guess 5 iterations initially
+        _ if run < 6 => 5.0,
         // Otherwise guess next will work
         _ => run as f64,
     };
-    ((run - 1) as f64 + sample_progress as f64) * BAR_LEN as f64 / total_runs_guess
+    let sample_progress = sample_progress.clamp(0.0, 1.0) as f64;
+    (((run - 1) as f64 + sample_progress) * BAR_LEN as f64 / total_runs_guess)
+        .min(BAR_LEN as f64)
 }
 
 /// Conversion logic for integer "q" values used in the crf search.
@@ -1045,6 +1084,7 @@ mod crf_search_tests {
         let args = search_args_with_crf_range(Some(95.0), None, true, Some(24.0), Some(26.0));
         let _guard = MockGuard::set(move |crf| {
             let vmaf = match crf.round() as i32 {
+                24 => 96.0,
                 25 => 93.0,
                 26 => 92.0,
                 _ => 80.0,
@@ -1164,7 +1204,11 @@ mod crf_search_tests {
     async fn non_thorough_rejects_score_above_tolerance_band() {
         let min_score = 95.0;
         let args = search_args(Some(min_score), None, false);
-        let _guard = MockGuard::set(move |_crf| mock_output(Some(min_score + 0.15), None, 50.0));
+        let _guard = MockGuard::set(move |crf| {
+            // Higher CRF → slightly lower VMAF so the search can refine after the first hit.
+            let score = min_score + 0.15 - (crf - 20.0) * 0.01;
+            mock_output(Some(score), None, 50.0)
+        });
 
         let updates = collect_run(args, test_probe()).await.expect("run");
         let done = last_done(&updates).expect("expected Done");

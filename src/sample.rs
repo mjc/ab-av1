@@ -38,7 +38,9 @@ pub fn sample_dest_path(
 
 /// Whether ffmpeg copy should retry with `-fflags +genpts`.
 pub fn unknown_timestamp_retry(stderr: &[u8]) -> bool {
-    String::from_utf8_lossy(stderr).contains("Can't write packet with unknown timestamp")
+    String::from_utf8_lossy(stderr)
+        .to_ascii_lowercase()
+        .contains("can't write packet with unknown timestamp")
 }
 
 /// Build the primary ffmpeg copy command (without genpts retry flags).

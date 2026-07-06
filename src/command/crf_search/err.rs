@@ -1,4 +1,5 @@
 use crate::command::crf_search::Sample;
+use crate::float::TerseF32;
 use std::fmt;
 
 #[derive(Debug)]
@@ -38,7 +39,9 @@ impl From<tokio::task::JoinError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoGoodCrf { .. } => "Failed to find a suitable crf".fmt(f),
+            Self::NoGoodCrf { last } => {
+                write!(f, "Failed to find a suitable crf (last crf {})", TerseF32(last.crf))
+            }
             Self::Other(err) => err.fmt(f),
         }
     }
@@ -92,7 +95,7 @@ mod tests {
         // assert
         assert!(ok.is_ok());
         assert!(matches!(err, Error::NoGoodCrf { .. }));
-        assert_eq!(err.to_string(), "Failed to find a suitable crf");
+        assert_eq!(err.to_string(), "Failed to find a suitable crf (last crf 32)");
     }
 
     #[test]

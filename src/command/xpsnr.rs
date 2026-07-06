@@ -120,14 +120,20 @@ pub fn lavfi(ref_vfilter: Option<&str>, pix_fmt: Option<PixelFormat>) -> String 
         }
 
         lavfi.push_str(old_name);
+        let mut has_filter = false;
         if let Some(pix_fmt) = pix_fmt {
             _ = write!(lavfi, "format={pix_fmt}");
+            has_filter = true;
         }
         if let Some(vf) = vfilter {
-            if pix_fmt.is_some() {
+            if has_filter {
                 lavfi.push(',');
             }
             lavfi.push_str(vf);
+            has_filter = true;
+        }
+        if has_filter {
+            lavfi.push_str(",setpts=PTS-STARTPTS,settb=AVTB");
         }
         lavfi.push_str(new_name);
         lavfi.push(';');
@@ -136,8 +142,8 @@ pub fn lavfi(ref_vfilter: Option<&str>, pix_fmt: Option<PixelFormat>) -> String 
 
     let mut lavfi = String::new();
 
-    let ref_stream = add_filter(&mut lavfi, "[0:v]", "[ref]", ref_vfilter, pix_fmt);
-    let dis_stream = add_filter(&mut lavfi, "[1:v]", "[dis]", None, pix_fmt);
+    let ref_stream = add_filter(&mut lavfi, "[1:v]", "[ref]", ref_vfilter, pix_fmt);
+    let dis_stream = add_filter(&mut lavfi, "[0:v]", "[dis]", None, pix_fmt);
     lavfi.push_str(ref_stream);
     lavfi.push_str(dis_stream);
     lavfi.push_str("xpsnr");
@@ -146,15 +152,15 @@ pub fn lavfi(ref_vfilter: Option<&str>, pix_fmt: Option<PixelFormat>) -> String 
 
 #[test]
 fn test_lavfi_default() {
-    assert_eq!(lavfi(None, None), "[0:v][1:v]xpsnr");
+    assert_eq!(lavfi(None, None), "[1:v][0:v]xpsnr");
 }
 
 #[test]
 fn test_lavfi_ref_vfilter() {
     assert_eq!(
         lavfi(Some("scale=1280:-1"), None),
-        "[0:v]scale=1280:-1[ref];\
-         [ref][1:v]xpsnr"
+        "[1:v]scale=1280:-1,setpts=PTS-STARTPTS,settb=AVTB[ref];\
+         [ref][0:v]xpsnr"
     );
 }
 
@@ -162,8 +168,8 @@ fn test_lavfi_ref_vfilter() {
 fn test_lavfi_pixel_format() {
     assert_eq!(
         lavfi(None, Some(PixelFormat::Yuv420p10le)),
-        "[0:v]format=yuv420p10le[ref];\
-         [1:v]format=yuv420p10le[dis];\
+        "[1:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[ref];\
+         [0:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [ref][dis]xpsnr"
     );
 }
@@ -172,8 +178,8 @@ fn test_lavfi_pixel_format() {
 fn test_lavfi_all() {
     assert_eq!(
         lavfi(Some("scale=640:-1"), Some(PixelFormat::Yuv420p10le)),
-        "[0:v]format=yuv420p10le,scale=640:-1[ref];\
-         [1:v]format=yuv420p10le[dis];\
+        "[1:v]format=yuv420p10le,scale=640:-1,setpts=PTS-STARTPTS,settb=AVTB[ref];\
+         [0:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [ref][dis]xpsnr"
     );
 }

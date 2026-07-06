@@ -18,8 +18,12 @@ pub async fn cached_encode(
     input_extension: Option<&OsStr>,
     input_size: u64,
     full_pass: bool,
+    dest_ext: &str,
     enc_args: &FfmpegEncodeArgs<'_>,
-    scoring: impl Hash,
+    score: &impl Hash,
+    vmaf: &impl Hash,
+    use_xpsnr: bool,
+    xpsnr_opts: &impl Hash,
 ) -> (Option<super::EncodeResult>, Option<Key>) {
     if !cache {
         return (None, None);
@@ -32,8 +36,9 @@ pub async fn cached_encode(
         input_extension,
         input_size,
         full_pass,
+        dest_ext,
         enc_args,
-        scoring,
+        (score, vmaf, use_xpsnr, xpsnr_opts),
     );
 
     let cached = tokio::task::spawn_blocking::<_, anyhow::Result<_>>(move || {
@@ -113,6 +118,7 @@ pub(crate) fn encode_cache_key(
     input_extension: Option<&OsStr>,
     input_size: u64,
     full_pass: bool,
+    dest_ext: &str,
     enc_args: &FfmpegEncodeArgs<'_>,
     scoring: impl Hash,
 ) -> Key {
@@ -126,6 +132,7 @@ pub(crate) fn encode_cache_key(
             input_extension,
             input_size,
             full_pass,
+            dest_ext,
         ),
         enc_args,
         scoring,
@@ -183,12 +190,13 @@ mod tests {
             }
         }
 
-        pub fn default_scoring() -> (ScoreArgs, Vmaf, Xpsnr) {
+        pub fn default_scoring(use_xpsnr: bool) -> (ScoreArgs, Vmaf, bool, Xpsnr) {
             (
                 ScoreArgs {
                     reference_vfilter: None,
                 },
                 Vmaf::default(),
+                use_xpsnr,
                 Xpsnr {
                     xpsnr_fps: 60.0,
                     xpsnr_pix_format: None,
@@ -202,7 +210,7 @@ mod tests {
             Option<&'static OsStr>,
             u64,
             Duration,
-            (ScoreArgs, Vmaf, Xpsnr),
+            (ScoreArgs, Vmaf, bool, Xpsnr),
         ) {
             (
                 Path::new("/tmp/.ab-av1-abc/sample0+20f.mkv"),
@@ -210,7 +218,7 @@ mod tests {
                 Some(OsStr::new("mkv")),
                 1_000_000_u64,
                 Duration::from_secs(3600),
-                default_scoring(),
+                default_scoring(false),
             )
         }
     }
@@ -227,14 +235,14 @@ mod tests {
         let extension = Some(std::ffi::OsStr::new("mkv"));
         let size = 1_000_000_u64;
         let enc = minimal_enc_args(input_a);
-        let scoring = default_scoring();
+        let scoring = default_scoring(false);
 
         // execute
         let key_a = encode_cache_key(
-            sample, input_a, duration, extension, size, false, &enc, &scoring,
+            sample, input_a, duration, extension, size, false, "mkv", &enc, &scoring,
         );
         let key_b = encode_cache_key(
-            sample, input_b, duration, extension, size, false, &enc, &scoring,
+            sample, input_b, duration, extension, size, false, "mkv", &enc, &scoring,
         );
 
         // assert
@@ -253,14 +261,14 @@ mod tests {
         let extension = Some(std::ffi::OsStr::new("mkv"));
         let size = 1_000_000_u64;
         let enc = minimal_enc_args(input);
-        let scoring = default_scoring();
+        let scoring = default_scoring(false);
 
         // execute
         let key_a = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc, &scoring,
+            sample, input, duration, extension, size, false, "mkv", &enc, &scoring,
         );
         let key_b = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc, &scoring,
+            sample, input, duration, extension, size, false, "mkv", &enc, &scoring,
         );
 
         // assert
@@ -303,10 +311,10 @@ mod tests {
         let mut enc_crf_frac = enc.clone();
         enc_crf_frac.crf = 30.5;
         let key_crf_a = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc_crf_a, &scoring,
+            sample, input, duration, extension, size, false, "mkv", &enc_crf_a, &scoring,
         );
         let key_crf_b = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc_crf_b, &scoring,
+            sample, input, duration, extension, size, false, "mkv", &enc_crf_b, &scoring,
         );
         let key_crf_frac = encode_cache_key(
             sample,
@@ -315,16 +323,17 @@ mod tests {
             extension,
             size,
             false,
+            "mkv",
             &enc_crf_frac,
             &scoring,
         );
 
         // execute — full_pass flag
         let key_full_pass_false = encode_cache_key(
-            sample, input, duration, extension, size, false, &enc, &scoring,
+            sample, input, duration, extension, size, false, "mkv", &enc, &scoring,
         );
         let key_full_pass_true = encode_cache_key(
-            sample, input, duration, extension, size, true, &enc, &scoring,
+            sample, input, duration, extension, size, true, "mkv", &enc, &scoring,
         );
 
         // execute — input duration
@@ -335,6 +344,7 @@ mod tests {
             extension,
             size,
             false,
+            "mkv",
             &enc,
             &scoring,
         );
@@ -345,6 +355,7 @@ mod tests {
             extension,
             size,
             false,
+            "mkv",
             &enc,
             &scoring,
         );
@@ -370,6 +381,7 @@ mod tests {
                 reference_vfilter: None,
             },
             Vmaf::default(),
+            true,
             Xpsnr {
                 xpsnr_fps: 60.0,
                 xpsnr_pix_format: Some(PixelFormat::Yuv420p),
@@ -380,6 +392,7 @@ mod tests {
                 reference_vfilter: None,
             },
             Vmaf::default(),
+            true,
             Xpsnr {
                 xpsnr_fps: 60.0,
                 xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
@@ -394,6 +407,7 @@ mod tests {
             extension,
             size,
             false,
+            "mkv",
             &enc,
             &scoring_420p,
         );
@@ -404,6 +418,7 @@ mod tests {
             extension,
             size,
             false,
+            "mkv",
             &enc,
             &scoring_420p10,
         );
@@ -422,15 +437,18 @@ mod tests {
             sample: &Path,
             input: &Path,
             enc: &FfmpegEncodeArgs<'_>,
-            _xpsnr_fps: f32,
+            xpsnr_fps: f32,
         ) -> Key {
-            // Production hashes only the bool xpsnr flag, not xpsnr_opts (ab-kgc.25).
             let scoring = (
                 ScoreArgs {
                     reference_vfilter: None,
                 },
                 Vmaf::default(),
                 true,
+                Xpsnr {
+                    xpsnr_fps,
+                    xpsnr_pix_format: None,
+                },
             );
             encode_cache_key(
                 sample,
@@ -439,6 +457,7 @@ mod tests {
                 Some(std::ffi::OsStr::new("mkv")),
                 1_000_000_u64,
                 false,
+                "mkv",
                 enc,
                 &scoring,
             )
@@ -467,9 +486,9 @@ mod tests {
             sample: &Path,
             input: &Path,
             enc: &FfmpegEncodeArgs<'_>,
-            _dest_ext: &str,
+            dest_ext: &str,
         ) -> Key {
-            let scoring = default_scoring();
+            let scoring = default_scoring(false);
             encode_cache_key(
                 sample,
                 input,
@@ -477,6 +496,7 @@ mod tests {
                 Some(std::ffi::OsStr::new("mkv")),
                 1_000_000_u64,
                 false,
+                dest_ext,
                 enc,
                 &scoring,
             )
@@ -498,13 +518,14 @@ mod tests {
         );
     }
 
-    /// Mirror production `cached_encode` scoring hash input: `(ScoreArgs, Vmaf, Xpsnr)`.
+    /// Mirror production `cached_encode` scoring hash input.
     fn production_cache_key(
         sample: &Path,
         input: &Path,
         enc: &FfmpegEncodeArgs<'_>,
         score: &ScoreArgs,
         vmaf: &Vmaf,
+        use_xpsnr: bool,
         xpsnr_opts: &Xpsnr,
     ) -> Key {
         encode_cache_key(
@@ -514,8 +535,9 @@ mod tests {
             Some(std::ffi::OsStr::new("mkv")),
             1_000_000_u64,
             false,
+            "mkv",
             enc,
-            (score, vmaf, xpsnr_opts),
+            (score, vmaf, use_xpsnr, xpsnr_opts),
         )
     }
 
@@ -533,20 +555,22 @@ mod tests {
             xpsnr_pix_format: None,
         };
 
-        // execute — ab-kgc.46: vmaf-only vs xpsnr-only (bool omitted from hash today)
+        // execute — ab-kgc.46: vmaf-only vs xpsnr-only
         let vmaf = Vmaf::default();
-        let key_vmaf_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
-        let key_xpsnr_only = production_cache_key(sample, input, &enc, &score, &vmaf, &xpsnr_opts);
+        let key_vmaf_only =
+            production_cache_key(sample, input, &enc, &score, &vmaf, false, &xpsnr_opts);
+        let key_xpsnr_only =
+            production_cache_key(sample, input, &enc, &score, &vmaf, true, &xpsnr_opts);
 
-        // execute — ab-kgc.54: vmaf-only vs xpsnr+and_vmaf
+        // execute — ab-kgc.54: xpsnr-only vs xpsnr+and_vmaf
         let vmaf_and = Vmaf {
             and_vmaf: Some(true),
             ..Vmaf::default()
         };
         let key_vmaf_and_only =
-            production_cache_key(sample, input, &enc, &score, &vmaf_and, &xpsnr_opts);
+            production_cache_key(sample, input, &enc, &score, &vmaf, true, &xpsnr_opts);
         let key_vmaf_and_both =
-            production_cache_key(sample, input, &enc, &score, &vmaf_and, &xpsnr_opts);
+            production_cache_key(sample, input, &enc, &score, &vmaf_and, true, &xpsnr_opts);
 
         // assert
         assert_ne!(
@@ -574,13 +598,13 @@ mod tests {
                 let duration = Duration::from_secs(3600);
                 let extension = Some(std::ffi::OsStr::new("mkv"));
                 let enc = minimal_enc_args(input);
-                let scoring = default_scoring();
+                let scoring = default_scoring(false);
 
                 let key_a = encode_cache_key(
-                    sample, input, duration, extension, size_a, false, &enc, &scoring,
+                    sample, input, duration, extension, size_a, false, "mkv", &enc, &scoring,
                 );
                 let key_b = encode_cache_key(
-                    sample, input, duration, extension, size_b, false, &enc, &scoring,
+                    sample, input, duration, extension, size_b, false, "mkv", &enc, &scoring,
                 );
                 prop_assert_ne!(key_a, key_b);
             }
