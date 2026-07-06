@@ -56,6 +56,8 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
 
     search.sample.set_extension_from_output(&output);
     search.validate()?;
+    let search = crf_search::CrfSearchConfig::from(search);
+    search.validate()?;
 
     let bar = ProgressBar::new(BAR_LEN).with_style(
         ProgressStyle::default_bar()

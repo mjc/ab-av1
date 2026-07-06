@@ -47,7 +47,7 @@ pub struct Args {
 pub struct VmafConfig {
     reference: PathBuf,
     distorted: PathBuf,
-    vmaf: args::Vmaf,
+    vmaf: args::VmafConfig,
     score: ScoreConfig,
 }
 
@@ -63,7 +63,7 @@ impl From<Args> for VmafConfig {
         Self {
             reference,
             distorted,
-            vmaf,
+            vmaf: vmaf.into(),
             score: score.into(),
         }
     }

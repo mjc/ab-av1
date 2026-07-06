@@ -20,10 +20,7 @@ pub async fn cached_encode(
     full_pass: bool,
     dest_ext: &str,
     enc_args: &FfmpegEncodeArgs<'_>,
-    score: &impl Hash,
-    vmaf: &impl Hash,
-    use_xpsnr: bool,
-    xpsnr_opts: &impl Hash,
+    scoring: &impl Hash,
 ) -> (Option<super::EncodeResult>, Option<Key>) {
     if !cache {
         return (None, None);
@@ -38,7 +35,7 @@ pub async fn cached_encode(
         full_pass,
         dest_ext,
         enc_args,
-        (score, vmaf, use_xpsnr, xpsnr_opts),
+        scoring,
     );
 
     let cached = tokio::task::spawn_blocking::<_, anyhow::Result<_>>(move || {

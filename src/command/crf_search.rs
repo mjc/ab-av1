@@ -148,6 +148,94 @@ pub struct Args {
     pub verbose: clap_verbosity_flag::Verbosity,
 }
 
+#[derive(Clone)]
+pub struct CrfSearchConfig {
+    pub args: args::Encode,
+    pub min_vmaf: Option<f32>,
+    pub min_xpsnr: Option<f32>,
+    pub max_encoded_percent: MaxEncodedPercent,
+    pub min_crf: Option<f32>,
+    pub max_crf: Option<f32>,
+    pub thorough: bool,
+    pub crf_increment: Option<CrfStep>,
+    pub high_crf_means_hq: Option<bool>,
+    pub cache: bool,
+    pub sample: args::Sample,
+    pub scoring: sample_encode::ScoringConfig,
+    pub verbose: clap_verbosity_flag::Verbosity,
+}
+
+impl CrfSearchConfig {
+    pub fn min_score(&self) -> f32 {
+        self.min_xpsnr.or(self.min_vmaf).unwrap_or(DEFAULT_MIN_VMAF)
+    }
+
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.min_vmaf.is_some() && self.min_xpsnr.is_some() {
+            return Err(ValidationError::BothMinScores);
+        }
+        if let (Some(min_crf), Some(max_crf)) = (self.min_crf, self.max_crf)
+            && min_crf >= max_crf
+        {
+            return Err(ValidationError::InvalidCrfBounds);
+        }
+        if self.min_vmaf.is_none()
+            && let Some(num) = self
+                .scoring
+                .vmaf
+                .vmaf_args
+                .iter()
+                .find_map(|arg| arg.parse::<f32>().ok())
+        {
+            return Err(ValidationError::PositionalVmafNumber { num });
+        }
+        Ok(())
+    }
+}
+
+impl From<Args> for CrfSearchConfig {
+    fn from(
+        Args {
+            args,
+            min_vmaf,
+            min_xpsnr,
+            max_encoded_percent,
+            min_crf,
+            max_crf,
+            thorough,
+            crf_increment,
+            high_crf_means_hq,
+            cache,
+            sample,
+            vmaf,
+            score,
+            xpsnr,
+            verbose,
+        }: Args,
+    ) -> Self {
+        Self {
+            args,
+            min_vmaf,
+            min_xpsnr,
+            max_encoded_percent,
+            min_crf,
+            max_crf,
+            thorough,
+            crf_increment,
+            high_crf_means_hq,
+            cache,
+            sample,
+            scoring: sample_encode::ScoringConfig {
+                score: score.into(),
+                vmaf: vmaf.into(),
+                xpsnr: min_xpsnr.is_some(),
+                xpsnr_opts: xpsnr.into(),
+            },
+            verbose,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum ValidationError {
     #[error("Only one of --min-vmaf and --min-xpsnr may be set")]
@@ -195,6 +283,7 @@ impl FromStr for MaxEncodedPercent {
 }
 
 impl Args {
+    #[cfg(test)]
     pub fn min_score(&self) -> f32 {
         self.min_xpsnr.or(self.min_vmaf).unwrap_or(DEFAULT_MIN_VMAF)
     }
@@ -235,14 +324,16 @@ pub async fn crf_search(mut args: Args) -> anyhow::Result<()> {
     let input_is_image = probe.is_image;
     args.sample
         .set_extension_from_input(&args.args.input, &args.args.encoder, &probe);
+    let config = CrfSearchConfig::from(args);
+    config.validate()?;
 
-    let min_score = args.min_score();
-    let max_encoded_percent = args.max_encoded_percent;
-    let thorough = args.thorough;
-    let enc_args = args.args.clone();
-    let verbose = args.verbose;
+    let min_score = config.min_score();
+    let max_encoded_percent = config.max_encoded_percent;
+    let thorough = config.thorough;
+    let enc_args = config.args.clone();
+    let verbose = config.verbose;
 
-    let mut run = pin!(run(args, probe.into()));
+    let mut run = pin!(run(config, probe.into()));
     while let Some(update) = run.next().await {
         let update = update.inspect_err(|e| {
             if let Error::NoGoodCrf { last } = e {
@@ -308,7 +399,7 @@ pub async fn crf_search(mut args: Args) -> anyhow::Result<()> {
 }
 
 pub fn run(
-    Args {
+    CrfSearchConfig {
         args,
         min_vmaf,
         min_xpsnr,
@@ -320,11 +411,9 @@ pub fn run(
         thorough,
         sample,
         cache,
-        vmaf,
-        score,
-        xpsnr,
+        scoring,
         verbose: _,
-    }: Args,
+    }: CrfSearchConfig,
     input_probe: Arc<Ffprobe>,
 ) -> impl Stream<Item = Result<Update, Error>> {
     async_stream::try_stream! {
@@ -361,16 +450,12 @@ pub fn run(
         assert!(min_q < max_q);
         let mut q = (min_q + max_q) / 2;
 
-        let mut args = sample_encode::Args {
+        let mut args = sample_encode::SampleEncodeConfig {
             args: args.clone(),
             crf: 0.0,
             sample: sample.clone(),
             cache,
-            stdout_format: sample_encode::StdoutFormat::Json,
-            vmaf: vmaf.clone(),
-            score: score.clone(),
-            xpsnr: min_xpsnr.is_some(),
-            xpsnr_opts: xpsnr,
+            scoring,
         };
 
         let mut crf_attempts = Vec::new();
@@ -875,8 +960,8 @@ pub enum Update {
 #[cfg(test)]
 mod crf_search_tests {
     use super::{
-        Args, CrfStep, Error, MaxEncodedPercent, Sample, Update, ValidationError, guess_progress,
-        output_search_score, run, test_hooks, vmaf_lerp_q,
+        Args, CrfSearchConfig, CrfStep, Error, MaxEncodedPercent, Sample, Update, ValidationError,
+        guess_progress, output_search_score, run, test_hooks, vmaf_lerp_q,
     };
     use crate::{
         command::{
@@ -980,7 +1065,7 @@ mod crf_search_tests {
 
         pub async fn collect_run(args: Args, probe: Arc<Ffprobe>) -> Result<Vec<Update>, Error> {
             let mut updates = Vec::new();
-            let mut stream = pin!(run(args, probe));
+            let mut stream = pin!(run(CrfSearchConfig::from(args), probe));
             while let Some(item) = stream.next().await {
                 updates.push(item?);
             }
@@ -1052,6 +1137,33 @@ mod crf_search_tests {
         assert!(
             !args.cache,
             "env default must disable cache when set to false"
+        );
+    }
+
+    #[test]
+    fn crf_search_config_lowers_score_args() {
+        let mut args = search_args(None, Some(90.0), true);
+        args.score.reference_vfilter = Some("scale=1280:-1".into());
+        args.vmaf.vmaf_args = vec!["n_subsample=4".into()];
+        args.xpsnr.xpsnr_fps = args::FrameRateOverride::new(0.0);
+
+        let config = CrfSearchConfig::from(args);
+
+        assert_eq!(
+            config.scoring.score.reference_vfilter.as_deref(),
+            Some("scale=1280:-1")
+        );
+        assert!(config.scoring.xpsnr);
+        assert_eq!(config.scoring.xpsnr_opts.fps(), None);
+        assert_eq!(
+            config
+                .scoring
+                .vmaf
+                .vmaf_args
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            ["n_subsample=4"]
         );
     }
 

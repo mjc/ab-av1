@@ -60,50 +60,15 @@ impl Default for Vmaf {
     }
 }
 
-impl std::hash::Hash for Vmaf {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.and_vmaf.hash(state);
-        self.vmaf_args.hash(state);
-        self.vmaf_scale.hash(state);
-        self.vmaf_fps.hash(state);
-    }
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct VmafConfig {
+    pub and_vmaf: Option<bool>,
+    pub vmaf_args: Vec<Arc<str>>,
+    pub vmaf_scale: VmafScale,
+    pub vmaf_fps: FrameRateOverride,
 }
 
-fn parse_vmaf_arg(arg: &str) -> anyhow::Result<Arc<str>> {
-    Ok(arg.to_owned().into())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Resolution {
-    width: u32,
-    height: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ResolutionError {
-    #[error("resolution width and height must be positive")]
-    Invalid,
-}
-
-impl Resolution {
-    pub fn try_new(width: u32, height: u32) -> Result<Self, ResolutionError> {
-        if width == 0 || height == 0 {
-            Err(ResolutionError::Invalid)
-        } else {
-            Ok(Self { width, height })
-        }
-    }
-
-    pub fn width(self) -> u32 {
-        self.width
-    }
-
-    pub fn height(self) -> u32 {
-        self.height
-    }
-}
-
-impl Vmaf {
+impl VmafConfig {
     pub fn fps(&self) -> Option<f32> {
         self.vmaf_fps.fps()
     }
@@ -186,6 +151,77 @@ impl Vmaf {
             }
             _ => None,
         }
+    }
+}
+
+impl From<Vmaf> for VmafConfig {
+    fn from(vmaf: Vmaf) -> Self {
+        Self {
+            and_vmaf: vmaf.and_vmaf,
+            vmaf_args: vmaf.vmaf_args,
+            vmaf_scale: vmaf.vmaf_scale,
+            vmaf_fps: vmaf.vmaf_fps,
+        }
+    }
+}
+
+impl std::hash::Hash for Vmaf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.and_vmaf.hash(state);
+        self.vmaf_args.hash(state);
+        self.vmaf_scale.hash(state);
+        self.vmaf_fps.hash(state);
+    }
+}
+
+fn parse_vmaf_arg(arg: &str) -> anyhow::Result<Arc<str>> {
+    Ok(arg.to_owned().into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Resolution {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResolutionError {
+    #[error("resolution width and height must be positive")]
+    Invalid,
+}
+
+impl Resolution {
+    pub fn try_new(width: u32, height: u32) -> Result<Self, ResolutionError> {
+        if width == 0 || height == 0 {
+            Err(ResolutionError::Invalid)
+        } else {
+            Ok(Self { width, height })
+        }
+    }
+
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    pub fn height(self) -> u32 {
+        self.height
+    }
+}
+
+#[cfg(test)]
+impl Vmaf {
+    pub fn fps(&self) -> Option<f32> {
+        self.vmaf_fps.fps()
+    }
+
+    /// Returns ffmpeg `filter_complex`/`lavfi` value for calculating vmaf.
+    pub fn ffmpeg_lavfi(
+        &self,
+        distorted_res: Option<(u32, u32)>,
+        pix_fmt: Option<PixelFormat>,
+        ref_vfilter: Option<&str>,
+    ) -> String {
+        VmafConfig::from(self.clone()).ffmpeg_lavfi(distorted_res, pix_fmt, ref_vfilter)
     }
 }
 

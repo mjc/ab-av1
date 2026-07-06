@@ -205,6 +205,27 @@ impl Xpsnr {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
+pub struct XpsnrConfig {
+    pub xpsnr_fps: FrameRateOverride,
+    pub xpsnr_pix_format: Option<PixelFormat>,
+}
+
+impl XpsnrConfig {
+    pub fn fps(&self) -> Option<f32> {
+        self.xpsnr_fps.fps()
+    }
+}
+
+impl From<Xpsnr> for XpsnrConfig {
+    fn from(xpsnr: Xpsnr) -> Self {
+        Self {
+            xpsnr_fps: xpsnr.xpsnr_fps,
+            xpsnr_pix_format: xpsnr.xpsnr_pix_format,
+        }
+    }
+}
+
 impl Default for Xpsnr {
     fn default() -> Self {
         Self {
