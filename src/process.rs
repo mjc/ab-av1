@@ -147,6 +147,12 @@ pub struct Chunks {
     trunc_next_push: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChunkLineError {
+    #[error("chunk line is not valid UTF-8")]
+    Utf8,
+}
+
 impl Chunks {
     /// Append a chunk.
     ///
@@ -205,18 +211,24 @@ impl Chunks {
     }
 
     pub fn rfind_line_map<'a, T>(&'a self, f: impl Fn(&'a str) -> Option<T>) -> Option<T> {
+        self.rfind_line_map_checked(f).ok().flatten()
+    }
+
+    pub fn rfind_line_map_checked<'a, T>(
+        &'a self,
+        f: impl Fn(&'a str) -> Option<T>,
+    ) -> Result<Option<T>, ChunkLineError> {
         let lines = self
             .out
             .rsplit(|b| *b == b'\n')
             .flat_map(|l| l.rsplit(|b| *b == b'\r'));
         for line in lines {
-            if let Ok(line) = std::str::from_utf8(line)
-                && let Some(out) = f(line)
-            {
-                return Some(out);
+            let line = std::str::from_utf8(line).map_err(|_| ChunkLineError::Utf8)?;
+            if let Some(out) = f(line) {
+                return Ok(Some(out));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Returns last non-empty line, if any.
@@ -375,6 +387,17 @@ fn parse_ffmpeg_stream_sizes() {
             subtitle: 0,
             other: 0,
         })
+    );
+}
+
+#[test]
+fn chunks_checked_line_map_reports_malformed_utf8() {
+    let mut chunks = Chunks::default();
+    chunks.push(b"good line\nbad \xff line\n");
+
+    assert_eq!(
+        chunks.rfind_line_map_checked(|line| line.contains("missing").then_some(line)),
+        Err(ChunkLineError::Utf8)
     );
 }
 

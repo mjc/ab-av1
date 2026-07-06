@@ -1,7 +1,8 @@
 //! vmaf logic
 use crate::process::{Chunks, CommandExt, FfmpegOut, managed::ManagedProcess};
 use crate::score_stream::{
-    ParsedScore, Score, ScoreError, ScoreStreamParse, build_score_ffmpeg_command, run_score_stream,
+    ParsedScore, Score, ScoreError, ScoreStreamParse, build_score_ffmpeg_command,
+    parse_score_chunk, run_score_stream,
 };
 use anyhow::Context;
 use log::{debug, info};
@@ -74,19 +75,11 @@ impl VmafOut {
     }
 
     fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
-        chunks.push(chunk);
-
-        if let Some(parsed) = chunks.rfind_line_map(|line| parse_vmaf_score_line(line).hit()) {
-            match parsed {
-                ParsedScore::Score(score) => return Some(Self::Done(score.get())),
-                ParsedScore::Invalid(_) => return None,
-                ParsedScore::Miss => {}
-            }
+        match parse_score_chunk(chunk, chunks, parse_vmaf_score_line) {
+            Ok(Some(event)) => Some(Self::from_parse(event)),
+            Ok(None) => None,
+            Err(err) => Some(Self::Err(err.into())),
         }
-        if let Some(progress) = FfmpegOut::try_parse(chunks.last_line()) {
-            return Some(Self::Progress(progress));
-        }
-        None
     }
 }
 
@@ -151,6 +144,14 @@ mod test {
     }
 
     #[test]
+    fn parse_vmaf_score_line_success_does_not_allocate() {
+        crate::test_support::assert_no_allocations(|| {
+            let parsed = parse_vmaf_score_line("[Parsed_libvmaf_0 @ 0x1] VMAF score: 88.125000");
+            std::hint::black_box(parsed);
+        });
+    }
+
+    #[test]
     fn parse_vmaf_score_line_rejects_nan() {
         assert_eq!(
             parse_vmaf_score_line("[Parsed_libvmaf_0 @ 0x1] VMAF score: NaN"),
@@ -164,6 +165,15 @@ mod test {
             parse_vmaf_score_line("[Parsed_libvmaf_0 @ 0x1] VMAF score: nope"),
             ParsedScore::Miss
         );
+    }
+
+    #[test]
+    fn vmaf_chunk_parser_reports_malformed_utf8() {
+        let mut chunks = Chunks::default();
+        let out =
+            VmafOut::try_from_chunk(b"[Parsed_libvmaf_0 @ 0x1] VMAF score: \xff\n", &mut chunks);
+
+        assert!(matches!(out, Some(VmafOut::Err(_))));
     }
 
     #[test]

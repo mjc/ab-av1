@@ -54,6 +54,7 @@ opt-level = "s"
 strip = true
 
 [dev-dependencies]
+allocation-counter = "0.8.1"
 proptest = "1"
 rstest = "0.24"
 serial_test = "3"

@@ -306,10 +306,10 @@ pub fn run(
             .unwrap_or_else(|| args.encoder.default_crf_increment())
             .max(0.001);
 
-        let q_conv = QualityConverter {
-            crf_increment,
-            high_crf_means_hq: high_crf_means_hq.unwrap_or_else(|| args.encoder.high_crf_means_hq()),
-        };
+        let q_conv = QualityConverter::new(
+            CrfStep::try_new(crf_increment).expect("CRF increment must be positive after clamp"),
+            high_crf_means_hq.unwrap_or_else(|| args.encoder.high_crf_means_hq()),
+        );
 
         let (min_q, max_q) = q_conv.min_max_q(min_crf, max_crf);
         assert!(min_q < max_q);
@@ -584,7 +584,61 @@ struct QualityConverter {
     crf_increment: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Crf(f32);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CrfStep(f32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualityIndex(i64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum CrfValueError {
+    #[error("CRF value must be finite")]
+    InvalidCrf,
+    #[error("CRF step must be finite and positive")]
+    InvalidStep,
+}
+
+impl Crf {
+    fn try_new(crf: f32) -> Result<Self, CrfValueError> {
+        crf.is_finite()
+            .then_some(Self(crf))
+            .ok_or(CrfValueError::InvalidCrf)
+    }
+
+    fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl CrfStep {
+    fn try_new(step: f32) -> Result<Self, CrfValueError> {
+        (step.is_finite() && step > 0.0)
+            .then_some(Self(step))
+            .ok_or(CrfValueError::InvalidStep)
+    }
+
+    fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl QualityIndex {
+    fn get(self) -> i64 {
+        self.0
+    }
+}
+
 impl QualityConverter {
+    fn new(crf_increment: CrfStep, high_crf_means_hq: bool) -> Self {
+        Self {
+            crf_increment: crf_increment.get(),
+            high_crf_means_hq,
+        }
+    }
+
     /// Calculate "q" as an integer quality value related to crf.
     ///
     /// # Example
@@ -595,20 +649,30 @@ impl QualityConverter {
     /// * crf=33.5, inc=0.1 -> q=-335
     /// * crf=27, inc=1 -> q=-27
     pub fn q(&self, crf: f32) -> i64 {
-        let q = (f64::from(crf) / f64::from(self.crf_increment)).round() as i64;
+        self.quality_index(Crf::try_new(crf).expect("CRF must be finite"))
+            .get()
+    }
+
+    fn quality_index(&self, crf: Crf) -> QualityIndex {
+        let q = (f64::from(crf.get()) / f64::from(self.crf_increment)).round() as i64;
         match self.high_crf_means_hq {
-            true => -q,
-            false => q,
+            true => QualityIndex(-q),
+            false => QualityIndex(q),
         }
     }
 
     /// Calculate crf back from "q".
     pub fn crf(&self, q: i64) -> f32 {
+        self.crf_from_quality_index(QualityIndex(q)).get()
+    }
+
+    fn crf_from_quality_index(&self, q: QualityIndex) -> Crf {
         let pos_q = match self.high_crf_means_hq {
-            true => -q,
-            false => q,
+            true => -q.get(),
+            false => q.get(),
         };
-        ((pos_q as f64) * f64::from(self.crf_increment)) as _
+        Crf::try_new(((pos_q as f64) * f64::from(self.crf_increment)) as _)
+            .expect("quality index conversion must produce finite CRF")
     }
 
     pub fn min_max_q(&self, min_crf: f32, max_crf: f32) -> (i64, i64) {
@@ -621,30 +685,42 @@ impl QualityConverter {
 
 #[test]
 fn q_crf_conversions() {
-    let mut q_conv = QualityConverter {
-        crf_increment: 0.1,
-        high_crf_means_hq: false,
-    };
+    let mut q_conv = QualityConverter::new(CrfStep::try_new(0.1).unwrap(), false);
 
     assert_eq!(q_conv.q(33.5), 335);
     assert_eq!(q_conv.crf(335), 33.5);
 
-    q_conv.crf_increment = 1.0;
+    q_conv = QualityConverter::new(CrfStep::try_new(1.0).unwrap(), false);
     assert_eq!(q_conv.q(27.0), 27);
     assert_eq!(q_conv.crf(27), 27.0);
 }
 
 #[test]
+fn crf_step_rejects_non_finite_and_non_positive_values() {
+    assert!(CrfStep::try_new(0.0).is_err());
+    assert!(CrfStep::try_new(-1.0).is_err());
+    assert!(CrfStep::try_new(f32::NAN).is_err());
+}
+
+#[test]
+fn quality_converter_typed_round_trip_preserves_crf() {
+    let q_conv = QualityConverter::new(CrfStep::try_new(0.1).unwrap(), false);
+    let crf = Crf::try_new(33.5).unwrap();
+
+    let q = q_conv.quality_index(crf);
+
+    assert_eq!(q.get(), 335);
+    assert_eq!(q_conv.crf_from_quality_index(q).get(), 33.5);
+}
+
+#[test]
 fn q_crf_conversions_high_crf_means_hq() {
-    let mut q_conv = QualityConverter {
-        crf_increment: 0.1,
-        high_crf_means_hq: true,
-    };
+    let mut q_conv = QualityConverter::new(CrfStep::try_new(0.1).unwrap(), true);
 
     assert_eq!(q_conv.q(33.5), -335);
     assert_eq!(q_conv.crf(-335), 33.5);
 
-    q_conv.crf_increment = 1.0;
+    q_conv = QualityConverter::new(CrfStep::try_new(1.0).unwrap(), true);
     assert_eq!(q_conv.q(27.0), -27);
     assert_eq!(q_conv.crf(-27), 27.0);
 }

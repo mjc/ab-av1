@@ -1,7 +1,8 @@
 //! xpsnr logic
 use crate::process::{Chunks, CommandExt, FfmpegOut, managed::ManagedProcess};
 use crate::score_stream::{
-    ParsedScore, Score, ScoreError, ScoreStreamParse, build_score_ffmpeg_command, run_score_stream,
+    ParsedScore, Score, ScoreError, ScoreStreamParse, build_score_ffmpeg_command,
+    parse_buffered_score, run_score_stream,
 };
 use anyhow::Context;
 use log::{debug, info};
@@ -67,31 +68,35 @@ impl XpsnrOut {
     }
 
     fn try_parse_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<ScoreStreamParse> {
-        Self::try_from_chunk(chunk, chunks).map(|out| match out {
-            Self::Progress(progress) => ScoreStreamParse::Progress(progress),
-            Self::Done(score) => ScoreStreamParse::LogicalDone(Score::new(score)),
-            Self::Err(err) => unreachable!("pure XPSNR parser returned error event: {err}"),
-        })
+        match try_parse_xpsnr_score_chunk(chunk, chunks) {
+            Ok(event) => event,
+            Err(err) => unreachable!("pure XPSNR parser returned error event: {err}"),
+        }
     }
 
     fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
-        chunks.push(chunk);
-
-        if let Some(parsed) = chunks
-            .rfind_line_map(|line| score_from_minimum_line(line).hit())
-            .or_else(|| chunks.rfind_line_map(|line| score_from_average_line(line).hit()))
-        {
-            match parsed {
-                ParsedScore::Score(score) => return Some(Self::Done(score.get())),
-                ParsedScore::Invalid(_) => return None,
-                ParsedScore::Miss => {}
-            }
+        match try_parse_xpsnr_score_chunk(chunk, chunks) {
+            Ok(Some(event)) => Some(Self::from_parse(event)),
+            Ok(None) => None,
+            Err(err) => Some(Self::Err(err.into())),
         }
-        if let Some(progress) = FfmpegOut::try_parse(chunks.last_line()) {
-            return Some(Self::Progress(progress));
-        }
-        None
     }
+}
+
+fn try_parse_xpsnr_score_chunk(
+    chunk: &[u8],
+    chunks: &mut Chunks,
+) -> Result<Option<ScoreStreamParse>, crate::process::ChunkLineError> {
+    chunks.push(chunk);
+
+    let score = match parse_buffered_score(chunks, score_from_minimum_line)? {
+        Some(score) => Some(score),
+        None => parse_buffered_score(chunks, score_from_average_line)?,
+    };
+    if let Some(score) = score {
+        return Ok(Some(ScoreStreamParse::LogicalDone(score)));
+    }
+    Ok(FfmpegOut::try_parse(chunks.last_line()).map(ScoreStreamParse::Progress))
 }
 
 // E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
@@ -264,6 +269,16 @@ mod test {
     }
 
     #[test]
+    fn parse_xpsnr_score_line_success_does_not_allocate() {
+        crate::test_support::assert_no_allocations(|| {
+            let parsed = parse_xpsnr_score_line(
+                "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)",
+            );
+            std::hint::black_box(parsed);
+        });
+    }
+
+    #[test]
     fn parse_xpsnr_score_line_rejects_nan_minimum() {
         assert_eq!(
             parse_xpsnr_score_line(
@@ -279,6 +294,17 @@ mod test {
             parse_xpsnr_score_line("[Parsed_xpsnr_0 @ 0x1] XPSNR  y: nope"),
             ParsedScore::Miss
         );
+    }
+
+    #[test]
+    fn xpsnr_chunk_parser_reports_malformed_utf8() {
+        let mut chunks = Chunks::default();
+        let out = XpsnrOut::try_from_chunk(
+            b"[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 33.0  (minimum: \xff)\n",
+            &mut chunks,
+        );
+
+        assert!(matches!(out, Some(XpsnrOut::Err(_))));
     }
 
     #[test]

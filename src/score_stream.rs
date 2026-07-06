@@ -1,5 +1,5 @@
 use crate::process::{
-    Chunks, CommandExt, FfmpegOut, cmd_err, exit_ok_stderr,
+    ChunkLineError, Chunks, CommandExt, FfmpegOut, cmd_err, exit_ok_stderr,
     managed::{ManagedEvent, ManagedProcess},
 };
 use std::path::Path;
@@ -61,6 +61,31 @@ impl Score {
     pub fn get(self) -> f32 {
         self.0
     }
+}
+
+pub(crate) fn parse_score_chunk(
+    chunk: &[u8],
+    chunks: &mut Chunks,
+    parse_score_line: impl Fn(&str) -> ParsedScore,
+) -> Result<Option<ScoreStreamParse>, ChunkLineError> {
+    chunks.push(chunk);
+
+    if let Some(score) = parse_buffered_score(chunks, parse_score_line)? {
+        return Ok(Some(ScoreStreamParse::LogicalDone(score)));
+    }
+    Ok(FfmpegOut::try_parse(chunks.last_line()).map(ScoreStreamParse::Progress))
+}
+
+pub(crate) fn parse_buffered_score(
+    chunks: &Chunks,
+    parse_score_line: impl Fn(&str) -> ParsedScore,
+) -> Result<Option<Score>, ChunkLineError> {
+    Ok(
+        match chunks.rfind_line_map_checked(|line| parse_score_line(line).hit())? {
+            Some(ParsedScore::Score(score)) => Some(score),
+            Some(ParsedScore::Invalid(_) | ParsedScore::Miss) | None => None,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -215,6 +240,27 @@ mod tests {
             completion,
             LogicalScoreCompletion::Done(Score::new(97.5)),
             "duplicate score lines must not overwrite the first logical score"
+        );
+    }
+
+    #[test]
+    fn parse_score_chunk_handles_split_score_lines() {
+        let mut chunks = Chunks::default();
+        let parse_score_line = |line: &str| {
+            line.strip_prefix("metric score: ")
+                .and_then(|score| score.parse().ok())
+                .map(Score::new)
+                .map(ParsedScore::Score)
+                .unwrap_or(ParsedScore::Miss)
+        };
+
+        assert_eq!(
+            parse_score_chunk(b"metric ", &mut chunks, parse_score_line),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_score_chunk(b"score: 91.25\n", &mut chunks, parse_score_line),
+            Ok(Some(ScoreStreamParse::LogicalDone(Score::new(91.25))))
         );
     }
 

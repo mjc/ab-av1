@@ -64,6 +64,10 @@ impl FfmpegEncodeArgs<'_> {
     }
 }
 
+fn ffmpeg_arg_values(args: &[Arc<String>]) -> impl ExactSizeIterator<Item = &str> {
+    args.iter().map(|arg| arg.as_str())
+}
+
 /// Encode a sample.
 pub fn encode_sample(
     FfmpegEncodeArgs {
@@ -95,10 +99,10 @@ pub fn encode_sample(
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-nostdin")
         .arg("-y")
-        .args(input_args.iter().map(|a| &**a))
+        .args(ffmpeg_arg_values(&input_args))
         .arg2("-i", input)
         .arg2("-c:v", &*vcodec)
-        .args(output_args.iter().map(|a| &**a))
+        .args(ffmpeg_arg_values(&output_args))
         // Avoid dropping or duplicating frames as this may negatively affect input/output analysis
         .arg2("-fps_mode", "passthrough")
         .arg2(vcodec.crf_arg(), vcodec.crf(crf))
@@ -165,7 +169,7 @@ pub fn encode(
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-nostdin")
-        .args(input_args.iter().map(|a| &**a))
+        .args(ffmpeg_arg_values(&input_args))
         .arg("-y")
         .arg2("-i", input)
         .arg2("-map", map)
@@ -174,7 +178,7 @@ pub fn encode(
         .arg2("-metadata", metadata)
         .arg2("-c:a", audio_codec)
         .arg2("-c:s", "copy")
-        .args(output_args.iter().map(|a| &**a))
+        .args(ffmpeg_arg_values(&output_args))
         .arg2(vcodec.crf_arg(), vcodec.crf(crf))
         .arg2_opt("-pix_fmt", pix_fmt.map(|v| v.as_str()))
         .arg2_opt(vcodec.preset_arg(), preset)
@@ -460,6 +464,22 @@ mod tests {
         // assert
         assert_ne!(base_hash.finish(), output_hash.finish());
         assert_ne!(base_hash.finish(), input_hash.finish());
+    }
+
+    #[test]
+    fn ffmpeg_arg_values_iterates_borrowed_arg_views() {
+        let first = Arc::new(String::from("-threads"));
+        let second = Arc::new(String::from("4"));
+        let args = vec![Arc::clone(&first), Arc::clone(&second)];
+
+        let borrowed = ffmpeg_arg_values(&args).collect::<Vec<_>>();
+
+        assert_eq!(borrowed, vec!["-threads", "4"]);
+        assert_eq!(ffmpeg_arg_values(&args).len(), 2);
+        assert!(
+            std::ptr::eq(borrowed[0].as_ptr(), first.as_str().as_ptr()),
+            "argument iteration must borrow existing storage"
+        );
     }
 
     #[rstest]

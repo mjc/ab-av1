@@ -8,6 +8,8 @@ mod process;
 mod sample;
 mod score_stream;
 mod temporary;
+#[cfg(test)]
+mod test_support;
 mod vmaf;
 mod xpsnr;
 
