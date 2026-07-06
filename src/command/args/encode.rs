@@ -8,6 +8,7 @@ use clap::{Parser, ValueHint};
 #[cfg(test)]
 use rstest::rstest;
 use std::{
+    borrow::Cow,
     fmt::{self, Write},
     path::PathBuf,
     str::FromStr,
@@ -244,6 +245,13 @@ impl<'a> PassthroughArg<'a> {
         [Some(self.option), self.value].into_iter().flatten()
     }
 
+    fn hint_value(self) -> Cow<'a, str> {
+        match self.value {
+            Some(value) => Cow::Owned(format!("{}={value}", self.option.trim_start_matches('-'))),
+            None => Cow::Borrowed(self.option.trim_start_matches('-')),
+        }
+    }
+
     fn is_svtav1_params(self) -> bool {
         self.option.trim_start_matches('-') == "svtav1-params"
     }
@@ -253,14 +261,44 @@ fn owned_arg(arg: &str) -> Arc<String> {
     arg.to_owned().into()
 }
 
-fn collect_passthrough_args<'a, T>(args: impl IntoIterator<Item = &'a T>) -> Vec<Arc<String>>
+struct CollectedPassthroughArgs {
+    args: Vec<Arc<String>>,
+    omitted_defaults: Vec<&'static str>,
+}
+
+fn collect_passthrough_args<'a, T>(
+    args: impl IntoIterator<Item = &'a T>,
+    omit_default_value_for: &'static [&'static str],
+) -> CollectedPassthroughArgs
 where
     T: AsRef<str> + 'a,
 {
-    args.into_iter()
-        .flat_map(|arg| PassthroughArg::parse(arg.as_ref()).values())
+    let mut omitted_defaults = Vec::new();
+
+    let args = args
+        .into_iter()
+        .map(|arg| PassthroughArg::parse(arg.as_ref()))
+        .filter(|arg| {
+            if arg.value == Some("none")
+                && let Some(name) = omit_default_value_for
+                    .iter()
+                    .copied()
+                    .find(|name| *name == arg.option)
+            {
+                omitted_defaults.push(name);
+                return false;
+            }
+
+            true
+        })
+        .flat_map(PassthroughArg::values)
         .map(owned_arg)
-        .collect()
+        .collect();
+
+    CollectedPassthroughArgs {
+        args,
+        omitted_defaults,
+    }
 }
 
 impl Encode {
@@ -307,12 +345,15 @@ impl Encode {
             write!(hint, " --svt {arg}").unwrap();
         }
         for arg in enc_input_args {
-            let arg = arg.as_str().trim_start_matches('-');
-            write!(hint, " --enc-input {arg}").unwrap();
+            write!(
+                hint,
+                " --enc-input {}",
+                PassthroughArg::parse(arg.as_str()).hint_value()
+            )
+            .unwrap();
         }
         for arg in enc_args {
-            let arg = arg.as_str().trim_start_matches('-');
-            write!(hint, " --enc {arg}").unwrap();
+            write!(hint, " --enc {}", PassthroughArg::parse(arg.as_str()).hint_value()).unwrap();
         }
 
         hint
@@ -395,29 +436,24 @@ impl Encode {
             _ => None,
         });
 
-        let mut input_args = collect_passthrough_args(&self.enc_input_args);
+        let mut input_args = collect_passthrough_args(
+            &self.enc_input_args,
+            &["-hwaccel", "-hwaccel_output_format"],
+        );
 
         for (name, val) in self.encoder.default_ffmpeg_input_args() {
-            if !input_args.iter().any(|arg| &**arg == name) {
-                input_args.push(name.to_string().into());
-                input_args.push(val.to_string().into());
-            }
-        }
-
-        // support setting possibly default args as "none" to omit them
-        for (name, _) in self.encoder.default_ffmpeg_input_args() {
-            if let Some(idx) = input_args
-                .windows(2)
-                .position(|w| *w[0] == *name && *w[1] == "none")
+            if !input_args.omitted_defaults.contains(name)
+                && !input_args.args.iter().any(|arg| &**arg == name)
             {
-                input_args.splice(idx..idx + 2, []);
+                input_args.args.push(name.to_string().into());
+                input_args.args.push(val.to_string().into());
             }
         }
 
         validate_encoder_passthrough(
             true,
             false,
-            input_args.iter().map(|arg| arg.as_str()),
+            input_args.args.iter().map(|arg| arg.as_str()),
             args.iter().map(|arg| arg.as_str()),
         )
         .map_err(anyhow::Error::new)?;
@@ -430,7 +466,7 @@ impl Encode {
             crf,
             preset,
             output_args: args,
-            input_args,
+            input_args: input_args.args,
             video_only: false,
         })
     }
@@ -908,6 +944,21 @@ fn passthrough_arg_values_split_once_and_keep_hyphen_values() {
         PassthroughArg::parse("-dn").values().collect::<Vec<_>>(),
         ["-dn"]
     );
+}
+
+#[test]
+fn collect_passthrough_args_omits_none_for_default_inputs() {
+    let args = [
+        EncoderInputArg::from("-hwaccel=none"),
+        EncoderInputArg::from("-hwaccel_output_format=none"),
+    ];
+
+    assert!(collect_passthrough_args(
+        &args,
+        &["-hwaccel", "-hwaccel_output_format"]
+    )
+    .args
+    .is_empty());
 }
 
 // ab-kgc.30: CLI docs promise 0.1 increment for libvpx-vp9
