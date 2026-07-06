@@ -1,14 +1,27 @@
 //! xpsnr logic
-use crate::process::{Chunks, CommandExt, FfmpegOut, cmd_err, exit_ok_stderr};
+use crate::process::{Chunks, CommandExt, FfmpegOut, managed::ManagedProcess};
+use crate::score_stream::{
+    ParsedScore, Score, ScoreError, ScoreStreamParse, build_score_ffmpeg_command,
+    parse_buffered_score, run_score_stream,
+};
 use anyhow::Context;
 use log::{debug, info};
-use std::{path::Path, process::Stdio};
+use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
-use tokio_process_stream::{Item, ProcessChunkStream};
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::Stream;
+
+/// Build ffmpeg command for XPSNR scoring (testable without spawning).
+pub(crate) fn build_ffmpeg_command(
+    reference: &Path,
+    distorted: &Path,
+    filter_complex: &str,
+    fps: Option<f32>,
+) -> Command {
+    build_score_ffmpeg_command(reference, distorted, filter_complex, fps)
+}
 
 /// Calculate XPSNR score using ffmpeg.
-// TODO: fix progress update to account for fps
 pub fn run(
     reference: &Path,
     distorted: &Path,
@@ -21,52 +34,33 @@ pub fn run(
         reference.file_name().and_then(|n| n.to_str()).unwrap_or(""),
     );
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.kill_on_drop(true)
-        .arg2_opt("-r", fps)
-        .arg2("-i", reference)
-        .arg2_opt("-r", fps)
-        .arg2("-i", distorted)
-        .arg2("-filter_complex", filter_complex)
-        .arg2("-f", "null")
-        .arg("-")
-        .stdin(Stdio::null());
-
+    let cmd = build_ffmpeg_command(reference, distorted, filter_complex, fps);
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
-    let mut xpsnr = crate::process::child::AddOnDropChunkStream::from(
-        ProcessChunkStream::try_from(cmd).context("ffmpeg xpsnr")?,
-    );
+    let xpsnr = ManagedProcess::spawn("ffmpeg xpsnr", cmd).context("ffmpeg xpsnr")?;
+    Ok(stream_process(xpsnr, cmd_str))
+}
 
-    Ok(async_stream::stream! {
-        let mut chunks = Chunks::default();
-        let mut parsed_done = false;
-        while let Some(next) = xpsnr.next().await {
-            match next {
-                Item::Stderr(chunk) => {
-                    if let Some(out) = XpsnrOut::try_from_chunk(&chunk, &mut chunks) {
-                        if matches!(out, XpsnrOut::Done(_)) {
-                            parsed_done = true;
-                        }
-                        yield out;
-                    }
-                }
-                Item::Stdout(_) => {}
-                Item::Done(code) => {
-                    if let Err(err) = exit_ok_stderr("ffmpeg xpsnr", code, &cmd_str, &chunks) {
-                        yield XpsnrOut::Err(err);
-                    }
-                }
-            }
-        }
-        if !parsed_done {
-            yield XpsnrOut::Err(cmd_err(
-                "could not parse ffmpeg xpsnr score",
-                &cmd_str,
-                &chunks,
-            ));
-        }
-    })
+fn stream_process(process: ManagedProcess, cmd_str: String) -> impl Stream<Item = XpsnrOut> {
+    run_score_stream(
+        process,
+        "ffmpeg xpsnr",
+        cmd_str,
+        XpsnrOut::try_parse_chunk,
+        XpsnrOut::from_parse,
+        XpsnrOut::Err,
+    )
+}
+
+pub(crate) fn progress_time(
+    time: Duration,
+    source_fps: f64,
+    override_fps: Option<f32>,
+) -> Duration {
+    match (source_fps.is_finite() && source_fps > 0.0, override_fps) {
+        (true, Some(override_fps)) => time.mul_f64(override_fps as f64 / source_fps),
+        _ => time,
+    }
 }
 
 #[derive(Debug)]
@@ -77,44 +71,389 @@ pub enum XpsnrOut {
 }
 
 impl XpsnrOut {
-    fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
-        chunks.push(chunk);
+    fn from_parse(event: ScoreStreamParse) -> Self {
+        match event {
+            ScoreStreamParse::Progress(progress) => Self::Progress(progress),
+            ScoreStreamParse::LogicalDone(score) => Self::Done(score.get()),
+        }
+    }
 
-        if let Some(score) = chunks.rfind_line_map(score_from_line) {
-            return Some(Self::Done(score));
+    fn try_parse_chunk(
+        chunk: &[u8],
+        chunks: &mut Chunks,
+    ) -> anyhow::Result<Option<ScoreStreamParse>> {
+        try_parse_xpsnr_score_chunk(chunk, chunks).map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
+        match try_parse_xpsnr_score_chunk(chunk, chunks) {
+            Ok(Some(event)) => Some(Self::from_parse(event)),
+            Ok(None) => None,
+            Err(err) => Some(Self::Err(err.into())),
         }
-        if let Some(progress) = FfmpegOut::try_parse(chunks.last_line()) {
-            return Some(Self::Progress(progress));
-        }
-        None
     }
 }
 
-// E.g. "[Parsed_xpsnr_0 @ 0x711494004cc0] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)"
+fn try_parse_xpsnr_score_chunk(
+    chunk: &[u8],
+    chunks: &mut Chunks,
+) -> Result<Option<ScoreStreamParse>, crate::process::ChunkLineError> {
+    chunks.push(chunk);
+
+    let score = match parse_buffered_score(chunks, score_from_minimum_line)? {
+        Some(score) => Some(score),
+        None => parse_buffered_score(chunks, score_from_average_line)?,
+    };
+    if let Some(score) = score {
+        return Ok(Some(ScoreStreamParse::LogicalDone(score)));
+    }
+    Ok(FfmpegOut::try_parse(chunks.last_line()).map(ScoreStreamParse::Progress))
+}
+
+#[cfg(test)]
 fn score_from_line(line: &str) -> Option<f32> {
+    match parse_xpsnr_score_line(line) {
+        ParsedScore::Score(score) => Some(score.get()),
+        ParsedScore::Miss | ParsedScore::Invalid(_) => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn parse_xpsnr_score_line(line: &str) -> ParsedScore {
+    match score_from_minimum_line(line) {
+        ParsedScore::Miss => score_from_average_line(line),
+        parsed => parsed,
+    }
+}
+
+fn score_from_minimum_line(line: &str) -> ParsedScore {
     const MIN_PREFIX: &str = "minimum: ";
 
     if !line.contains("XPSNR") {
-        return None;
+        return ParsedScore::Miss;
     }
 
-    let yidx = line.find(MIN_PREFIX)?;
-    let tail = &line[yidx + MIN_PREFIX.len()..];
-    if tail.starts_with("inf") {
-        return Some(f32::INFINITY);
+    let Some(tail) = line
+        .find(MIN_PREFIX)
+        .map(|yidx| &line[yidx + MIN_PREFIX.len()..])
+    else {
+        return ParsedScore::Miss;
+    };
+    parse_score_number(tail)
+}
+
+fn score_from_average_line(line: &str) -> ParsedScore {
+    if !line.contains("XPSNR average") {
+        return ParsedScore::Miss;
+    }
+    let Some(yidx) = line.find("y:") else {
+        return ParsedScore::Miss;
+    };
+    parse_score_number(line[yidx + 2..].trim_start())
+}
+
+fn parse_score_number(s: &str) -> ParsedScore {
+    if s.starts_with("inf") {
+        return ParsedScore::Score(Score::new(f32::INFINITY));
+    }
+    if s.starts_with("NaN") || s.starts_with("nan") {
+        return ParsedScore::Invalid(ScoreError::Nan);
     }
 
-    let end_idx = tail
+    let Some(end_idx) = s
         .char_indices()
         .take_while(|(_, c)| *c == '-' || *c == '.' || c.is_numeric())
-        .last()?
-        .0;
-    tail[..=end_idx].parse().ok()
+        .last()
+        .map(|(idx, _)| idx)
+    else {
+        return ParsedScore::Miss;
+    };
+    s[..=end_idx].parse().map_or(ParsedScore::Miss, |score| {
+        ParsedScore::from_score(Score::try_new(score))
+    })
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::process::CommandExt;
+    use std::env;
+    use std::path::Path;
+    use std::pin::Pin;
+    use tokio::process::Command;
+    use tokio_stream::StreamExt;
+
+    fn assert_suppresses_non_video_streams(cmd: &Command) {
+        // setup
+        let cmd_str = cmd.to_cmd_str();
+        // execute — n/a (command already built)
+        // assert
+        for flag in ["-an", "-sn", "-dn"] {
+            assert!(
+                cmd_str.split_whitespace().any(|arg| arg == flag),
+                "expected {flag} in `{cmd_str}`"
+            );
+        }
+    }
+
+    #[test]
+    fn xpsnr_command_suppresses_non_video_streams() {
+        // setup
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[0:v][1:v]xpsnr",
+            Some(25.0),
+        );
+        // execute — n/a
+        // assert
+        assert_suppresses_non_video_streams(&cmd);
+    }
+
+    #[test]
+    fn xpsnr_build_command_distorted_input_is_stream_zero() {
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[dis][ref]xpsnr",
+            Some(25.0),
+        );
+        let cmd_str = cmd.to_cmd_str();
+        let dist_pos = cmd_str.find("dist.mkv").expect("distorted path");
+        let ref_pos = cmd_str.find("ref.mkv").expect("reference path");
+        assert!(
+            dist_pos < ref_pos,
+            "distorted input must precede reference for [0:v] mapping: `{cmd_str}`"
+        );
+        assert!(cmd_str.contains("-r 25"));
+    }
+
+    #[test]
+    fn xpsnr_build_command_omits_fps_override_when_none() {
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[ref][dis]xpsnr",
+            None,
+        );
+        let cmd_str = cmd.to_cmd_str();
+        assert!(
+            !cmd_str.split_whitespace().any(|arg| arg == "-r"),
+            "native frame rate must omit -r: `{cmd_str}`"
+        );
+    }
+
+    #[test]
+    fn progress_time_without_fps_override_uses_ffmpeg_time() {
+        assert_eq!(
+            progress_time(Duration::from_secs(10), 30.0, None),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn progress_time_scales_override_time_to_source_time() {
+        assert_eq!(
+            progress_time(Duration::from_secs(10), 30.0, Some(60.0)),
+            Duration::from_secs(20)
+        );
+    }
+
+    // bug-hunt-red: per-frame XPSNR progress lines must not emit Done early
+    #[test]
+    fn xpsnr_per_frame_lines_do_not_emit_done() {
+        let mut chunks = Chunks::default();
+        let line = b"n:   12  XPSNR y: 41.0726  XPSNR u: 39.7731  XPSNR v: 42.5210\n";
+        assert!(
+            XpsnrOut::try_from_chunk(line, &mut chunks).is_none(),
+            "per-frame XPSNR lines must not complete scoring"
+        );
+    }
+
+    // ab-kgc.95: score_from_line must handle special trailing formats
+    #[test]
+    fn score_from_line_parses_special_cases() {
+        // setup (none)
+        // execute / assert
+        assert_eq!(
+            score_from_line("[Parsed_xpsnr_0 @ 0x1] XPSNR  y: inf  u: inf  v: inf  (minimum: inf)",),
+            Some(f32::INFINITY)
+        );
+        assert_eq!(
+            score_from_line("XPSNR average, 1344 frames  y: 40.7139"),
+            Some(40.7139)
+        );
+    }
+
+    #[test]
+    fn parse_xpsnr_score_line_returns_typed_minimum_score() {
+        assert_eq!(
+            parse_xpsnr_score_line(
+                "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)",
+            ),
+            ParsedScore::Score(Score::new(33.6547))
+        );
+    }
+
+    #[test]
+    fn parse_xpsnr_score_line_success_does_not_allocate() {
+        crate::test_support::assert_no_allocations(|| {
+            let parsed = parse_xpsnr_score_line(
+                "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 33.6547  u: 41.8741  v: 42.2571  (minimum: 33.6547)",
+            );
+            std::hint::black_box(parsed);
+        });
+    }
+
+    #[test]
+    fn parse_xpsnr_score_line_rejects_nan_minimum() {
+        assert_eq!(
+            parse_xpsnr_score_line(
+                "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: NaN  u: NaN  v: NaN  (minimum: NaN)",
+            ),
+            ParsedScore::Invalid(ScoreError::Nan)
+        );
+    }
+
+    #[test]
+    fn parse_xpsnr_score_line_misses_malformed_score() {
+        assert_eq!(
+            parse_xpsnr_score_line("[Parsed_xpsnr_0 @ 0x1] XPSNR  y: nope"),
+            ParsedScore::Miss
+        );
+    }
+
+    #[test]
+    fn xpsnr_chunk_parser_reports_malformed_utf8() {
+        let mut chunks = Chunks::default();
+        let out = XpsnrOut::try_from_chunk(
+            b"[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 33.0  (minimum: \xff)\n",
+            &mut chunks,
+        );
+
+        assert!(matches!(out, Some(XpsnrOut::Err(_))));
+    }
+
+    #[test]
+    fn score_runners_suppress_non_video_streams_consistently() {
+        // setup
+        let reference = Path::new("ref.mkv");
+        let distorted = Path::new("dist.mkv");
+        let filter = "[0:v][1:v]score";
+        let fps = Some(25.0);
+        let vmaf_cmd = crate::vmaf::build_ffmpeg_command(reference, distorted, filter, fps);
+        let xpsnr_cmd = build_ffmpeg_command(reference, distorted, filter, fps);
+        // execute — n/a
+        // assert
+        assert_suppresses_non_video_streams(&vmaf_cmd);
+        assert_suppresses_non_video_streams(&xpsnr_cmd);
+    }
+
+    const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
+    const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";
+
+    fn fixture_command(fixture: &str) -> Command {
+        let mut cmd = Command::new(env::current_exe().expect("current test executable"));
+        cmd.arg("--exact")
+            .arg(FIXTURE_TEST)
+            .arg("--nocapture")
+            .env(FIXTURE_ENV, fixture);
+        cmd
+    }
+
+    fn fixture_stream(fixture: &str) -> Pin<Box<dyn Stream<Item = XpsnrOut>>> {
+        let process = ManagedProcess::spawn("ffmpeg xpsnr", fixture_command(fixture))
+            .expect("spawn XPSNR fixture");
+        Box::pin(stream_process(process, format!("fixture {fixture}")))
+    }
+
+    #[tokio::test]
+    async fn xpsnr_stream_yields_progress_then_logical_done() {
+        let mut stream = fixture_stream("xpsnr-progress-score");
+
+        match stream.next().await.expect("progress") {
+            XpsnrOut::Progress(FfmpegOut::Progress { frame, fps, time }) => {
+                assert_eq!(frame, 12);
+                assert_eq!(fps, 24.0);
+                assert_eq!(time, std::time::Duration::new(1, 500_000_000));
+            }
+            other => panic!("expected XPSNR progress, got {other:?}"),
+        }
+        match stream.next().await.expect("score") {
+            XpsnrOut::Done(score) => assert_eq!(score, 33.6547),
+            other => panic!("expected XPSNR score, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn xpsnr_stream_reports_missing_logical_done_with_stderr_context() {
+        let mut stream = fixture_stream("xpsnr-no-score");
+        let mut err = None;
+        while let Some(out) = stream.next().await {
+            if let XpsnrOut::Err(next) = out {
+                err = Some(next.to_string());
+            }
+        }
+
+        let err = err.expect("missing score error");
+        assert!(err.contains("could not parse ffmpeg xpsnr score"));
+        assert!(err.contains("fixture xpsnr-no-score"));
+        assert!(err.contains("frame="));
+    }
+
+    #[tokio::test]
+    async fn xpsnr_stream_reports_child_failure_after_logical_done() {
+        let mut stream = fixture_stream("xpsnr-score-exit-7");
+        assert!(matches!(stream.next().await, Some(XpsnrOut::Done(33.6547))));
+
+        match stream.next().await.expect("failure") {
+            XpsnrOut::Err(err) => {
+                let err = err.to_string();
+                assert!(err.contains("ffmpeg xpsnr exit code 7"));
+                assert!(err.contains("xpsnr badness"));
+            }
+            other => panic!("expected XPSNR process error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xpsnr_stream_ignores_stdout_noise() {
+        let mut stream = fixture_stream("stdout-noise-xpsnr-progress-score");
+        assert!(matches!(
+            stream.next().await,
+            Some(XpsnrOut::Progress(FfmpegOut::Progress { frame: 3, .. }))
+        ));
+        assert!(matches!(stream.next().await, Some(XpsnrOut::Done(34.0))));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn xpsnr_stream_replays_score_emitted_before_subscription() {
+        let process =
+            ManagedProcess::spawn("ffmpeg xpsnr", fixture_command("xpsnr-progress-score"))
+                .expect("spawn XPSNR fixture");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut stream = Box::pin(stream_process(process, "delayed xpsnr fixture".into()));
+
+        let mut score = None;
+        while let Some(out) = stream.next().await {
+            if let XpsnrOut::Done(next) = out {
+                score = Some(next);
+            }
+        }
+
+        assert_eq!(score, Some(33.6547));
+    }
+
+    #[tokio::test]
+    async fn xpsnr_stream_terminates_when_dropped_after_logical_done() {
+        let mut stream = fixture_stream("xpsnr-score-then-sleep");
+        assert!(matches!(stream.next().await, Some(XpsnrOut::Done(33.6547))));
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     #[test]
     fn parse_rgb_line() {

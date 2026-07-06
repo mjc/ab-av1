@@ -1,7 +1,7 @@
 use crate::{
     command::{
         PROGRESS_CHARS,
-        args::{self, PixelFormat},
+        args::{self, PixelFormat, ScoreConfig},
     },
     ffprobe,
     log::ProgressLogger,
@@ -40,14 +40,40 @@ pub struct Args {
     pub xpsnr: args::Xpsnr,
 }
 
-pub async fn xpsnr(
-    Args {
+#[derive(Debug, Clone)]
+pub struct XpsnrConfig {
+    reference: PathBuf,
+    distorted: PathBuf,
+    score: ScoreConfig,
+    xpsnr: args::XpsnrConfig,
+}
+
+impl From<Args> for XpsnrConfig {
+    fn from(
+        Args {
+            reference,
+            distorted,
+            score,
+            xpsnr,
+        }: Args,
+    ) -> Self {
+        Self {
+            reference,
+            distorted,
+            score: score.into(),
+            xpsnr: xpsnr.into(),
+        }
+    }
+}
+
+pub async fn xpsnr(config: XpsnrConfig) -> anyhow::Result<()> {
+    let XpsnrConfig {
         reference,
         distorted,
         score,
         xpsnr,
-    }: Args,
-) -> anyhow::Result<()> {
+    } = config;
+
     let bar = ProgressBar::new(1).with_style(
         ProgressStyle::default_bar()
             .template("{spinner:.cyan.bold} {elapsed_precise:.bold} {wide_bar:.cyan/blue} ({msg}eta {eta})")?
@@ -60,6 +86,7 @@ pub async fn xpsnr(
     let rprobe = ffprobe::probe(&reference);
     let nframes = dprobe.nframes().or_else(|_| rprobe.nframes());
     let duration = dprobe.duration.as_ref().or(rprobe.duration.as_ref());
+    let source_fps = dprobe.fps.as_ref().or(rprobe.fps.as_ref()).ok().copied();
     if let Ok(nframes) = nframes {
         bar.set_length(nframes);
     }
@@ -85,6 +112,9 @@ pub async fn xpsnr(
             XpsnrOut::Progress(FfmpegOut::Progress {
                 frame, fps, time, ..
             }) => {
+                let time = source_fps.map_or(time, |source_fps| {
+                    xpsnr::progress_time(time, source_fps, xpsnr.fps())
+                });
                 if fps > 0.0 {
                     bar.set_message(format!("xpsnr {fps} fps, "));
                 }
@@ -120,15 +150,18 @@ pub fn lavfi(ref_vfilter: Option<&str>, pix_fmt: Option<PixelFormat>) -> String 
         }
 
         lavfi.push_str(old_name);
+        let mut has_filter = false;
         if let Some(pix_fmt) = pix_fmt {
             _ = write!(lavfi, "format={pix_fmt}");
+            has_filter = true;
         }
         if let Some(vf) = vfilter {
-            if pix_fmt.is_some() {
+            if has_filter {
                 lavfi.push(',');
             }
             lavfi.push_str(vf);
         }
+        lavfi.push_str(",setpts=PTS-STARTPTS,settb=AVTB");
         lavfi.push_str(new_name);
         lavfi.push(';');
         new_name
@@ -136,8 +169,8 @@ pub fn lavfi(ref_vfilter: Option<&str>, pix_fmt: Option<PixelFormat>) -> String 
 
     let mut lavfi = String::new();
 
-    let ref_stream = add_filter(&mut lavfi, "[0:v]", "[ref]", ref_vfilter, pix_fmt);
-    let dis_stream = add_filter(&mut lavfi, "[1:v]", "[dis]", None, pix_fmt);
+    let ref_stream = add_filter(&mut lavfi, "[1:v]", "[ref]", ref_vfilter, pix_fmt);
+    let dis_stream = add_filter(&mut lavfi, "[0:v]", "[dis]", None, pix_fmt);
     lavfi.push_str(ref_stream);
     lavfi.push_str(dis_stream);
     lavfi.push_str("xpsnr");
@@ -146,15 +179,15 @@ pub fn lavfi(ref_vfilter: Option<&str>, pix_fmt: Option<PixelFormat>) -> String 
 
 #[test]
 fn test_lavfi_default() {
-    assert_eq!(lavfi(None, None), "[0:v][1:v]xpsnr");
+    assert_eq!(lavfi(None, None), "[1:v][0:v]xpsnr");
 }
 
 #[test]
 fn test_lavfi_ref_vfilter() {
     assert_eq!(
         lavfi(Some("scale=1280:-1"), None),
-        "[0:v]scale=1280:-1[ref];\
-         [ref][1:v]xpsnr"
+        "[1:v]scale=1280:-1,setpts=PTS-STARTPTS,settb=AVTB[ref];\
+         [ref][0:v]xpsnr"
     );
 }
 
@@ -162,8 +195,8 @@ fn test_lavfi_ref_vfilter() {
 fn test_lavfi_pixel_format() {
     assert_eq!(
         lavfi(None, Some(PixelFormat::Yuv420p10le)),
-        "[0:v]format=yuv420p10le[ref];\
-         [1:v]format=yuv420p10le[dis];\
+        "[1:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[ref];\
+         [0:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [ref][dis]xpsnr"
     );
 }
@@ -172,8 +205,59 @@ fn test_lavfi_pixel_format() {
 fn test_lavfi_all() {
     assert_eq!(
         lavfi(Some("scale=640:-1"), Some(PixelFormat::Yuv420p10le)),
-        "[0:v]format=yuv420p10le,scale=640:-1[ref];\
-         [1:v]format=yuv420p10le[dis];\
+        "[1:v]format=yuv420p10le,scale=640:-1,setpts=PTS-STARTPTS,settb=AVTB[ref];\
+         [0:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [ref][dis]xpsnr"
     );
+}
+
+// ab-kgc.96: XPSNR lavfi should sync timestamps like VMAF analysis graphs
+#[test]
+fn xpsnr_lavfi_includes_timestamp_sync_filters() {
+    let filter = lavfi(None, Some(PixelFormat::Yuv420p));
+    assert!(
+        filter.contains("setpts=PTS-STARTPTS") && filter.contains("settb=AVTB"),
+        "xpsnr lavfi must sync presentation timestamps: {filter}"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xpsnr_config_lowers_score_args() {
+        let config = XpsnrConfig::from(Args {
+            reference: PathBuf::from("ref.mkv"),
+            distorted: PathBuf::from("dist.mkv"),
+            score: args::ScoreArgs {
+                reference_vfilter: Some("scale=1280:-1".into()),
+            },
+            xpsnr: args::Xpsnr::default(),
+        });
+
+        assert_eq!(
+            config.score.reference_vfilter.as_deref(),
+            Some("scale=1280:-1")
+        );
+    }
+
+    #[test]
+    fn xpsnr_config_from_args_does_not_allocate() {
+        let args = Args {
+            reference: PathBuf::from("ref.mkv"),
+            distorted: PathBuf::from("dist.mkv"),
+            score: args::ScoreArgs {
+                reference_vfilter: Some("scale=1280:-1".into()),
+            },
+            xpsnr: args::Xpsnr {
+                xpsnr_fps: args::FrameRateOverride::new(0.0),
+                xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+            },
+        };
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(XpsnrConfig::from(args));
+        });
+    }
 }

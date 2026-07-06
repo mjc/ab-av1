@@ -1,5 +1,6 @@
-pub mod child;
+pub mod managed;
 
+use crate::process::managed::{ManagedEvent, ManagedProcess};
 use anyhow::{anyhow, ensure};
 use std::{
     borrow::Cow,
@@ -9,13 +10,10 @@ use std::{
     pin::Pin,
     process::{ExitStatus, Output},
     sync::Arc,
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
     time::Duration,
 };
-use time::macros::format_description;
-use tokio::process::Child;
-use tokio_process_stream::{Item, ProcessChunkStream};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 
 pub fn ensure_success(name: &'static str, out: &Output) -> anyhow::Result<()> {
     ensure!(
@@ -60,6 +58,42 @@ pub fn cmd_err(err: impl Display, cmd_str: &str, stderr: &Chunks) -> anyhow::Err
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FfmpegProgress {
+    frame: u64,
+    fps: f32,
+    time: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfmpegStreamSizes {
+    video: u64,
+    audio: u64,
+    subtitle: u64,
+    other: u64,
+}
+
+impl From<FfmpegProgress> for FfmpegOut {
+    fn from(progress: FfmpegProgress) -> Self {
+        Self::Progress {
+            frame: progress.frame,
+            fps: progress.fps,
+            time: progress.time,
+        }
+    }
+}
+
+impl From<FfmpegStreamSizes> for FfmpegOut {
+    fn from(sizes: FfmpegStreamSizes) -> Self {
+        Self::StreamSizes {
+            video: sizes.video,
+            audio: sizes.audio,
+            subtitle: sizes.subtitle,
+            other: sizes.other,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum FfmpegOut {
     Progress {
@@ -77,44 +111,58 @@ pub enum FfmpegOut {
 
 impl FfmpegOut {
     pub fn try_parse(line: &str) -> Option<Self> {
-        if line.starts_with("frame=") {
-            let frame: u64 = parse_label_substr("frame=", line)?.parse().ok()?;
-            let fps: f32 = parse_label_substr("fps=", line)?.parse().ok()?;
-            let (h, m, s, ns) = time::Time::parse(
-                parse_label_substr("time=", line)?,
-                &format_description!("[hour]:[minute]:[second].[subsecond]"),
-            )
-            .ok()?
-            .as_hms_nano();
-            return Some(Self::Progress {
-                frame,
-                fps,
-                time: Duration::new(h as u64 * 60 * 60 + m as u64 * 60 + s as u64, ns),
-            });
+        if let Some(progress) = parse_ffmpeg_progress(line) {
+            return Some(progress.into());
         }
-        if line.starts_with("video:") && line.contains("muxing overhead") {
-            let video = parse_label_size("video:", line)?;
-            let audio = parse_label_size("audio:", line)?;
-            let subtitle = parse_label_size("subtitle:", line)?;
-            let other = parse_label_size("other streams:", line)?;
-            return Some(Self::StreamSizes {
-                video,
-                audio,
-                subtitle,
-                other,
-            });
+        if let Some(sizes) = parse_ffmpeg_stream_sizes(line) {
+            return Some(sizes.into());
         }
         None
     }
 
-    pub fn stream(child: Child, name: &'static str, cmd_str: String) -> FfmpegOutStream {
+    pub fn stream(process: ManagedProcess, name: &'static str, cmd_str: String) -> FfmpegOutStream {
         FfmpegOutStream {
-            chunk_stream: ProcessChunkStream::from(child),
+            events: Box::pin(process.must_complete().stderr_events()),
             chunks: <_>::default(),
             name,
             cmd_str,
+            completion: FfmpegProcessCompletion::Pending,
         }
     }
+}
+
+pub(crate) fn parse_ffmpeg_progress(line: &str) -> Option<FfmpegProgress> {
+    if !line.starts_with("frame=") {
+        return None;
+    }
+
+    let frame = parse_label_substr("frame=", line)?.parse().ok()?;
+    let fps = parse_label_substr("fps=", line)?.parse().ok()?;
+    let progress_time = parse_label_substr("time=", line)?;
+    let (h, rest) = progress_time.split_once(':')?;
+    let (m, s) = rest.split_once(':')?;
+    let h = h.parse::<u64>().ok()?;
+    let m = m.parse::<u64>().ok()?;
+    let s = s.parse::<f64>().ok()?;
+
+    Some(FfmpegProgress {
+        frame,
+        fps,
+        time: Duration::from_secs(h * 60 * 60 + m * 60).checked_add(Duration::from_secs_f64(s))?,
+    })
+}
+
+pub(crate) fn parse_ffmpeg_stream_sizes(line: &str) -> Option<FfmpegStreamSizes> {
+    if !(line.starts_with("video:") && line.contains("muxing overhead")) {
+        return None;
+    }
+
+    Some(FfmpegStreamSizes {
+        video: parse_label_size("video:", line)?,
+        audio: parse_label_size("audio:", line)?,
+        subtitle: parse_label_size("subtitle:", line)?,
+        other: parse_label_size("other streams:", line)?,
+    })
 }
 
 /// Parse a ffmpeg `label=  value ` type substring.
@@ -145,6 +193,12 @@ pub struct Chunks {
     out: Vec<u8>,
     /// Truncate to this index before the next Self::push
     trunc_next_push: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChunkLineError {
+    #[error("chunk line is not valid UTF-8")]
+    Utf8,
 }
 
 impl Chunks {
@@ -205,18 +259,24 @@ impl Chunks {
     }
 
     pub fn rfind_line_map<'a, T>(&'a self, f: impl Fn(&'a str) -> Option<T>) -> Option<T> {
+        self.rfind_line_map_checked(f).ok().flatten()
+    }
+
+    pub fn rfind_line_map_checked<'a, T>(
+        &'a self,
+        f: impl Fn(&'a str) -> Option<T>,
+    ) -> Result<Option<T>, ChunkLineError> {
         let lines = self
             .out
             .rsplit(|b| *b == b'\n')
             .flat_map(|l| l.rsplit(|b| *b == b'\r'));
         for line in lines {
-            if let Ok(line) = std::str::from_utf8(line)
-                && let Some(out) = f(line)
-            {
-                return Some(out);
+            let line = std::str::from_utf8(line).map_err(|_| ChunkLineError::Utf8)?;
+            if let Some(out) = f(line) {
+                return Ok(Some(out));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Returns last non-empty line, if any.
@@ -226,22 +286,71 @@ impl Chunks {
 }
 
 pin_project_lite::pin_project! {
+    /// Streaming ffmpeg stderr parser for encode/sample progress.
+    ///
+    /// This stream uses the must-complete process policy. Progress events are
+    /// opportunistic: ffmpeg may produce none, one, or many progress lines. Success
+    /// is only established by the consuming `wait` transition reaching process
+    /// completion; EOF before `ProcessDone` is reported as `UnexpectedEof`.
     #[must_use = "streams do nothing unless polled"]
     pub struct FfmpegOutStream {
         #[pin]
-        chunk_stream: ProcessChunkStream,
+        events: Pin<Box<dyn Stream<Item = anyhow::Result<ManagedEvent>>>>,
         name: &'static str,
         cmd_str: String,
         chunks: Chunks,
+        completion: FfmpegProcessCompletion,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FfmpegProcessCompletion {
+    Pending,
+    Done(FfmpegProcessDone),
+}
+
+impl FfmpegProcessCompletion {
+    fn status(self) -> Option<ExitStatus> {
+        match self {
+            Self::Pending => None,
+            Self::Done(done) => Some(done.status()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FfmpegProcessDone(ExitStatus);
+
+impl FfmpegProcessDone {
+    fn new(status: ExitStatus) -> Self {
+        Self(status)
+    }
+
+    fn status(self) -> ExitStatus {
+        self.0
     }
 }
 
 impl FfmpegOutStream {
-    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        match self.chunk_stream.child_mut() {
-            Some(c) => c.wait().await,
-            None => Ok(<_>::default()),
+    /// Consume progress events until ffmpeg reaches a terminal process status.
+    ///
+    /// Child failure is returned with bounded stderr and command context.
+    /// Parser misses are not errors for encode progress: a successful child may
+    /// complete without emitting a parseable progress line.
+    pub async fn wait(mut self) -> io::Result<ExitStatus> {
+        while self.completion.status().is_none() {
+            match self.next().await {
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Err(io::Error::other(err)),
+                None => break,
+            }
         }
+        self.completion.status().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "ffmpeg event stream ended before process completion",
+            )
+        })
     }
 }
 
@@ -250,31 +359,50 @@ impl Stream for FfmpegOutStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match ready!(self.as_mut().project().chunk_stream.poll_next(cx)) {
-                Some(item) => match item {
-                    Item::Stderr(chunk) => {
-                        self.chunks.push(&chunk);
+            let this = self.as_mut().project();
+            match this.events.poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(item)) => match item {
+                    Ok(ManagedEvent::RawStderr(chunk)) => {
+                        self.chunks.push(chunk.as_bytes());
                         if let Some(out) = FfmpegOut::try_parse(self.chunks.last_line()) {
                             return Poll::Ready(Some(Ok(out)));
                         }
                     }
-                    Item::Stdout(_) => {}
-                    Item::Done(code) => {
+                    Ok(ManagedEvent::ReplayGap(_)) => {}
+                    Ok(ManagedEvent::ProcessDone(done)) => {
+                        let status = done.status();
+                        self.completion =
+                            FfmpegProcessCompletion::Done(FfmpegProcessDone::new(status));
                         if let Err(err) =
-                            exit_ok_stderr(self.name, code, &self.cmd_str, &self.chunks)
+                            exit_ok_stderr(self.name, Ok(status), &self.cmd_str, &self.chunks)
                         {
                             return Poll::Ready(Some(Err(err)));
                         }
                     }
+                    Err(err) => return Poll::Ready(Some(Err(err))),
                 },
-                None => return Poll::Ready(None),
+                Poll::Ready(None) => return Poll::Ready(None),
             }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, self.chunk_stream.size_hint().1)
+        (0, self.events.size_hint().1)
     }
+}
+
+#[test]
+fn parse_ffmpeg_progress_returns_typed_progress() {
+    let out = "frame=  161 fps= 73 q=-0.0 size=  978076kB time=00:00:06.71 bitrate=1193201.6kbits/s dup=13 drop=0 speed=3.03x    ";
+    assert_eq!(
+        parse_ffmpeg_progress(out),
+        Some(FfmpegProgress {
+            frame: 161,
+            fps: 73.0,
+            time: Duration::new(6, 710_000_000),
+        })
+    );
 }
 
 #[test]
@@ -282,6 +410,43 @@ fn parse_ffmpeg_progress_chunk() {
     let out = "frame=  288 fps= 94 q=-0.0 size=N/A time=01:23:12.34 bitrate=N/A speed=3.94x    \r";
     assert_eq!(
         FfmpegOut::try_parse(out),
+        Some(FfmpegOut::Progress {
+            frame: 288,
+            fps: 94.0,
+            time: Duration::new(60 * 60 + 23 * 60 + 12, 340_000_000),
+        })
+    );
+}
+
+#[test]
+fn parse_ffmpeg_progress_accepts_elapsed_hours_over_23() {
+    let out = "frame=  288 fps= 94 q=-0.0 size=N/A time=25:00:00.00 bitrate=N/A speed=3.94x    \r";
+    assert_eq!(
+        FfmpegOut::try_parse(out),
+        Some(FfmpegOut::Progress {
+            frame: 288,
+            fps: 94.0,
+            time: Duration::from_secs(25 * 60 * 60),
+        })
+    );
+}
+
+#[test]
+fn parse_ffmpeg_progress_split_chunk() {
+    let mut chunks = Chunks::default();
+    let first = b"frame=  288 fps= 94 q=-0.0 size=N/A time=01:23:";
+    let second = b"12.34 bitrate=N/A speed=3.94x    \r";
+
+    assert_eq!(
+        FfmpegOut::try_parse(std::str::from_utf8(first).unwrap()),
+        None
+    );
+    chunks.push(first);
+    assert_eq!(FfmpegOut::try_parse(chunks.last_line()), None);
+
+    chunks.push(second);
+    assert_eq!(
+        FfmpegOut::try_parse(chunks.last_line()),
         Some(FfmpegOut::Progress {
             frame: 288,
             fps: 94.0,
@@ -310,7 +475,21 @@ fn parse_ffmpeg_progress_na_time() {
 }
 
 #[test]
-fn parse_ffmpeg_stream_sizes() {
+fn parse_ffmpeg_stream_sizes_returns_typed_sizes() {
+    let out = "video:2897022kB audio:537162kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.289700%\n";
+    assert_eq!(
+        parse_ffmpeg_stream_sizes(out),
+        Some(FfmpegStreamSizes {
+            video: 2897022 * 1024,
+            audio: 537162 * 1024,
+            subtitle: 0,
+            other: 0,
+        })
+    );
+}
+
+#[test]
+fn parse_ffmpeg_out_stream_sizes() {
     let out = "video:2897022kB audio:537162kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.289700%\n";
     assert_eq!(
         FfmpegOut::try_parse(out),
@@ -321,6 +500,207 @@ fn parse_ffmpeg_stream_sizes() {
             other: 0,
         })
     );
+}
+
+#[test]
+fn chunks_checked_line_map_reports_malformed_utf8() {
+    let mut chunks = Chunks::default();
+    chunks.push(b"good line\nbad \xff line\n");
+
+    assert_eq!(
+        chunks.rfind_line_map_checked(|line| line.contains("missing").then_some(line)),
+        Err(ChunkLineError::Utf8)
+    );
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use std::env;
+    use tokio::process::Command;
+    use tokio_stream::StreamExt;
+
+    const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
+    const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";
+
+    fn fixture_command(fixture: &str) -> Command {
+        let mut cmd = Command::new(env::current_exe().expect("current test executable"));
+        cmd.arg("--exact")
+            .arg(FIXTURE_TEST)
+            .arg("--nocapture")
+            .env(FIXTURE_ENV, fixture);
+        cmd
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_out_stream_parses_stderr_progress_and_waits() {
+        let child = ManagedProcess::spawn(
+            "progress fixture",
+            fixture_command("stderr-ffmpeg-progress"),
+        )
+        .expect("spawn progress fixture");
+        let mut stream = FfmpegOut::stream(child, "progress fixture", "progress fixture".into());
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("progress item")
+                .expect("progress parse"),
+            FfmpegOut::Progress {
+                frame: 12,
+                fps: 24.0,
+                time: Duration::new(1, 500_000_000),
+            }
+        );
+
+        assert!(
+            stream
+                .wait()
+                .await
+                .expect("wait progress fixture")
+                .success(),
+            "success-path wait should reap the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_out_stream_supports_long_running_periodic_progress() {
+        let child = ManagedProcess::spawn(
+            "periodic progress fixture",
+            fixture_command("stderr-ffmpeg-progress-twice"),
+        )
+        .expect("spawn periodic progress fixture");
+        let mut stream = FfmpegOut::stream(
+            child,
+            "periodic progress fixture",
+            "periodic progress fixture".into(),
+        );
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("first progress item")
+                .expect("first progress parse"),
+            FfmpegOut::Progress {
+                frame: 12,
+                fps: 24.0,
+                time: Duration::new(1, 500_000_000),
+            }
+        );
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("second progress item")
+                .expect("second progress parse"),
+            FfmpegOut::Progress {
+                frame: 24,
+                fps: 24.0,
+                time: Duration::new(3, 0),
+            }
+        );
+        assert!(
+            stream
+                .wait()
+                .await
+                .expect("wait periodic progress fixture")
+                .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_out_stream_wait_succeeds_for_process_done_without_progress() {
+        let child = ManagedProcess::spawn("no-progress fixture", fixture_command("stderr-warning"))
+            .expect("spawn no-progress fixture");
+        let stream = FfmpegOut::stream(child, "no-progress fixture", "no-progress fixture".into());
+
+        assert!(
+            stream
+                .wait()
+                .await
+                .expect("wait no-progress fixture")
+                .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_out_stream_reports_failure_with_stderr_context() {
+        let child =
+            ManagedProcess::spawn("failure fixture", fixture_command("stderr-badness-exit-7"))
+                .expect("spawn failure fixture");
+        let mut stream = FfmpegOut::stream(child, "failure fixture", "failure fixture".into());
+
+        let err = stream
+            .next()
+            .await
+            .expect("failure item")
+            .expect_err("non-zero exit should surface as stream error")
+            .to_string();
+
+        assert!(err.contains("failure fixture exit code 7"));
+        assert!(err.contains("----cmd-----\nfailure fixture"));
+        assert!(err.contains("---stderr---\nbadness"));
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_out_stream_failure_context_keeps_recent_bounded_stderr() {
+        let child = ManagedProcess::spawn(
+            "bounded failure fixture",
+            fixture_command("stderr-many-lines-exit-7"),
+        )
+        .expect("spawn bounded failure fixture");
+        let mut stream = FfmpegOut::stream(
+            child,
+            "bounded failure fixture",
+            "bounded failure fixture".into(),
+        );
+
+        let err = stream
+            .next()
+            .await
+            .expect("failure item")
+            .expect_err("non-zero exit should surface as stream error")
+            .to_string();
+
+        assert!(err.contains("bounded failure fixture exit code 7"));
+        assert!(err.contains("line-4999"));
+        assert!(!err.contains("line-0000"));
+        assert!(err.len() < 34_000, "stderr context should stay bounded");
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_out_stream_ignores_stdout_while_parsing_stderr_progress() {
+        let child = ManagedProcess::spawn(
+            "mixed-output fixture",
+            fixture_command("stdout-noise-stderr-ffmpeg-progress"),
+        )
+        .expect("spawn mixed-output fixture");
+        let mut stream =
+            FfmpegOut::stream(child, "mixed-output fixture", "mixed-output fixture".into());
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("progress item")
+                .expect("progress parse"),
+            FfmpegOut::Progress {
+                frame: 3,
+                fps: 30.0,
+                time: Duration::new(0, 250_000_000),
+            }
+        );
+
+        assert!(
+            stream
+                .wait()
+                .await
+                .expect("wait mixed-output fixture")
+                .success()
+        );
+    }
 }
 
 pub trait CommandExt {
@@ -335,6 +715,9 @@ pub trait CommandExt {
 
     /// Adds an argument if `condition` otherwise noop.
     fn arg_if(&mut self, condition: bool, a: impl ArgString) -> &mut Self;
+
+    /// Disable audio, subtitle, and data streams (score/null output runs).
+    fn suppress_non_video_streams(&mut self) -> &mut Self;
 
     /// Convert to readable shell-like string.
     fn to_cmd_str(&self) -> String;
@@ -363,6 +746,10 @@ impl CommandExt for tokio::process::Command {
             true => self.arg(a.arg_string()),
             false => self,
         }
+    }
+
+    fn suppress_non_video_streams(&mut self) -> &mut Self {
+        self.arg("-an").arg("-sn").arg("-dn")
     }
 
     fn to_cmd_str(&self) -> String {

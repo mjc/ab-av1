@@ -2,6 +2,7 @@
 use crate::{
     command::args::PixelFormat,
     float::TerseF32,
+    process::managed::ManagedProcess,
     process::{CommandExt, FfmpegOut, FfmpegOutStream},
     temporary::{self, TempKind},
 };
@@ -12,10 +13,16 @@ use std::{
     fmt::Write,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, LazyLock},
 };
 use tokio::process::Command;
+
+/// Encode output registered for cleanup until the run succeeds.
+///
+/// Only [`crate::command::encode::PartialOutput`] implements this in production code.
+pub trait EncodeDestination {
+    fn encode_destination(&self) -> &Path;
+}
 
 /// Exposed ffmpeg encoding args.
 #[derive(Debug, Clone)]
@@ -57,6 +64,20 @@ impl FfmpegEncodeArgs<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FfmpegArgValues<'a> {
+    args: &'a [Arc<String>],
+}
+
+impl<'a> FfmpegArgValues<'a> {
+    fn new(args: &'a [Arc<String>]) -> Self {
+        Self { args }
+    }
+    fn iter(self) -> impl ExactSizeIterator<Item = &'a str> {
+        self.args.iter().map(|arg| arg.as_str())
+    }
+}
+
 /// Encode a sample.
 pub fn encode_sample(
     FfmpegEncodeArgs {
@@ -80,18 +101,18 @@ pub fn encode_sample(
         None => input.with_extension(format!("{pre}.crf{crf_str}.{dest_ext}")),
     };
     let dest_file_name = dest_file_name.file_name().unwrap();
-    let mut dest = temporary::process_dir(temp_dir);
+    let mut dest = temporary::process_dir(temp_dir, input.parent().map(Path::to_path_buf));
     dest.push(dest_file_name);
 
     temporary::add(&dest, TempKind::Keepable);
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.kill_on_drop(true)
+    cmd.arg("-nostdin")
         .arg("-y")
-        .args(input_args.iter().map(|a| &**a))
+        .args(FfmpegArgValues::new(&input_args).iter())
         .arg2("-i", input)
         .arg2("-c:v", &*vcodec)
-        .args(output_args.iter().map(|a| &**a))
+        .args(FfmpegArgValues::new(&output_args).iter())
         // Avoid dropping or duplicating frames as this may negatively affect input/output analysis
         .arg2("-fps_mode", "passthrough")
         .arg2(vcodec.crf_arg(), vcodec.crf(crf))
@@ -99,14 +120,11 @@ pub fn encode_sample(
         .arg2_opt(vcodec.preset_arg(), preset)
         .arg2_opt("-vf", vfilter)
         .arg("-an")
-        .arg(&dest)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .arg(&dest);
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
 
-    let enc = cmd.spawn().context("ffmpeg encode_sample")?;
+    let enc = ManagedProcess::spawn("ffmpeg encode_sample", cmd).context("ffmpeg encode_sample")?;
 
     let stream = FfmpegOut::stream(enc, "ffmpeg encode_sample", cmd_str);
     Ok((dest, stream))
@@ -125,11 +143,12 @@ pub fn encode(
         input_args,
         video_only,
     }: FfmpegEncodeArgs,
-    output: &Path,
+    output: &impl EncodeDestination,
     has_audio: bool,
     audio_codec: Option<&str>,
     downmix_to_stereo: bool,
 ) -> anyhow::Result<FfmpegOutStream> {
+    let output = output.encode_destination();
     let oargs: HashSet<_> = output_args.iter().map(|a| a.as_str()).collect();
     let output_ext = output.extension().and_then(|e| e.to_str());
 
@@ -159,8 +178,8 @@ pub fn encode(
     }
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.kill_on_drop(true)
-        .args(input_args.iter().map(|a| &**a))
+    cmd.arg("-nostdin")
+        .args(FfmpegArgValues::new(&input_args).iter())
         .arg("-y")
         .arg2("-i", input)
         .arg2("-map", map)
@@ -169,7 +188,7 @@ pub fn encode(
         .arg2("-metadata", metadata)
         .arg2("-c:a", audio_codec)
         .arg2("-c:s", "copy")
-        .args(output_args.iter().map(|a| &**a))
+        .args(FfmpegArgValues::new(&output_args).iter())
         .arg2(vcodec.crf_arg(), vcodec.crf(crf))
         .arg2_opt("-pix_fmt", pix_fmt.map(|v| v.as_str()))
         .arg2_opt(vcodec.preset_arg(), preset)
@@ -179,24 +198,23 @@ pub fn encode(
         .arg2_if(set_ba_128k, "-b:a", "128k")
         .arg2_if(add_faststart, "-movflags", "+faststart")
         .arg2_if(add_cues_to_front, "-cues_to_front", "y")
-        .arg(output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .arg(output);
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
 
-    let enc = cmd.spawn().context("ffmpeg encode")?;
+    let enc = ManagedProcess::spawn("ffmpeg encode", cmd).context("ffmpeg encode")?;
 
     Ok(FfmpegOut::stream(enc, "ffmpeg encode", cmd_str))
 }
 
 pub fn pre_extension_name(vcodec: &str) -> &str {
-    match vcodec.strip_prefix("lib").filter(|s| !s.is_empty()) {
-        Some("svtav1") => "av1",
-        Some("vpx-vp9") => "vp9",
-        Some(suffix) => suffix,
-        _ => vcodec,
+    match vcodec {
+        "libsvtav1" | "libaom-av1" | "libdav1d" | "svtav1" => "av1",
+        "libvpx-vp9" | "libvpx" => "vp9",
+        _ => match vcodec.strip_prefix("lib").filter(|s| !s.is_empty()) {
+            Some(suffix) => suffix,
+            None => vcodec,
+        },
     }
 }
 
@@ -245,16 +263,270 @@ impl VCodecSpecific for Arc<str> {
 }
 
 pub fn remove_arg(args: &mut Vec<Arc<String>>, arg: &'static str) {
-    let mut retain_next = true;
-    args.retain(|a| {
-        if **a == arg {
-            retain_next = false;
-            false
-        } else if !retain_next {
-            retain_next = true;
-            false
-        } else {
-            true
+    if let Some(i) = args.iter().position(|a| a.as_str() == arg) {
+        args.remove(i);
+        if i < args.len() && !args[i].as_str().starts_with('-') {
+            args.remove(i);
         }
-    });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    #[test]
+    fn pre_extension_name_maps_codecs() {
+        // setup (none)
+        // execute / assert — ab-kgc.71–75 and baseline codec normalization
+        assert_eq!(pre_extension_name("libsvtav1"), "av1");
+        assert_eq!(pre_extension_name("libvpx-vp9"), "vp9");
+        assert_eq!(pre_extension_name("libx264"), "x264");
+        assert_eq!(pre_extension_name("libaom-av1"), "av1");
+        assert_eq!(pre_extension_name("libdav1d"), "av1");
+        assert_eq!(pre_extension_name("svtav1"), "av1");
+        assert_eq!(pre_extension_name("libvpx"), "vp9");
+        assert_eq!(
+            pre_extension_name("libaom-av1"),
+            pre_extension_name("libsvtav1"),
+            "libaom and libsvtav1 must share av1 suffix for cache filenames"
+        );
+    }
+
+    #[rstest]
+    #[case::libsvtav1("libsvtav1", "-crf", "-preset", 63.0)]
+    #[case::librav1e("librav1e", "-qp", "-speed", 40.0)]
+    #[case::libx264("libx264", "-crf", "-preset", 32.0)]
+    #[case::hevc_vt("hevc_videotoolbox", "-q:v", "-preset", 50.0)]
+    fn vcodec_arg_matrix(
+        #[case] codec: &str,
+        #[case] crf_arg: &str,
+        #[case] preset_arg: &str,
+        #[case] crf_in: f32,
+    ) {
+        // setup
+        let vcodec: Arc<str> = Arc::from(codec);
+
+        // execute / assert
+        assert_eq!(VCodecSpecific::crf_arg(&vcodec), crf_arg);
+        assert_eq!(VCodecSpecific::preset_arg(&vcodec), preset_arg);
+        assert_eq!(
+            VCodecSpecific::crf(&vcodec, crf_in),
+            crf_in.min(if codec == "libsvtav1" { 63.0 } else { crf_in })
+        );
+    }
+
+    #[test]
+    fn sample_encode_hash_stable_for_identical_args() {
+        // setup
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let input = std::path::Path::new("/tmp/vid.mkv");
+        let args = FfmpegEncodeArgs {
+            input,
+            vcodec: Arc::from("libsvtav1"),
+            vfilter: Some("scale=1280:-1"),
+            pix_fmt: None,
+            crf: 30.0,
+            preset: Some(Arc::from("8")),
+            output_args: vec![],
+            input_args: vec![],
+            video_only: false,
+        };
+
+        // execute
+        let mut hasher_a = DefaultHasher::new();
+        let mut hasher_b = DefaultHasher::new();
+        args.sample_encode_hash(&mut hasher_a);
+        args.sample_encode_hash(&mut hasher_b);
+
+        // assert
+        assert_eq!(hasher_a.finish(), hasher_b.finish());
+    }
+
+    #[test]
+    fn sample_encode_hash_differs_when_crf_changes() {
+        // setup
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let input = std::path::Path::new("/tmp/vid.mkv");
+        let base = FfmpegEncodeArgs {
+            input,
+            vcodec: Arc::from("libsvtav1"),
+            vfilter: None,
+            pix_fmt: None,
+            crf: 30.0,
+            preset: None,
+            output_args: vec![],
+            input_args: vec![],
+            video_only: false,
+        };
+        let mut other = base.clone();
+        other.crf = 31.0;
+
+        // execute
+        let mut hash_a = DefaultHasher::new();
+        let mut hash_b = DefaultHasher::new();
+        base.sample_encode_hash(&mut hash_a);
+        other.sample_encode_hash(&mut hash_b);
+
+        // assert
+        assert_ne!(hash_a.finish(), hash_b.finish());
+    }
+
+    // ab-kgc.24: duplicate ffmpeg flags should survive single removal
+    #[test]
+    fn remove_arg_strips_only_first_matching_pair() {
+        // setup — duplicate flags should require multiple removals or retain extras
+        let mut args = vec![
+            Arc::new("-preset".to_string()),
+            Arc::new("8".to_string()),
+            Arc::new("-preset".to_string()),
+            Arc::new("6".to_string()),
+            Arc::new("-crf".to_string()),
+            Arc::new("30".to_string()),
+        ];
+
+        // execute
+        remove_arg(&mut args, "-preset");
+
+        // assert — second -preset pair must survive one removal
+        assert_eq!(
+            args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            vec!["-preset", "6", "-crf", "30"]
+        );
+    }
+
+    #[test]
+    fn remove_arg_strips_flag_and_value() {
+        // setup
+        let mut args = vec![
+            Arc::new("-preset".to_string()),
+            Arc::new("8".to_string()),
+            Arc::new("-crf".to_string()),
+            Arc::new("30".to_string()),
+        ];
+
+        // execute
+        remove_arg(&mut args, "-preset");
+
+        // assert
+        assert_eq!(
+            args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            vec!["-crf", "30"]
+        );
+    }
+
+    // ab-kgc.76: remove_arg must not consume a value token that looks like another flag
+    #[test]
+    fn remove_arg_preserves_value_when_it_matches_a_flag_name() {
+        let mut args = vec![
+            Arc::new("-preset".to_string()),
+            Arc::new("-crf".to_string()),
+            Arc::new("30".to_string()),
+        ];
+
+        remove_arg(&mut args, "-preset");
+
+        assert_eq!(
+            args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            vec!["-crf", "30"]
+        );
+    }
+
+    #[test]
+    fn sample_encode_hash_differs_when_extra_args_change() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        // setup
+        let input = std::path::Path::new("/tmp/vid.mkv");
+        let base = FfmpegEncodeArgs {
+            input,
+            vcodec: Arc::from("libx264"),
+            vfilter: None,
+            pix_fmt: None,
+            crf: 30.0,
+            preset: None,
+            output_args: vec![],
+            input_args: vec![],
+            video_only: false,
+        };
+        let mut with_output_args = base.clone();
+        with_output_args.output_args =
+            vec![Arc::from("-g".to_string()), Arc::from("240".to_string())];
+        let mut with_input_args = base.clone();
+        with_input_args.input_args =
+            vec![Arc::from("-ss".to_string()), Arc::from("12".to_string())];
+
+        // execute
+        let mut base_hash = DefaultHasher::new();
+        let mut output_hash = DefaultHasher::new();
+        let mut input_hash = DefaultHasher::new();
+        base.sample_encode_hash(&mut base_hash);
+        with_output_args.sample_encode_hash(&mut output_hash);
+        with_input_args.sample_encode_hash(&mut input_hash);
+
+        // assert
+        assert_ne!(base_hash.finish(), output_hash.finish());
+        assert_ne!(base_hash.finish(), input_hash.finish());
+    }
+
+    #[test]
+    fn ffmpeg_arg_values_iterates_borrowed_arg_views() {
+        let first = Arc::new(String::from("-threads"));
+        let second = Arc::new(String::from("4"));
+        let args = vec![Arc::clone(&first), Arc::clone(&second)];
+        let spec = FfmpegArgValues::new(&args);
+
+        let borrowed = spec.iter().collect::<Vec<_>>();
+
+        assert_eq!(borrowed, vec!["-threads", "4"]);
+        assert_eq!(spec.iter().len(), 2);
+        assert!(
+            std::ptr::eq(borrowed[0].as_ptr(), first.as_str().as_ptr()),
+            "argument iteration must borrow existing storage"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_arg_values_iteration_does_not_allocate() {
+        let args = vec![
+            Arc::new(String::from("-threads")),
+            Arc::new(String::from("4")),
+        ];
+        let spec = FfmpegArgValues::new(&args);
+
+        crate::test_support::assert_no_allocations(|| {
+            let total_len = spec.iter().fold(0usize, |acc, arg| acc + arg.len());
+            std::hint::black_box(total_len);
+        });
+    }
+
+    #[rstest]
+    #[case::libaom_av1("libaom-av1", "-cpu-used", "-crf")]
+    #[case::mpeg2video("mpeg2video", "-preset", "-q")]
+    #[case::h264_nvenc("h264_nvenc", "-preset", "-cq")]
+    #[case::h264_vaapi("h264_vaapi", "-preset", "-q")]
+    #[case::h264_qsv("h264_qsv", "-preset", "-global_quality")]
+    fn vcodec_arg_matrix_extended(
+        #[case] codec: &str,
+        #[case] preset_arg: &str,
+        #[case] crf_arg: &str,
+    ) {
+        let vcodec: Arc<str> = Arc::from(codec);
+        assert_eq!(VCodecSpecific::preset_arg(&vcodec), preset_arg);
+        assert_eq!(VCodecSpecific::crf_arg(&vcodec), crf_arg);
+    }
+
+    #[test]
+    fn libsvtav1_crf_caps_above_ffmpeg_limit() {
+        let vcodec: Arc<str> = Arc::from("libsvtav1");
+        assert_eq!(VCodecSpecific::crf(&vcodec, 70.0), 63.0);
+        assert_eq!(VCodecSpecific::crf(&vcodec, 63.0), 63.0);
+    }
 }

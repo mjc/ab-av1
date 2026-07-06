@@ -1,7 +1,7 @@
 use crate::{
     command::{
         PROGRESS_CHARS,
-        args::{self, PixelFormat},
+        args::{self, PixelFormat, ScoreConfig},
     },
     ffprobe,
     log::ProgressLogger,
@@ -43,14 +43,40 @@ pub struct Args {
     pub score: args::ScoreArgs,
 }
 
-pub async fn vmaf(
-    Args {
+#[derive(Debug, Clone)]
+pub struct VmafConfig {
+    reference: PathBuf,
+    distorted: PathBuf,
+    vmaf: args::VmafConfig,
+    score: ScoreConfig,
+}
+
+impl From<Args> for VmafConfig {
+    fn from(
+        Args {
+            reference,
+            distorted,
+            vmaf,
+            score,
+        }: Args,
+    ) -> Self {
+        Self {
+            reference,
+            distorted,
+            vmaf: vmaf.into(),
+            score: score.into(),
+        }
+    }
+}
+
+pub async fn vmaf(config: VmafConfig) -> anyhow::Result<()> {
+    let VmafConfig {
         reference,
         distorted,
         vmaf,
         score,
-    }: Args,
-) -> anyhow::Result<()> {
+    } = config;
+
     let bar = ProgressBar::new(1).with_style(
         ProgressStyle::default_bar()
             .template("{spinner:.cyan.bold} {elapsed_precise:.bold} {wide_bar:.cyan/blue} ({msg}eta {eta})")?
@@ -105,4 +131,45 @@ pub async fn vmaf(
 
     println!("{}", vmaf_score.context("no vmaf score")?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vmaf_config_lowers_score_args() {
+        let config = VmafConfig::from(Args {
+            reference: PathBuf::from("ref.mkv"),
+            distorted: PathBuf::from("dist.mkv"),
+            vmaf: args::Vmaf::default(),
+            score: args::ScoreArgs {
+                reference_vfilter: Some("scale=1280:-1".into()),
+            },
+        });
+
+        assert_eq!(
+            config.score.reference_vfilter.as_deref(),
+            Some("scale=1280:-1")
+        );
+    }
+
+    #[test]
+    fn vmaf_config_from_args_does_not_allocate() {
+        let args = Args {
+            reference: PathBuf::from("ref.mkv"),
+            distorted: PathBuf::from("dist.mkv"),
+            vmaf: args::Vmaf {
+                vmaf_args: vec!["n_subsample=4".into()],
+                ..<_>::default()
+            },
+            score: args::ScoreArgs {
+                reference_vfilter: Some("scale=1280:-1".into()),
+            },
+        };
+
+        crate::test_support::assert_no_allocations(|| {
+            std::hint::black_box(VmafConfig::from(args));
+        });
+    }
 }

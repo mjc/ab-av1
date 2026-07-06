@@ -1,4 +1,5 @@
 use crate::command::crf_search::Sample;
+use crate::float::TerseF32;
 use std::fmt;
 
 #[derive(Debug)]
@@ -38,10 +39,119 @@ impl From<tokio::task::JoinError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoGoodCrf { .. } => "Failed to find a suitable crf".fmt(f),
+            Self::NoGoodCrf { last } => {
+                write!(
+                    f,
+                    "Failed to find a suitable crf (last crf {})",
+                    TerseF32(last.crf)
+                )
+            }
             Self::Other(err) => err.fmt(f),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::sample_encode;
+    use std::time::Duration;
+
+    fn search_sample(crf: f32) -> super::super::Sample {
+        super::super::Sample {
+            crf,
+            q: crf.round() as i64,
+            enc: sample_encode::Output {
+                vmaf_score: Some(90.0),
+                xpsnr_score: None,
+                predicted_encode_size: 1_000_000,
+                encode_percent: 50.0,
+                predicted_encode_time: Duration::from_secs(60),
+                from_cache: false,
+            },
+        }
+    }
+
+    #[test]
+    fn ensure_other_ok_and_err() {
+        // setup (none)
+        // execute
+        let ok = Error::ensure_other(true, "should not fail");
+        let err = Error::ensure_other(false, "bad state").expect_err("expected error");
+
+        // assert
+        assert!(ok.is_ok());
+        assert!(matches!(err, Error::Other(_)));
+        assert!(err.to_string().contains("bad state"));
+    }
+
+    #[test]
+    fn ensure_or_no_good_crf_ok_and_no_good_crf() {
+        // setup
+        let last = search_sample(32.0);
+
+        // execute
+        let ok = Error::ensure_or_no_good_crf(true, &last);
+        let err = Error::ensure_or_no_good_crf(false, &last).expect_err("expected NoGoodCrf");
+
+        // assert
+        assert!(ok.is_ok());
+        assert!(matches!(err, Error::NoGoodCrf { .. }));
+        assert_eq!(
+            err.to_string(),
+            "Failed to find a suitable crf (last crf 32)"
+        );
+    }
+
+    #[test]
+    fn from_anyhow_error_is_other() {
+        // setup
+        // execute
+        let err: Error = anyhow::anyhow!("boom").into();
+        // assert
+        assert!(matches!(err, Error::Other(_)));
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn from_join_error_is_other_with_message() {
+        // setup
+        let join_err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                tokio::spawn(async { panic!("task boom") })
+                    .await
+                    .expect_err("spawned task should panic")
+            });
+
+        // execute
+        let err: Error = join_err.into();
+
+        // assert
+        assert!(matches!(err, Error::Other(_)));
+        assert!(
+            err.to_string().contains("task"),
+            "JoinError should surface in Display: {}",
+            err
+        );
+    }
+
+    // ab-kgc.34: NoGoodCrf should include the last attempted crf for actionable errors
+    #[test]
+    fn no_good_crf_display_includes_last_crf() {
+        // setup
+        let last = search_sample(37.5);
+        let err = Error::NoGoodCrf { last };
+
+        // execute
+        let message = err.to_string();
+
+        // assert
+        assert!(
+            message.contains("37.5") || message.contains("37"),
+            "NoGoodCrf display should mention last crf, got: {message}"
+        );
+    }
+}
