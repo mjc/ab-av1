@@ -56,7 +56,7 @@ pub fn probe(input: &Path) -> Ffprobe {
     };
 
     let fps = read_fps(&probe);
-    let duration = read_duration(&probe);
+    let duration = read_duration(&probe, is_image);
     let has_audio = probe
         .streams
         .iter()
@@ -115,7 +115,7 @@ fn is_image(path: &Path) -> anyhow::Result<bool> {
     Ok(infer::is_image(&file_header))
 }
 
-fn read_duration(probe: &ffprobe::FfProbe) -> anyhow::Result<Duration> {
+fn read_duration(probe: &ffprobe::FfProbe, is_image: bool) -> anyhow::Result<Duration> {
     match probe.format.duration.as_deref() {
         Some(duration_s) => {
             let duration_f = duration_s
@@ -123,6 +123,13 @@ fn read_duration(probe: &ffprobe::FfProbe) -> anyhow::Result<Duration> {
                 .with_context(|| format!("invalid ffprobe video duration: {duration_s:?}"))?;
             Duration::try_from_secs_f64(duration_f)
                 .map_err(|e| anyhow!("{e}: ffprobe video duration: {duration_s:?}"))
+                .or_else(|err| {
+                    if is_image {
+                        Ok(Duration::ZERO)
+                    } else {
+                        Err(err)
+                    }
+                })
         }
         None => Ok(Duration::ZERO),
     }
