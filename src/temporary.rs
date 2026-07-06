@@ -72,16 +72,19 @@ async fn clean_non_keepables() {
 
 /// Return a temporary directory that is distinct per process/run.
 ///
-/// Configured --temp-dir is used as a parent or, if not set, the current working dir.
-pub fn process_dir(conf_parent: Option<PathBuf>) -> PathBuf {
+/// Configured `--temp-dir` is used as a parent. When unset, `default_parent`
+/// (typically the input file's directory) is used. Only when both are unavailable
+/// does this fall back to the current working directory.
+pub fn process_dir(conf_parent: Option<PathBuf>, default_parent: Option<PathBuf>) -> PathBuf {
     static SUBDIR: LazyLock<String> = LazyLock::new(|| {
         let mut subdir = String::from(".ab-av1-");
         subdir.extend(iter::repeat_with(fastrand::alphanumeric).take(12));
         subdir
     });
 
-    let mut temp_dir =
-        conf_parent.unwrap_or_else(|| env::current_dir().expect("current working directory"));
+    let mut temp_dir = conf_parent
+        .or(default_parent)
+        .unwrap_or_else(|| env::current_dir().expect("current working directory"));
     temp_dir.push(&*SUBDIR);
 
     if !temp_dir.exists() {
@@ -90,4 +93,58 @@ pub fn process_dir(conf_parent: Option<PathBuf>) -> PathBuf {
     }
 
     temp_dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{env, fs};
+
+    #[test]
+    fn default_temp_dir_uses_input_directory_ab_kgc_11() {
+        // setup
+        let input_dir = env::temp_dir().join("ab-av1-temp-test-input");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        let input = input_dir.join("clip.mkv");
+        let cwd = env::current_dir().expect("cwd");
+
+        // execute
+        let temp_dir = process_dir(None, input.parent().map(Path::to_path_buf));
+
+        // assert
+        assert!(
+            temp_dir.starts_with(&input_dir),
+            "default temp dir should be under input directory, got {}",
+            temp_dir.display()
+        );
+        assert!(
+            !temp_dir.starts_with(&cwd) || input_dir.starts_with(&cwd),
+            "default temp dir must not prefer cwd over input directory"
+        );
+        assert!(
+            temp_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".ab-av1-")),
+            "temp dir should use the per-run subdirectory"
+        );
+    }
+
+    #[test]
+    fn explicit_temp_dir_overrides_input_directory_ab_kgc_11() {
+        // setup
+        let explicit = env::temp_dir().join("ab-av1-explicit-temp");
+        fs::create_dir_all(&explicit).expect("create explicit temp dir");
+        let input = env::temp_dir().join("ab-av1-temp-test-input/clip.mkv");
+
+        // execute
+        let temp_dir = process_dir(Some(explicit.clone()), input.parent().map(Path::to_path_buf));
+
+        // assert
+        assert!(
+            temp_dir.starts_with(&explicit),
+            "explicit --temp-dir should win, got {}",
+            temp_dir.display()
+        );
+    }
 }

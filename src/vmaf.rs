@@ -7,6 +7,28 @@ use std::path::Path;
 use tokio::process::Command;
 use tokio_stream::Stream;
 
+/// Build ffmpeg command for VMAF scoring (testable without spawning).
+pub(crate) fn build_ffmpeg_command(
+    reference: &Path,
+    distorted: &Path,
+    filter_complex: &str,
+    fps: Option<f32>,
+) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-nostdin")
+        .arg2_opt("-r", fps)
+        .arg2("-i", distorted)
+        .arg2_opt("-r", fps)
+        .arg2("-i", reference)
+        .arg2("-filter_complex", filter_complex)
+        // Workaround unused streams causing ffmpeg memory leaks
+        // See https://github.com/alexheretic/ab-av1/issues/189
+        .suppress_non_video_streams()
+        .arg2("-f", "null")
+        .arg("-");
+    cmd
+}
+
 /// Calculate VMAF score using ffmpeg.
 pub fn run(
     reference: &Path,
@@ -20,21 +42,7 @@ pub fn run(
         reference.file_name().and_then(|n| n.to_str()).unwrap_or(""),
     );
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-nostdin")
-        .arg2_opt("-r", fps)
-        .arg2("-i", distorted)
-        .arg2_opt("-r", fps)
-        .arg2("-i", reference)
-        .arg2("-filter_complex", filter_complex)
-        // Workaround unused streams causing ffmpeg memory leaks
-        // See https://github.com/alexheretic/ab-av1/issues/189
-        .arg("-an")
-        .arg("-sn")
-        .arg("-dn")
-        .arg2("-f", "null")
-        .arg("-");
-
+    let cmd = build_ffmpeg_command(reference, distorted, filter_complex, fps);
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
     let vmaf = ManagedProcess::spawn("ffmpeg vmaf", cmd).context("ffmpeg vmaf")?;

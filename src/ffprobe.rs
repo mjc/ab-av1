@@ -44,17 +44,7 @@ pub fn probe(input: &Path) -> Ffprobe {
 
     let probe = match ffprobe::ffprobe(input) {
         Ok(p) => p,
-        Err(err) => {
-            return Ffprobe {
-                duration: Err(ProbeError(format!("ffprobe: {err}"))),
-                fps: Err(ProbeError(format!("ffprobe: {err}"))),
-                has_audio: true,
-                max_audio_channels: None,
-                resolution: None,
-                is_image: false,
-                pix_fmt: None,
-            };
-        }
+        Err(err) => return ffprobe_error_fallback(is_image, err),
     };
 
     let fps = read_fps(&probe);
@@ -94,6 +84,18 @@ pub fn probe(input: &Path) -> Ffprobe {
         resolution,
         is_image,
         pix_fmt,
+    }
+}
+
+fn ffprobe_error_fallback(is_image: bool, err: impl fmt::Display) -> Ffprobe {
+    Ffprobe {
+        duration: Err(ProbeError(format!("ffprobe: {err}"))),
+        fps: Err(ProbeError(format!("ffprobe: {err}"))),
+        has_audio: true,
+        max_audio_channels: None,
+        resolution: None,
+        is_image: false,
+        pix_fmt: None,
     }
 }
 
@@ -162,3 +164,55 @@ impl From<anyhow::Error> for ProbeError {
 }
 
 impl std::error::Error for ProbeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn ffprobe_error_fallback_preserves_image_detection() {
+        // setup
+        let is_image = true;
+        let err = "probe failed";
+        // execute
+        let probe = ffprobe_error_fallback(is_image, err);
+        // assert
+        assert!(probe.is_image);
+        assert!(!probe.has_audio);
+        assert!(probe.duration.is_err());
+        assert!(probe.fps.is_err());
+    }
+
+    #[test]
+    fn ffprobe_error_fallback_uses_conservative_audio_metadata() {
+        // setup
+        // execute
+        let probe = ffprobe_error_fallback(false, "missing ffprobe");
+        // assert
+        assert!(!probe.has_audio);
+        assert_eq!(probe.max_audio_channels, None);
+    }
+
+    #[test]
+    fn probe_preserves_image_detection_when_ffprobe_fails() {
+        // setup
+        let path = std::env::temp_dir().join(format!(
+            "ab-av1-probe-fallback-{}.png",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).expect("create png stub");
+        file.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .expect("write png magic");
+        drop(file);
+        // execute
+        let probe = probe(&path);
+        // assert
+        assert!(
+            probe.is_image,
+            "header-based image detection must survive ffprobe failure"
+        );
+        assert!(!probe.has_audio);
+        let _ = std::fs::remove_file(path);
+    }
+}

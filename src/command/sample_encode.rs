@@ -245,6 +245,7 @@ pub fn run(
             let result = match cache::cached_encode(
                 cache,
                 &sample,
+                &input,
                 duration,
                 input.extension(),
                 input_len,

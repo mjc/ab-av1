@@ -581,6 +581,9 @@ pub trait CommandExt {
     /// Adds an argument if `condition` otherwise noop.
     fn arg_if(&mut self, condition: bool, a: impl ArgString) -> &mut Self;
 
+    /// Disable audio, subtitle, and data streams (score/null output runs).
+    fn suppress_non_video_streams(&mut self) -> &mut Self;
+
     /// Convert to readable shell-like string.
     fn to_cmd_str(&self) -> String;
 }
@@ -608,6 +611,10 @@ impl CommandExt for tokio::process::Command {
             true => self.arg(a.arg_string()),
             false => self,
         }
+    }
+
+    fn suppress_non_video_streams(&mut self) -> &mut Self {
+        self.arg("-an").arg("-sn").arg("-dn")
     }
 
     fn to_cmd_str(&self) -> String {

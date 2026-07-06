@@ -392,3 +392,19 @@ fn vmaf_lavfi_1080p() {
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
     );
 }
+
+#[test]
+fn vmaf_phone_model_does_not_count_as_model_override() {
+    // setup
+    let vmaf = Vmaf {
+        vmaf_args: vec!["phone_model=1".into(), "n_threads=5".into()],
+        ..Default::default()
+    };
+    // execute
+    let lavfi = vmaf.ffmpeg_lavfi(Some((3840, 2160)), Some(PixelFormat::Yuv420p), None);
+    // assert
+    assert!(
+        lavfi.contains("model=version=vmaf_4k_v0.6.1"),
+        "phone_model=1 must not suppress automatic 4k model selection: {lavfi}"
+    );
+}

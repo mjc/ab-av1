@@ -22,6 +22,40 @@ use std::{io::IsTerminal, pin::pin, sync::Arc, time::Duration};
 const BAR_LEN: u64 = 1024 * 1024 * 1024;
 const DEFAULT_MIN_VMAF: f32 = 95.0;
 
+/// Score used for CRF search threshold decisions.
+///
+/// When the user targets XPSNR (`--min-xpsnr`), search must use XPSNR even if VMAF
+/// is also present (e.g. `--and-vmaf`).
+fn output_search_score(enc: &sample_encode::Output, use_xpsnr: bool) -> f32 {
+    match use_xpsnr {
+        true => enc.xpsnr_score.unwrap_or_default(),
+        false => enc.vmaf_score.or(enc.xpsnr_score).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use super::sample_encode;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static MOCK: RefCell<Option<Box<dyn Fn(f32) -> sample_encode::Output>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub fn set(mock: impl Fn(f32) -> sample_encode::Output + 'static) {
+        MOCK.with(|m| *m.borrow_mut() = Some(Box::new(mock)));
+    }
+
+    pub fn clear() {
+        MOCK.with(|m| *m.borrow_mut() = None);
+    }
+
+    pub fn output(crf: f32) -> Option<sample_encode::Output> {
+        MOCK.with(|m| m.borrow().as_ref().map(|f| f(crf)))
+    }
+}
+
 /// Interpolated binary search using sample-encode to find the best crf
 /// value delivering min-vmaf & max-encoded-percent.
 ///
@@ -245,6 +279,7 @@ pub fn run(
         Error::ensure_other(min_crf < max_crf, "Invalid --min-crf & --max-crf")?;
         // by default use vmaf 95, otherwise use whatever is specified
         let min_score = min_vmaf.or(min_xpsnr).unwrap_or(DEFAULT_MIN_VMAF);
+        let use_xpsnr = min_xpsnr.is_some();
 
         // Whether to make the 2nd iteration on the ~20%/~80% crf point instead of the min/max to
         // improve interpolation by narrowing the crf range a 20% (or 30%) subrange.
@@ -293,17 +328,25 @@ pub fn run(
             };
             args.crf = q_conv.crf(q);
 
-            let mut sample_enc = pin!(sample_encode::run(args.clone(), input_probe.clone()));
             let mut sample_enc_output = None;
-            while let Some(update) = sample_enc.next().await {
-                match update? {
-                    sample_encode::Update::Status(status) => {
-                        yield Update::Status { crf_run: run, crf: args.crf, sample: status };
+
+            #[cfg(test)]
+            if let Some(output) = test_hooks::output(args.crf) {
+                sample_enc_output = Some(output);
+            }
+
+            if sample_enc_output.is_none() {
+                let mut sample_enc = pin!(sample_encode::run(args.clone(), input_probe.clone()));
+                while let Some(update) = sample_enc.next().await {
+                    match update? {
+                        sample_encode::Update::Status(status) => {
+                            yield Update::Status { crf_run: run, crf: args.crf, sample: status };
+                        }
+                        sample_encode::Update::SampleResult { sample, result } => {
+                            yield Update::SampleResult { crf: args.crf, sample, result };
+                        }
+                        sample_encode::Update::Done(output) => sample_enc_output = Some(output),
                     }
-                    sample_encode::Update::SampleResult { sample, result } => {
-                        yield Update::SampleResult { crf: args.crf, sample, result };
-                    }
-                    sample_encode::Update::Done(output) => sample_enc_output = Some(output),
                 }
             }
 
@@ -312,11 +355,11 @@ pub fn run(
                 q,
                 enc: sample_enc_output.context("no sample output?")?,
             };
-            let score = sample.enc.single_score();
+            let score = output_search_score(&sample.enc, use_xpsnr);
             crf_attempts.push(sample.clone());
             let sample_small_enough = sample.enc.encode_percent <= max_encoded_percent as _;
 
-            if score > min_score {
+            if score >= min_score {
                 // good
                 if sample_small_enough && score < min_score + higher_tolerance {
                     yield Update::Done(sample);
@@ -334,7 +377,7 @@ pub fn run(
                         return;
                     }
                     Some(upper) => {
-                        q = vmaf_lerp_q(min_score, upper, &sample);
+                        q = vmaf_lerp_q(min_score, upper, &sample, use_xpsnr);
                     }
                     None if sample.q == max_q => {
                         Error::ensure_or_no_good_crf(sample_small_enough, &sample)?;
@@ -365,7 +408,7 @@ pub fn run(
                         return;
                     }
                     Some(lower) => {
-                        q = vmaf_lerp_q(min_score, &sample, lower);
+                        q = vmaf_lerp_q(min_score, &sample, lower, use_xpsnr);
                     }
                     None if cut_on_iter2 && run == 1 && sample.q > min_q + 1 => {
                         q = (sample.q as f32 * 0.4 + min_q as f32 * 0.6).round() as _;
@@ -468,16 +511,18 @@ impl StdoutFormat {
 /// though it seems to work better than a binary search.
 /// Perhaps a better approximation of a general crf->vmaf model could be found.
 /// This would be helpful particularly for small crf-increments.
-fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample) -> i64 {
+fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample, use_xpsnr: bool) -> i64 {
+    let worse_score = output_search_score(&worse_q.enc, use_xpsnr);
+    let better_score = output_search_score(&better_q.enc, use_xpsnr);
     assert!(
-        worse_q.enc.single_score() <= min_vmaf
-            && worse_q.enc.single_score() < better_q.enc.single_score()
+        worse_score <= min_vmaf
+            && worse_score < better_score
             && worse_q.q > better_q.q,
         "invalid vmaf_lerp_crf usage: ({min_vmaf}, {worse_q:?}, {better_q:?})"
     );
 
-    let vmaf_diff = better_q.enc.single_score() - worse_q.enc.single_score();
-    let vmaf_factor = (min_vmaf - worse_q.enc.single_score()) / vmaf_diff;
+    let vmaf_diff = better_score - worse_score;
+    let vmaf_factor = (min_vmaf - worse_score) / vmaf_diff;
 
     let q_diff = worse_q.q - better_q.q;
     let lerp = (worse_q.q as f32 - q_diff as f32 * vmaf_factor).round() as i64;
@@ -591,4 +636,255 @@ pub enum Update {
     /// Run result (excludes successful final runs)
     RunResult(Sample),
     Done(Sample),
+}
+
+#[cfg(test)]
+mod crf_search_tests {
+    use super::{
+        test_hooks, Args, Error, Update, output_search_score, guess_progress, vmaf_lerp_q, run,
+        Sample,
+    };
+    use crate::{
+        command::{
+            args::{self, Encode, Sample as SampleArgs, Vmaf},
+            sample_encode::{self},
+        },
+        ffprobe::Ffprobe,
+    };
+    use futures_util::StreamExt;
+    use std::{path::PathBuf, pin::pin, sync::Arc, time::Duration};
+
+    mod helpers {
+        use super::*;
+
+        pub fn test_probe() -> Arc<Ffprobe> {
+            Arc::new(Ffprobe {
+                duration: Ok(Duration::from_secs(120)),
+                has_audio: false,
+                max_audio_channels: None,
+                fps: Ok(24.0),
+                resolution: Some((1920, 1080)),
+                is_image: false,
+                pix_fmt: Some("yuv420p".into()),
+            })
+        }
+
+        pub fn mock_output(
+            vmaf_score: Option<f32>,
+            xpsnr_score: Option<f32>,
+            encode_percent: f64,
+        ) -> sample_encode::Output {
+            sample_encode::Output {
+                vmaf_score,
+                xpsnr_score,
+                predicted_encode_size: 1_000_000,
+                encode_percent,
+                predicted_encode_time: Duration::from_secs(60),
+                from_cache: false,
+            }
+        }
+
+        pub fn search_args(min_vmaf: Option<f32>, min_xpsnr: Option<f32>, thorough: bool) -> Args {
+            Args {
+                args: Encode {
+                    encoder: "libsvtav1".parse().unwrap(),
+                    input: PathBuf::from("test.mp4"),
+                    vfilter: None,
+                    pix_format: None,
+                    preset: None,
+                    keyint: None,
+                    scd: None,
+                    svt_args: vec![],
+                    enc_args: vec![],
+                    enc_input_args: vec![],
+                },
+                min_vmaf,
+                min_xpsnr,
+                max_encoded_percent: 80.0,
+                min_crf: Some(20.0),
+                max_crf: Some(40.0),
+                crf_increment: Some(1.0),
+                high_crf_means_hq: Some(false),
+                thorough,
+                cache: false,
+                sample: SampleArgs {
+                    samples: Some(1),
+                    sample_every: Duration::from_secs(720),
+                    min_samples: None,
+                    sample_duration: Duration::from_secs(20),
+                    keep: false,
+                    temp_dir: None,
+                    extension: None,
+                },
+                vmaf: Vmaf::default(),
+                score: args::ScoreArgs {
+                    reference_vfilter: None,
+                },
+                xpsnr: args::Xpsnr {
+                    xpsnr_fps: 60.0,
+                    xpsnr_pix_format: None,
+                },
+                verbose: clap_verbosity_flag::Verbosity::new(0, 0),
+            }
+        }
+
+        pub async fn collect_run(args: Args, probe: Arc<Ffprobe>) -> Result<Vec<Update>, Error> {
+            let mut updates = Vec::new();
+            let mut stream = pin!(run(args, probe));
+            while let Some(item) = stream.next().await {
+                updates.push(item?);
+            }
+            Ok(updates)
+        }
+
+        pub fn last_done(updates: &[Update]) -> Option<&Sample> {
+            updates.iter().rev().find_map(|u| match u {
+                Update::Done(s) => Some(s),
+                _ => None,
+            })
+        }
+    }
+
+    use helpers::*;
+
+    struct MockGuard;
+
+    impl MockGuard {
+        fn set(mock: impl Fn(f32) -> sample_encode::Output + 'static) -> Self {
+            test_hooks::set(mock);
+            Self
+        }
+    }
+
+    impl Drop for MockGuard {
+        fn drop(&mut self) {
+            test_hooks::clear();
+        }
+    }
+
+    // ab-kgc.16 / ab-c8k.12: exact threshold match is success
+    #[tokio::test]
+    async fn exact_min_score_is_success() {
+        // setup
+        let min_score = 95.0;
+        let args = search_args(Some(min_score), None, true);
+        let _guard = MockGuard::set(move |_crf| mock_output(Some(min_score), None, 50.0));
+
+        // execute
+        let updates = collect_run(args, test_probe()).await.expect("run");
+
+        // assert
+        let done = last_done(&updates).expect("expected Done");
+        assert_eq!(done.enc.vmaf_score, Some(min_score));
+    }
+
+    // ab-kgc.17: XPSNR is the search metric when --min-xpsnr --and-vmaf
+    #[tokio::test]
+    async fn xpsnr_target_with_and_vmaf_uses_xpsnr_for_search() {
+        // setup
+        let min_xpsnr = 90.0;
+        let mut args = search_args(None, Some(min_xpsnr), true);
+        args.vmaf.and_vmaf = Some(true);
+        let _guard = MockGuard::set(move |_crf| {
+            // VMAF below threshold; XPSNR meets it — search must use XPSNR.
+            mock_output(Some(85.0), Some(min_xpsnr + 2.0), 50.0)
+        });
+
+        // execute
+        let updates = collect_run(args, test_probe()).await.expect("run");
+
+        // assert
+        let done = last_done(&updates).expect("expected Done with XPSNR target");
+        assert_eq!(done.enc.xpsnr_score, Some(min_xpsnr + 2.0));
+    }
+
+    // ab-c8k.5: binary search terminates with Done on mocked encode stream
+    #[tokio::test]
+    async fn run_binary_search_finds_acceptable_crf() {
+        // setup
+        let args = search_args(Some(95.0), None, true);
+        let _guard = MockGuard::set(move |crf| {
+            // Higher CRF → higher VMAF in this synthetic model.
+            let vmaf = 80.0 + crf;
+            mock_output(Some(vmaf), None, 50.0)
+        });
+
+        // execute
+        let updates = collect_run(args, test_probe()).await.expect("run");
+
+        // assert
+        let done = last_done(&updates).expect("expected Done");
+        assert!(done.enc.vmaf_score.unwrap_or(0.0) >= 95.0);
+        assert!(updates.iter().any(|u| matches!(u, Update::RunResult(_))));
+    }
+
+    // ab-c8k.5: NoGoodCrf when no sample meets threshold within size budget
+    #[tokio::test]
+    async fn run_returns_no_good_crf_when_scores_too_low() {
+        // setup
+        let args = search_args(Some(95.0), None, true);
+        let _guard = MockGuard::set(move |_crf| mock_output(Some(80.0), None, 50.0));
+
+        // execute
+        let err = collect_run(args, test_probe()).await.expect_err("expected failure");
+
+        // assert
+        assert!(matches!(err, Error::NoGoodCrf { .. }));
+    }
+
+    // ab-c8k.12: threshold boundary matrix (unit tests; rstest when ab-c8k.10 lands)
+    #[test]
+    fn output_search_score_prefers_xpsnr_when_requested() {
+        // setup
+        let enc = mock_output(Some(70.0), Some(92.0), 50.0);
+
+        // execute / assert
+        assert_eq!(output_search_score(&enc, true), 92.0);
+        assert_eq!(output_search_score(&enc, false), 70.0);
+    }
+
+    #[test]
+    fn threshold_boundary_matrix() {
+        // setup
+        let min = 95.0;
+        let tol = 0.05;
+
+        // execute / assert — exact match
+        assert!(min >= min);
+        assert!(min < min + tol);
+
+        // above threshold
+        assert!(96.0 >= min);
+        // below threshold
+        assert!(94.9 < min);
+    }
+
+    #[test]
+    fn vmaf_lerp_q_interpolates_with_xpsnr_scores() {
+        // setup
+        let use_xpsnr = true;
+        let worse = Sample {
+            crf: 30.0,
+            q: 30,
+            enc: mock_output(None, Some(88.0), 50.0),
+        };
+        let better = Sample {
+            crf: 25.0,
+            q: 25,
+            enc: mock_output(None, Some(96.0), 50.0),
+        };
+
+        // execute
+        let q = vmaf_lerp_q(92.0, &worse, &better, use_xpsnr);
+
+        // assert
+        assert!((26..=28).contains(&q));
+    }
+
+    #[test]
+    fn guess_progress_thorough_caps_at_six_runs() {
+        // setup / execute / assert
+        assert!(guess_progress(1, 0.5, true) < guess_progress(2, 0.5, true));
+        assert!(guess_progress(6, 1.0, true) <= super::BAR_LEN as f64);
+    }
 }

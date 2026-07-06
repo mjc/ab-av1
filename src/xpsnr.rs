@@ -7,6 +7,26 @@ use std::path::Path;
 use tokio::process::Command;
 use tokio_stream::Stream;
 
+/// Build ffmpeg command for XPSNR scoring (testable without spawning).
+pub(crate) fn build_ffmpeg_command(
+    reference: &Path,
+    distorted: &Path,
+    filter_complex: &str,
+    fps: Option<f32>,
+) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-nostdin")
+        .arg2_opt("-r", fps)
+        .arg2("-i", reference)
+        .arg2_opt("-r", fps)
+        .arg2("-i", distorted)
+        .arg2("-filter_complex", filter_complex)
+        .suppress_non_video_streams()
+        .arg2("-f", "null")
+        .arg("-");
+    cmd
+}
+
 /// Calculate XPSNR score using ffmpeg.
 // TODO: fix progress update to account for fps
 pub fn run(
@@ -21,16 +41,7 @@ pub fn run(
         reference.file_name().and_then(|n| n.to_str()).unwrap_or(""),
     );
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-nostdin")
-        .arg2_opt("-r", fps)
-        .arg2("-i", reference)
-        .arg2_opt("-r", fps)
-        .arg2("-i", distorted)
-        .arg2("-filter_complex", filter_complex)
-        .arg2("-f", "null")
-        .arg("-");
-
+    let cmd = build_ffmpeg_command(reference, distorted, filter_complex, fps);
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
     let xpsnr = ManagedProcess::spawn("ffmpeg xpsnr", cmd).context("ffmpeg xpsnr")?;
@@ -109,10 +120,54 @@ fn score_from_line(line: &str) -> Option<f32> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::process::CommandExt;
     use std::env;
+    use std::path::Path;
     use std::pin::Pin;
     use tokio::process::Command;
     use tokio_stream::StreamExt;
+
+    fn assert_suppresses_non_video_streams(cmd: &Command) {
+        // setup
+        let cmd_str = cmd.to_cmd_str();
+        // execute — n/a (command already built)
+        // assert
+        for flag in ["-an", "-sn", "-dn"] {
+            assert!(
+                cmd_str.split_whitespace().any(|arg| arg == flag),
+                "expected {flag} in `{cmd_str}`"
+            );
+        }
+    }
+
+    #[test]
+    fn xpsnr_command_suppresses_non_video_streams() {
+        // setup
+        let cmd = build_ffmpeg_command(
+            Path::new("ref.mkv"),
+            Path::new("dist.mkv"),
+            "[0:v][1:v]xpsnr",
+            Some(25.0),
+        );
+        // execute — n/a
+        // assert
+        assert_suppresses_non_video_streams(&cmd);
+    }
+
+    #[test]
+    fn score_runners_suppress_non_video_streams_consistently() {
+        // setup
+        let reference = Path::new("ref.mkv");
+        let distorted = Path::new("dist.mkv");
+        let filter = "[0:v][1:v]score";
+        let fps = Some(25.0);
+        let vmaf_cmd = crate::vmaf::build_ffmpeg_command(reference, distorted, filter, fps);
+        let xpsnr_cmd = build_ffmpeg_command(reference, distorted, filter, fps);
+        // execute — n/a
+        // assert
+        assert_suppresses_non_video_streams(&vmaf_cmd);
+        assert_suppresses_non_video_streams(&xpsnr_cmd);
+    }
 
     const FIXTURE_ENV: &str = "AB_AV1_MANAGED_PROCESS_FIXTURE";
     const FIXTURE_TEST: &str = "process::managed::tests::managed_process_fixture_child";
