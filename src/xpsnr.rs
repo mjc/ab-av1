@@ -1,6 +1,6 @@
 //! xpsnr logic
 use crate::process::{Chunks, CommandExt, FfmpegOut, managed::ManagedProcess};
-use crate::score_stream::{Score, ScoreStreamParse, run_score_stream};
+use crate::score_stream::{Score, ScoreStreamParse, build_score_ffmpeg_command, run_score_stream};
 use anyhow::Context;
 use log::{debug, info};
 use std::path::Path;
@@ -14,17 +14,7 @@ pub(crate) fn build_ffmpeg_command(
     filter_complex: &str,
     fps: Option<f32>,
 ) -> Command {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-nostdin")
-        .arg2_opt("-r", fps)
-        .arg2("-i", distorted)
-        .arg2_opt("-r", fps)
-        .arg2("-i", reference)
-        .arg2("-filter_complex", filter_complex)
-        .suppress_non_video_streams()
-        .arg2("-f", "null")
-        .arg("-");
-    cmd
+    build_score_ffmpeg_command(reference, distorted, filter_complex, fps)
 }
 
 /// Calculate XPSNR score using ffmpeg.
@@ -111,7 +101,9 @@ fn score_from_minimum_line(line: &str) -> Option<f32> {
         return None;
     }
 
-    let tail = line.find(MIN_PREFIX).map(|yidx| &line[yidx + MIN_PREFIX.len()..])?;
+    let tail = line
+        .find(MIN_PREFIX)
+        .map(|yidx| &line[yidx + MIN_PREFIX.len()..])?;
     if tail.starts_with("inf") {
         return Some(f32::INFINITY);
     }

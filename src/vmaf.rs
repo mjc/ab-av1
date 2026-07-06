@@ -1,6 +1,6 @@
 //! vmaf logic
 use crate::process::{Chunks, CommandExt, FfmpegOut, managed::ManagedProcess};
-use crate::score_stream::{Score, ScoreStreamParse, run_score_stream};
+use crate::score_stream::{Score, ScoreStreamParse, build_score_ffmpeg_command, run_score_stream};
 use anyhow::Context;
 use log::{debug, info};
 use std::path::Path;
@@ -14,19 +14,7 @@ pub(crate) fn build_ffmpeg_command(
     filter_complex: &str,
     fps: Option<f32>,
 ) -> Command {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-nostdin")
-        .arg2_opt("-r", fps)
-        .arg2("-i", distorted)
-        .arg2_opt("-r", fps)
-        .arg2("-i", reference)
-        .arg2("-filter_complex", filter_complex)
-        // Workaround unused streams causing ffmpeg memory leaks
-        // See https://github.com/alexheretic/ab-av1/issues/189
-        .suppress_non_video_streams()
-        .arg2("-f", "null")
-        .arg("-");
-    cmd
+    build_score_ffmpeg_command(reference, distorted, filter_complex, fps)
 }
 
 /// Calculate VMAF score using ffmpeg.
