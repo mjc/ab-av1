@@ -56,7 +56,7 @@ async fn main() {
         Command::Encode(args) => command::encode(args).boxed_local(),
         Command::CrfSearch(args) => command::crf_search(args).boxed_local(),
         Command::AutoEncode(args) => command::auto_encode(args).boxed_local(),
-        Command::PrintCompletions(args) => return command::print_completions(args),
+        Command::PrintCompletions(args) => return command::print_completions(args.into()),
     });
 
     let out = tokio::select! {

@@ -36,7 +36,23 @@ pub struct Args {
     pub encode: args::EncodeToOutput,
 }
 
-pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()> {
+#[derive(Clone)]
+struct AutoEncodeConfig {
+    search: crf_search::CrfSearchConfig,
+    encode: args::EncodeToOutput,
+}
+
+impl From<Args> for AutoEncodeConfig {
+    fn from(Args { search, encode }: Args) -> Self {
+        Self {
+            search: crf_search::CrfSearchConfig::from(search),
+            encode,
+        }
+    }
+}
+
+pub async fn auto_encode(args: Args) -> anyhow::Result<()> {
+    let AutoEncodeConfig { mut search, encode } = AutoEncodeConfig::from(args);
     const SPINNER_RUNNING: &str = "{spinner:.cyan.bold} {elapsed_precise:.bold} {prefix} {wide_bar:.cyan/blue} ({msg}eta {eta})";
     const SPINNER_FINISHED: &str =
         "{spinner:.cyan.bold} {elapsed_precise:.bold} {prefix} {wide_bar:.cyan/blue} ({msg})";
@@ -55,8 +71,6 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
     let output = resolved.planned.path().to_path_buf();
 
     search.sample.set_extension_from_output(&output);
-    search.validate()?;
-    let search = crf_search::CrfSearchConfig::from(search);
     search.validate()?;
 
     let bar = ProgressBar::new(BAR_LEN).with_style(
@@ -203,10 +217,73 @@ mod tests {
         },
         temporary::{self, TempKind},
     };
-    use std::{env, fs, path::PathBuf, time::Duration};
+    use std::{env, fs, path::{Path, PathBuf}, time::Duration};
     use tokio::sync::Mutex;
 
     static AUTO_ENCODE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[test]
+    fn args_lower_to_auto_encode_config() {
+        let args = Args {
+            search: crf_search::Args {
+                args: Encode {
+                    encoder: "libsvtav1".parse().unwrap(),
+                    input: PathBuf::from("input.mkv"),
+                    vfilter: None,
+                    pix_format: None,
+                    preset: None,
+                    keyint: None,
+                    scd: None,
+                    svt_args: vec![],
+                    enc_args: vec![],
+                    enc_input_args: vec![],
+                },
+                min_vmaf: crate::command::crf_search::MinScore::new(95.0).ok(),
+                min_xpsnr: None,
+                max_encoded_percent: crate::command::crf_search::MaxEncodedPercent::new(80.0)
+                    .unwrap(),
+                min_crf: crate::command::crf_search::Crf::try_new(20.0).ok(),
+                max_crf: crate::command::crf_search::Crf::try_new(40.0).ok(),
+                crf_increment: Some(crate::command::crf_search::CrfStep::try_new(1.0).unwrap()),
+                high_crf_means_hq: Some(false),
+                thorough: true,
+                cache: false,
+                sample: SampleArgs {
+                    samples: Some(args::SampleCountOverride::new(1)),
+                    sample_every: match args::SampleDuration::new(Duration::from_secs(720)) {
+                        Ok(duration) => duration,
+                        Err(err) => panic!("invalid test sample_every: {err}"),
+                    },
+                    min_samples: None,
+                    sample_duration: match args::SampleDuration::new(Duration::from_secs(20)) {
+                        Ok(duration) => duration,
+                        Err(err) => panic!("invalid test sample_duration: {err}"),
+                    },
+                    keep: false,
+                    temp_dir: None,
+                    extension: None,
+                },
+                vmaf: Vmaf::default(),
+                score: args::ScoreArgs {
+                    reference_vfilter: None,
+                },
+                xpsnr: args::Xpsnr::default(),
+                verbose: clap_verbosity_flag::Verbosity::new(0, 0),
+            },
+            encode: args::EncodeToOutput {
+                output: Some(PathBuf::from("out.mkv")),
+                audio_codec: None,
+                downmix_to_stereo: false,
+                video_only: false,
+                overwrite_input: false,
+            },
+        };
+
+        let config = AutoEncodeConfig::from(args);
+
+        assert_eq!(config.search.args.input, PathBuf::from("input.mkv"));
+        assert_eq!(config.encode.output.as_deref(), Some(Path::new("out.mkv")));
+    }
 
     mod helpers {
         use super::*;

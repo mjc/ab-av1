@@ -467,6 +467,7 @@ pub fn run(
             crf: 0.0,
             sample: sample.clone(),
             cache,
+            stdout_format: sample_encode::StdoutFormat::Human,
             scoring,
         };
 

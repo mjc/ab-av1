@@ -302,6 +302,25 @@ where
 }
 
 impl Encode {
+    fn default_preset(&self, svtav1: bool) -> Option<Arc<str>> {
+        match &self.preset {
+            Some(preset) => Some(preset.clone()),
+            None if svtav1 => Some("8".into()),
+            None => None,
+        }
+    }
+
+    fn inferred_pix_fmt(&self, vcodec: &str) -> Option<PixelFormat> {
+        self.pix_format.or(match vcodec {
+            "libsvtav1" | "libaom-av1" | "librav1e" => Some(PixelFormat::Yuv420p10le),
+            _ => None,
+        })
+    }
+
+    fn default_input_args(&self) -> CollectedPassthroughArgs {
+        collect_passthrough_args(&self.enc_input_args, &["-hwaccel", "-hwaccel_output_format"])
+    }
+
     pub fn encode_hint(&self, crf: f32) -> String {
         let Self {
             encoder,
@@ -374,11 +393,7 @@ impl Encode {
         )
         .map_err(anyhow::Error::new)?;
 
-        let preset = match &self.preset {
-            Some(n) => Some(n.clone()),
-            None if svtav1 => Some("8".into()),
-            None => None,
-        };
+        let preset = self.default_preset(svtav1);
 
         let keyint = self.keyint(probe)?;
 
@@ -431,15 +446,9 @@ impl Encode {
             }
         }
 
-        let pix_fmt = self.pix_format.or_else(|| match &**vcodec {
-            "libsvtav1" | "libaom-av1" | "librav1e" => Some(PixelFormat::Yuv420p10le),
-            _ => None,
-        });
+        let pix_fmt = self.inferred_pix_fmt(vcodec);
 
-        let mut input_args = collect_passthrough_args(
-            &self.enc_input_args,
-            &["-hwaccel", "-hwaccel_output_format"],
-        );
+        let mut input_args = self.default_input_args();
 
         for (name, val) in self.encoder.default_ffmpeg_input_args() {
             if !input_args.omitted_defaults.contains(name)

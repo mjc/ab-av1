@@ -22,9 +22,9 @@ pub struct SpawnConfig {
 
 /// Validated encode inputs lowered from the raw clap surface.
 pub(crate) struct EncodeConfig {
-    encode: args::Encode,
-    crf: f32,
-    encode_to: args::EncodeToOutput,
+    pub(crate) encode: args::Encode,
+    pub(crate) crf: f32,
+    pub(crate) encode_to: args::EncodeToOutput,
 }
 
 impl From<Args> for EncodeConfig {

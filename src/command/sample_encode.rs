@@ -108,6 +108,7 @@ pub struct SampleEncodeConfig {
     pub crf: f32,
     pub sample: args::Sample,
     pub cache: bool,
+    pub stdout_format: StdoutFormat,
     pub scoring: ScoringConfig,
 }
 
@@ -118,7 +119,7 @@ impl From<Args> for SampleEncodeConfig {
             crf,
             sample,
             cache,
-            stdout_format: _,
+            stdout_format,
             vmaf,
             score,
             xpsnr_opts,
@@ -130,6 +131,7 @@ impl From<Args> for SampleEncodeConfig {
             crf: crf.get(),
             sample,
             cache,
+            stdout_format,
             scoring: ScoringConfig {
                 score: score.into(),
                 vmaf: vmaf.into(),
@@ -140,9 +142,10 @@ impl From<Args> for SampleEncodeConfig {
     }
 }
 
-pub async fn sample_encode(mut args: Args) -> anyhow::Result<()> {
+pub async fn sample_encode(args: Args) -> anyhow::Result<()> {
     const BAR_LEN: u64 = 1024 * 1024 * 1024;
     const BAR_LEN_F: f32 = BAR_LEN as _;
+    let mut config = SampleEncodeConfig::from(args);
 
     let bar = ProgressBar::new(BAR_LEN).with_style(
         ProgressStyle::default_bar()
@@ -151,16 +154,17 @@ pub async fn sample_encode(mut args: Args) -> anyhow::Result<()> {
     );
     bar.enable_steady_tick(Duration::from_millis(100));
 
-    let probe = ffprobe::probe(&args.args.input);
-    args.sample
-        .set_extension_from_input(&args.args.input, &args.args.encoder, &probe);
+    let probe = ffprobe::probe(&config.args.input);
+    config
+        .sample
+        .set_extension_from_input(&config.args.input, &config.args.encoder, &probe);
 
-    let enc_args = args.args.clone();
-    let crf = args.crf.get();
-    let stdout_fmt = args.stdout_format;
+    let enc_args = config.args.clone();
+    let crf = config.crf;
+    let stdout_fmt = config.stdout_format;
     let input_is_image = probe.is_image;
 
-    let mut run = pin!(run(SampleEncodeConfig::from(args), probe.into()));
+    let mut run = pin!(run(config, probe.into()));
     while let Some(update) = run.next().await {
         match update? {
             Update::Status(Status {
@@ -206,6 +210,7 @@ pub fn run(
         crf,
         sample: sample_args,
         cache,
+        stdout_format: _,
         scoring,
     }: SampleEncodeConfig,
     input_probe: Arc<Ffprobe>,
