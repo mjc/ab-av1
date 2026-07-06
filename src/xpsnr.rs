@@ -79,10 +79,7 @@ impl XpsnrOut {
     }
 
     fn try_parse_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<ScoreStreamParse> {
-        match try_parse_xpsnr_score_chunk(chunk, chunks) {
-            Ok(event) => event,
-            Err(err) => unreachable!("pure XPSNR parser returned error event: {err}"),
-        }
+        try_parse_xpsnr_score_chunk(chunk, chunks).ok().flatten()
     }
 
     #[cfg(test)]

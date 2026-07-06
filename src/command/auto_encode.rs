@@ -218,7 +218,11 @@ mod tests {
         },
         temporary::{self, TempKind},
     };
-    use std::{env, fs, path::{Path, PathBuf}, time::Duration};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
     use tokio::sync::Mutex;
 
     static AUTO_ENCODE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
@@ -483,7 +487,9 @@ mod tests {
         let _guard = MockGuard::crf(|_crf| mock_output(80.0));
 
         // execute
-        let err = auto_encode(args.into()).await.expect_err("expected NoGoodCrf");
+        let err = auto_encode(args.into())
+            .await
+            .expect_err("expected NoGoodCrf");
 
         // assert
         assert!(err.to_string().contains("Failed to find a suitable crf"));

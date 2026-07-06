@@ -67,13 +67,12 @@ impl VmafOut {
     }
 
     fn try_parse_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<ScoreStreamParse> {
-        Self::try_from_chunk(chunk, chunks).map(|out| match out {
-            Self::Progress(progress) => ScoreStreamParse::Progress(progress),
-            Self::Done(score) => ScoreStreamParse::LogicalDone(Score::new(score)),
-            Self::Err(err) => unreachable!("pure VMAF parser returned error event: {err}"),
-        })
+        parse_score_chunk(chunk, chunks, parse_vmaf_score_line)
+            .ok()
+            .flatten()
     }
 
+    #[cfg(test)]
     fn try_from_chunk(chunk: &[u8], chunks: &mut Chunks) -> Option<Self> {
         match parse_score_chunk(chunk, chunks, parse_vmaf_score_line) {
             Ok(Some(event)) => Some(Self::from_parse(event)),

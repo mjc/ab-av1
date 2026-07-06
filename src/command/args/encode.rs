@@ -255,6 +255,17 @@ impl<'a> PassthroughArg<'a> {
     fn is_svtav1_params(self) -> bool {
         self.option.trim_start_matches('-') == "svtav1-params"
     }
+
+    fn omitted_default(self, omit_default_value_for: &[&'static str]) -> Option<&'static str> {
+        (self.value == Some("none"))
+            .then(|| {
+                omit_default_value_for
+                    .iter()
+                    .copied()
+                    .find(|name| *name == self.option)
+            })
+            .flatten()
+    }
 }
 
 fn owned_arg(arg: &str) -> Arc<String> {
@@ -273,24 +284,18 @@ fn collect_passthrough_args<'a, T>(
 where
     T: AsRef<str> + 'a,
 {
-    let mut omitted_defaults = Vec::new();
+    let (omitted, args): (Vec<_>, Vec<_>) = args
+        .into_iter()
+        .map(|arg| PassthroughArg::parse(arg.as_ref()))
+        .partition(|arg| arg.omitted_default(omit_default_value_for).is_some());
+
+    let omitted_defaults = omitted
+        .into_iter()
+        .filter_map(|arg| arg.omitted_default(omit_default_value_for))
+        .collect();
 
     let args = args
         .into_iter()
-        .map(|arg| PassthroughArg::parse(arg.as_ref()))
-        .filter(|arg| {
-            if arg.value == Some("none")
-                && let Some(name) = omit_default_value_for
-                    .iter()
-                    .copied()
-                    .find(|name| *name == arg.option)
-            {
-                omitted_defaults.push(name);
-                return false;
-            }
-
-            true
-        })
         .flat_map(PassthroughArg::values)
         .map(owned_arg)
         .collect();
@@ -310,15 +315,15 @@ impl Encode {
         }
     }
 
-    fn inferred_pix_fmt(&self, vcodec: &str) -> Option<PixelFormat> {
-        self.pix_format.or(match vcodec {
-            "libsvtav1" | "libaom-av1" | "librav1e" => Some(PixelFormat::Yuv420p10le),
-            _ => None,
-        })
+    fn inferred_pix_fmt(&self) -> Option<PixelFormat> {
+        self.pix_format.or_else(|| self.encoder.default_pix_fmt())
     }
 
     fn default_input_args(&self) -> CollectedPassthroughArgs {
-        collect_passthrough_args(&self.enc_input_args, &["-hwaccel", "-hwaccel_output_format"])
+        collect_passthrough_args(
+            &self.enc_input_args,
+            &["-hwaccel", "-hwaccel_output_format"],
+        )
     }
 
     pub fn encode_hint(&self, crf: f32) -> String {
@@ -372,7 +377,12 @@ impl Encode {
             .unwrap();
         }
         for arg in enc_args {
-            write!(hint, " --enc {}", PassthroughArg::parse(arg.as_str()).hint_value()).unwrap();
+            write!(
+                hint,
+                " --enc {}",
+                PassthroughArg::parse(arg.as_str()).hint_value()
+            )
+            .unwrap();
         }
 
         hint
@@ -446,7 +456,7 @@ impl Encode {
             }
         }
 
-        let pix_fmt = self.inferred_pix_fmt(vcodec);
+        let pix_fmt = self.inferred_pix_fmt();
 
         let mut input_args = self.default_input_args();
 
@@ -564,6 +574,13 @@ impl Encoder {
             "libx265" => "265",
             // otherwise assume av1
             _ => "avif",
+        }
+    }
+
+    fn default_pix_fmt(&self) -> Option<PixelFormat> {
+        match self.as_str() {
+            "libsvtav1" | "libaom-av1" | "librav1e" => Some(PixelFormat::Yuv420p10le),
+            _ => None,
         }
     }
 
@@ -962,12 +979,11 @@ fn collect_passthrough_args_omits_none_for_default_inputs() {
         EncoderInputArg::from("-hwaccel_output_format=none"),
     ];
 
-    assert!(collect_passthrough_args(
-        &args,
-        &["-hwaccel", "-hwaccel_output_format"]
-    )
-    .args
-    .is_empty());
+    assert!(
+        collect_passthrough_args(&args, &["-hwaccel", "-hwaccel_output_format"])
+            .args
+            .is_empty()
+    );
 }
 
 // ab-kgc.30: CLI docs promise 0.1 increment for libvpx-vp9

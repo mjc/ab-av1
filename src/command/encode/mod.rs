@@ -67,7 +67,11 @@ pub async fn encode(config: plan::EncodeConfig) -> anyhow::Result<()> {
     run(config, probe.into(), &bar).await
 }
 
-pub async fn run(config: plan::EncodeConfig, probe: Arc<Ffprobe>, bar: &ProgressBar) -> anyhow::Result<()> {
+pub async fn run(
+    config: plan::EncodeConfig,
+    probe: Arc<Ffprobe>,
+    bar: &ProgressBar,
+) -> anyhow::Result<()> {
     #[cfg(test)]
     {
         run_with_spawner(config, probe, bar, &spawner::ThreadLocalFixtureSpawner).await

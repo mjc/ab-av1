@@ -114,13 +114,7 @@ $ RUST_LOG=ab_av1=debug ab-av1 auto-encode -i vid.mkv
 ```
 
 ## Fast Checks
-Use the repository task target for the quick clippy gate:
-
-```sh
-./scripts/clippy-fast
-```
-
-This runs:
+Use the same strict clippy gate as CI:
 
 ```sh
 cargo clippy --all-targets --all-features -- -D warnings

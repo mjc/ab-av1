@@ -22,7 +22,15 @@ fn crf_search_validation_error_reaches_stderr() {
 
 #[test]
 fn encode_validation_error_reaches_stderr() {
-    let output = run_ab_av1(&["encode", "--input", "input.mkv", "--crf", "30", "--enc", "-crf=32"]);
+    let output = run_ab_av1(&[
+        "encode",
+        "--input",
+        "input.mkv",
+        "--crf",
+        "30",
+        "--enc",
+        "-crf=32",
+    ]);
 
     assert!(!output.status.success());
     assert_eq!(output.status.code(), Some(1));
