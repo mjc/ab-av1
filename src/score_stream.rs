@@ -3,6 +3,7 @@ use crate::process::{
     managed::{ManagedEvent, ManagedProcess},
 };
 use std::path::Path;
+use thiserror::Error;
 use tokio::process::Command;
 use tokio_stream::{Stream, StreamExt};
 
@@ -15,9 +16,46 @@ pub enum ScoreStreamParse {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Score(f32);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ScoreError {
+    #[error("score must not be NaN")]
+    Nan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ParsedScore {
+    Miss,
+    Score(Score),
+    Invalid(ScoreError),
+}
+
+impl ParsedScore {
+    pub fn from_score(score: Result<Score, ScoreError>) -> Self {
+        match score {
+            Ok(score) => Self::Score(score),
+            Err(err) => Self::Invalid(err),
+        }
+    }
+
+    pub fn hit(self) -> Option<Self> {
+        match self {
+            Self::Miss => None,
+            hit => Some(hit),
+        }
+    }
+}
+
 impl Score {
+    pub fn try_new(score: f32) -> Result<Self, ScoreError> {
+        if score.is_nan() {
+            Err(ScoreError::Nan)
+        } else {
+            Ok(Self(score))
+        }
+    }
+
     pub fn new(score: f32) -> Self {
-        Self(score)
+        Self::try_new(score).expect("score must not be NaN")
     }
 
     pub fn get(self) -> f32 {
@@ -177,6 +215,19 @@ mod tests {
             completion,
             LogicalScoreCompletion::Done(Score::new(97.5)),
             "duplicate score lines must not overwrite the first logical score"
+        );
+    }
+
+    #[test]
+    fn score_rejects_nan() {
+        assert_eq!(Score::try_new(f32::NAN), Err(ScoreError::Nan));
+    }
+
+    #[test]
+    fn score_accepts_infinity_for_xpsnr() {
+        assert_eq!(
+            Score::try_new(f32::INFINITY).map(Score::get),
+            Ok(f32::INFINITY)
         );
     }
 }
