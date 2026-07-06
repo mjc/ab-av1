@@ -125,7 +125,9 @@ impl FrameCount {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FrameRate(f64);
+pub struct FrameRate {
+    fps: f64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FrameRateError {
@@ -136,14 +138,14 @@ pub enum FrameRateError {
 impl FrameRate {
     pub fn try_new(fps: f64) -> Result<Self, FrameRateError> {
         if fps.is_finite() && fps > 0.0 {
-            Ok(Self(fps))
+            Ok(Self { fps })
         } else {
             Err(FrameRateError::Invalid)
         }
     }
 
     fn frames_per_second(self) -> f64 {
-        self.0
+        self.fps
     }
 
     pub fn one_frame_duration(self) -> Duration {
@@ -1323,7 +1325,7 @@ mod tests {
 
     #[test]
     fn frame_rate_is_a_local_checked_f64_newtype() {
-        let rate = FrameRate(29.97);
+        let rate = FrameRate { fps: 29.97 };
 
         assert_eq!(rate.frames_per_second(), 29.97);
     }

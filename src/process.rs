@@ -59,6 +59,42 @@ pub fn cmd_err(err: impl Display, cmd_str: &str, stderr: &Chunks) -> anyhow::Err
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FfmpegProgress {
+    frame: u64,
+    fps: f32,
+    time: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfmpegStreamSizes {
+    video: u64,
+    audio: u64,
+    subtitle: u64,
+    other: u64,
+}
+
+impl From<FfmpegProgress> for FfmpegOut {
+    fn from(progress: FfmpegProgress) -> Self {
+        Self::Progress {
+            frame: progress.frame,
+            fps: progress.fps,
+            time: progress.time,
+        }
+    }
+}
+
+impl From<FfmpegStreamSizes> for FfmpegOut {
+    fn from(sizes: FfmpegStreamSizes) -> Self {
+        Self::StreamSizes {
+            video: sizes.video,
+            audio: sizes.audio,
+            subtitle: sizes.subtitle,
+            other: sizes.other,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum FfmpegOut {
     Progress {
@@ -76,32 +112,11 @@ pub enum FfmpegOut {
 
 impl FfmpegOut {
     pub fn try_parse(line: &str) -> Option<Self> {
-        if line.starts_with("frame=") {
-            let frame: u64 = parse_label_substr("frame=", line)?.parse().ok()?;
-            let fps: f32 = parse_label_substr("fps=", line)?.parse().ok()?;
-            let (h, m, s, ns) = time::Time::parse(
-                parse_label_substr("time=", line)?,
-                &format_description!("[hour]:[minute]:[second].[subsecond]"),
-            )
-            .ok()?
-            .as_hms_nano();
-            return Some(Self::Progress {
-                frame,
-                fps,
-                time: Duration::new(h as u64 * 60 * 60 + m as u64 * 60 + s as u64, ns),
-            });
+        if let Some(progress) = parse_ffmpeg_progress(line) {
+            return Some(progress.into());
         }
-        if line.starts_with("video:") && line.contains("muxing overhead") {
-            let video = parse_label_size("video:", line)?;
-            let audio = parse_label_size("audio:", line)?;
-            let subtitle = parse_label_size("subtitle:", line)?;
-            let other = parse_label_size("other streams:", line)?;
-            return Some(Self::StreamSizes {
-                video,
-                audio,
-                subtitle,
-                other,
-            });
+        if let Some(sizes) = parse_ffmpeg_stream_sizes(line) {
+            return Some(sizes.into());
         }
         None
     }
@@ -115,6 +130,40 @@ impl FfmpegOut {
             completion: FfmpegProcessCompletion::Pending,
         }
     }
+}
+
+pub(crate) fn parse_ffmpeg_progress(line: &str) -> Option<FfmpegProgress> {
+    if !line.starts_with("frame=") {
+        return None;
+    }
+
+    let frame = parse_label_substr("frame=", line)?.parse().ok()?;
+    let fps = parse_label_substr("fps=", line)?.parse().ok()?;
+    let (h, m, s, ns) = time::Time::parse(
+        parse_label_substr("time=", line)?,
+        &format_description!("[hour]:[minute]:[second].[subsecond]"),
+    )
+    .ok()?
+    .as_hms_nano();
+
+    Some(FfmpegProgress {
+        frame,
+        fps,
+        time: Duration::new(h as u64 * 60 * 60 + m as u64 * 60 + s as u64, ns),
+    })
+}
+
+pub(crate) fn parse_ffmpeg_stream_sizes(line: &str) -> Option<FfmpegStreamSizes> {
+    if !(line.starts_with("video:") && line.contains("muxing overhead")) {
+        return None;
+    }
+
+    Some(FfmpegStreamSizes {
+        video: parse_label_size("video:", line)?,
+        audio: parse_label_size("audio:", line)?,
+        subtitle: parse_label_size("subtitle:", line)?,
+        other: parse_label_size("other streams:", line)?,
+    })
 }
 
 /// Parse a ffmpeg `label=  value ` type substring.
@@ -345,6 +394,19 @@ impl Stream for FfmpegOutStream {
 }
 
 #[test]
+fn parse_ffmpeg_progress_returns_typed_progress() {
+    let out = "frame=  161 fps= 73 q=-0.0 size=  978076kB time=00:00:06.71 bitrate=1193201.6kbits/s dup=13 drop=0 speed=3.03x    ";
+    assert_eq!(
+        parse_ffmpeg_progress(out),
+        Some(FfmpegProgress {
+            frame: 161,
+            fps: 73.0,
+            time: Duration::new(6, 710_000_000),
+        })
+    );
+}
+
+#[test]
 fn parse_ffmpeg_progress_chunk() {
     let out = "frame=  288 fps= 94 q=-0.0 size=N/A time=01:23:12.34 bitrate=N/A speed=3.94x    \r";
     assert_eq!(
@@ -377,7 +439,21 @@ fn parse_ffmpeg_progress_na_time() {
 }
 
 #[test]
-fn parse_ffmpeg_stream_sizes() {
+fn parse_ffmpeg_stream_sizes_returns_typed_sizes() {
+    let out = "video:2897022kB audio:537162kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.289700%\n";
+    assert_eq!(
+        parse_ffmpeg_stream_sizes(out),
+        Some(FfmpegStreamSizes {
+            video: 2897022 * 1024,
+            audio: 537162 * 1024,
+            subtitle: 0,
+            other: 0,
+        })
+    );
+}
+
+#[test]
+fn parse_ffmpeg_out_stream_sizes() {
     let out = "video:2897022kB audio:537162kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.289700%\n";
     assert_eq!(
         FfmpegOut::try_parse(out),
