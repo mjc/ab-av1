@@ -341,8 +341,64 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+    #[derive(Clone, Copy)]
+    struct WorkerTestConfig {
+        once: bool,
+    }
+
+    impl WorkerTestConfig {
+        fn continuous() -> Self {
+            Self { once: false }
+        }
+    }
+
+    struct FakeCoordinator {
+        address: std::net::SocketAddr,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeCoordinator {
+        async fn with_no_work_replies(no_work_replies: usize) -> Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept connection");
+                let socket = accept_async(stream).await.expect("accept websocket");
+                let (mut writer, mut reader) = socket.split();
+
+                expect_join(&mut reader).await;
+                send_join_reply(&mut writer).await;
+                expect_announce(&mut reader).await;
+                send_announce_reply(&mut writer).await;
+
+                for request_ref in 3..(3 + no_work_replies as u64) {
+                    expect_pull_work(&mut reader, request_ref).await;
+                    send_no_work_reply(&mut writer, request_ref).await;
+                }
+            });
+
+            Ok(Self { address, server })
+        }
+
+        fn worker_config(&self, config: WorkerTestConfig) -> WorkerConfig {
+            WorkerConfig {
+                connect: format!("http://{}", self.address),
+                token: "test-worker-token".into(),
+                worker_id: "abav1-dev".into(),
+                version: "0.11.4".into(),
+                protocol_version: 1,
+                once: config.once,
+            }
+        }
+
+        async fn finish(self) {
+            self.server.await.expect("server task");
+        }
+    }
+
     #[test]
-    fn args_lower_to_worker_config() {
+    fn args_lowers_to_worker_config() {
         let config = WorkerConfig::from(Args {
             connect: "http://127.0.0.1:4000".into(),
             token: "token".into(),
@@ -357,6 +413,7 @@ mod tests {
         assert_eq!(config.worker_id, "abav1-dev");
         assert_eq!(config.version, "0.11.4");
         assert_eq!(config.protocol_version, 1);
+        assert!(!config.once);
     }
 
     #[test]
@@ -371,88 +428,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worker_session_joins_announces_and_requests_work() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
+        let coordinator = FakeCoordinator::with_no_work_replies(1).await?;
 
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept connection");
-            let socket = accept_async(stream).await.expect("accept websocket");
-            let (mut writer, mut reader) = socket.split();
-
-            assert_text_message(
-                reader.next().await.expect("join frame").expect("join message"),
-                json!(["1", "1", CRF_SEARCH_TOPIC, "phx_join", {}]),
-            );
-            writer
-                .send(Message::Text(
-                    json!([null, "1", CRF_SEARCH_TOPIC, "phx_reply", {
-                        "status": "ok",
-                        "response": {"worker_id": "worker-123"}
-                    }])
-                    .to_string(),
-                ))
-                .await
-                .expect("send join reply");
-
-            assert_text_message(
-                reader
-                    .next()
-                    .await
-                    .expect("announce frame")
-                    .expect("announce message"),
-                json!([
-                    "1",
-                    "2",
-                    CRF_SEARCH_TOPIC,
-                    "announce",
-                    {
-                        "worker_id": "abav1-dev",
-                        "protocol_version": 1,
-                        "version": "0.11.4",
-                        "capabilities": {"crf_search": true}
-                    }
-                ]),
-            );
-            writer
-                .send(Message::Text(
-                    json!([null, "2", CRF_SEARCH_TOPIC, "phx_reply", {
-                        "status": "ok",
-                        "response": {"accepted": true, "protocol_version": 1}
-                    }])
-                    .to_string(),
-                ))
-                .await
-                .expect("send announce reply");
-
-            assert_text_message(
-                reader
-                    .next()
-                    .await
-                    .expect("pull_work frame")
-                    .expect("pull_work message"),
-                json!(["1", "3", CRF_SEARCH_TOPIC, "pull_work", {}]),
-            );
-            writer
-                .send(Message::Text(
-                    json!([null, "3", CRF_SEARCH_TOPIC, "phx_reply", {
-                        "status": "ok",
-                        "response": {"status": "no_work"}
-                    }])
-                    .to_string(),
-                ))
-                .await
-                .expect("send pull_work reply");
-        });
-
-        let session = run_worker_session(&WorkerConfig {
-            connect: format!("http://{address}"),
-            token: "test-worker-token".into(),
-            worker_id: "abav1-dev".into(),
-            version: "0.11.4".into(),
-            protocol_version: 1,
-            once: false,
-        })
-        .await?;
+        let session = run_worker_session(&coordinator.worker_config(WorkerTestConfig::continuous())).await?;
 
         assert_eq!(
             session,
@@ -463,101 +441,16 @@ mod tests {
             }
         );
 
-        server.await.expect("server task");
+        coordinator.finish().await;
         Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn worker_stays_connected_and_pulls_work_again_after_no_work() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept connection");
-            let socket = accept_async(stream).await.expect("accept websocket");
-            let (mut writer, mut reader) = socket.split();
-
-            assert_text_message(
-                reader.next().await.expect("join frame").expect("join message"),
-                json!(["1", "1", CRF_SEARCH_TOPIC, "phx_join", {}]),
-            );
-            writer
-                .send(Message::Text(
-                    json!([null, "1", CRF_SEARCH_TOPIC, "phx_reply", {
-                        "status": "ok",
-                        "response": {"worker_id": "worker-123"}
-                    }])
-                    .to_string(),
-                ))
-                .await
-                .expect("send join reply");
-
-            assert_text_message(
-                reader.next().await.expect("announce frame").expect("announce message"),
-                json!([
-                    "1",
-                    "2",
-                    CRF_SEARCH_TOPIC,
-                    "announce",
-                    {
-                        "worker_id": "abav1-dev",
-                        "protocol_version": 1,
-                        "version": "0.11.4",
-                        "capabilities": {"crf_search": true}
-                    }
-                ]),
-            );
-            writer
-                .send(Message::Text(
-                    json!([null, "2", CRF_SEARCH_TOPIC, "phx_reply", {
-                        "status": "ok",
-                        "response": {"accepted": true, "protocol_version": 1}
-                    }])
-                    .to_string(),
-                ))
-                .await
-                .expect("send announce reply");
-
-            assert_text_message(
-                reader.next().await.expect("first pull").expect("first pull message"),
-                json!(["1", "3", CRF_SEARCH_TOPIC, "pull_work", {}]),
-            );
-            writer
-                .send(Message::Text(
-                    json!([null, "3", CRF_SEARCH_TOPIC, "phx_reply", {
-                        "status": "ok",
-                        "response": {"status": "no_work"}
-                    }])
-                    .to_string(),
-                ))
-                .await
-                .expect("send first pull reply");
-
-            assert_text_message(
-                reader.next().await.expect("second pull").expect("second pull message"),
-                json!(["1", "4", CRF_SEARCH_TOPIC, "pull_work", {}]),
-            );
-            writer
-                .send(Message::Text(
-                    json!([null, "4", CRF_SEARCH_TOPIC, "phx_reply", {
-                        "status": "ok",
-                        "response": {"status": "no_work"}
-                    }])
-                    .to_string(),
-                ))
-                .await
-                .expect("send second pull reply");
-        });
+        let coordinator = FakeCoordinator::with_no_work_replies(2).await?;
 
         run_worker_until(
-            &WorkerConfig {
-                connect: format!("http://{address}"),
-                token: "test-worker-token".into(),
-                worker_id: "abav1-dev".into(),
-                version: "0.11.4".into(),
-                protocol_version: 1,
-                once: false,
-            },
+            &coordinator.worker_config(WorkerTestConfig::continuous()),
             WorkerRuntime {
                 idle_delay: Duration::from_millis(1),
                 reconnect_delay: Duration::from_millis(1),
@@ -566,8 +459,104 @@ mod tests {
         )
         .await?;
 
-        server.await.expect("server task");
+        coordinator.finish().await;
         Ok(())
+    }
+
+    async fn expect_join<R>(reader: &mut R)
+    where
+        R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        assert_text_message(
+            reader.next().await.expect("join frame").expect("join message"),
+            json!(["1", "1", CRF_SEARCH_TOPIC, "phx_join", {}]),
+        );
+    }
+
+    async fn expect_announce<R>(reader: &mut R)
+    where
+        R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        assert_text_message(
+            reader.next().await.expect("announce frame").expect("announce message"),
+            json!([
+                "1",
+                "2",
+                CRF_SEARCH_TOPIC,
+                "announce",
+                {
+                    "worker_id": "abav1-dev",
+                    "protocol_version": 1,
+                    "version": "0.11.4",
+                    "capabilities": {"crf_search": true}
+                }
+            ]),
+        );
+    }
+
+    async fn expect_pull_work<R>(reader: &mut R, request_ref: u64)
+    where
+        R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        assert_text_message(
+            reader
+                .next()
+                .await
+                .expect("pull_work frame")
+                .expect("pull_work message"),
+            json!(["1", request_ref.to_string(), CRF_SEARCH_TOPIC, "pull_work", {}]),
+        );
+    }
+
+    async fn send_join_reply<W>(writer: &mut W)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        writer
+            .send(Message::Text(
+                json!([null, "1", CRF_SEARCH_TOPIC, "phx_reply", {
+                    "status": "ok",
+                    "response": {"worker_id": "worker-123"}
+                }])
+                .to_string(),
+            ))
+            .await
+            .expect("send join reply");
+    }
+
+    async fn send_announce_reply<W>(writer: &mut W)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        writer
+            .send(Message::Text(
+                json!([null, "2", CRF_SEARCH_TOPIC, "phx_reply", {
+                    "status": "ok",
+                    "response": {"accepted": true, "protocol_version": 1}
+                }])
+                .to_string(),
+            ))
+            .await
+            .expect("send announce reply");
+    }
+
+    async fn send_no_work_reply<W>(writer: &mut W, request_ref: u64)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        writer
+            .send(Message::Text(
+                json!([null, request_ref.to_string(), CRF_SEARCH_TOPIC, "phx_reply", {
+                    "status": "ok",
+                    "response": {"status": "no_work"}
+                }])
+                .to_string(),
+            ))
+            .await
+            .expect("send pull_work reply");
     }
 
     fn assert_text_message(message: Message, expected: Value) {
