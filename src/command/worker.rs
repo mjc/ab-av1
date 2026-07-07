@@ -176,6 +176,58 @@ struct ConnectedWorker {
     socket: WorkerSocket,
 }
 
+impl ConnectedWorker {
+    async fn connect(config: &WorkerConfig) -> Result<Self> {
+        let request_url = worker_websocket_url(&config.connect, &config.token)?;
+        let (mut socket, _) = connect_async(&request_url)
+            .await
+            .map_err(|error| websocket_connect_error(&request_url, error))?;
+
+        send_json(&mut socket, json!(["1", "1", CRF_SEARCH_TOPIC, "phx_join", {}])).await?;
+        let join: JoinResponse = expect_reply(&mut socket, "1", "phx_join").await?;
+
+        send_json(
+            &mut socket,
+            json!([
+                "1",
+                "2",
+                CRF_SEARCH_TOPIC,
+                "announce",
+                AnnouncePayload {
+                    worker_id: &config.worker_id,
+                    protocol_version: config.protocol_version,
+                    version: &config.version,
+                    capabilities: Capabilities { crf_search: true },
+                }
+            ]),
+        )
+        .await?;
+        let announce: AnnounceResponse = expect_reply(&mut socket, "2", "announce").await?;
+        if !announce.accepted {
+            bail!("worker announcement was not accepted");
+        }
+
+        Ok(Self {
+            assigned_worker_id: join.worker_id,
+            negotiated_protocol_version: announce.protocol_version,
+            next_ref: 3,
+            socket,
+        })
+    }
+
+    async fn request_work(&mut self) -> Result<PullWorkResponse> {
+        let request_ref = self.next_ref.to_string();
+        self.next_ref += 1;
+
+        send_json(
+            &mut self.socket,
+            json!(["1", request_ref, CRF_SEARCH_TOPIC, "pull_work", {}]),
+        )
+        .await?;
+        expect_reply(&mut self.socket, &request_ref, "pull_work").await
+    }
+}
+
 pub async fn worker(config: WorkerConfig) -> Result<()> {
     if config.once {
         let session = run_worker_session(&config).await?;
@@ -214,10 +266,10 @@ async fn run_connected_worker(
     runtime: WorkerRuntime,
     completed_pulls: &mut usize,
 ) -> Result<()> {
-    let mut worker = connect_worker(config).await?;
+    let mut worker = ConnectedWorker::connect(config).await?;
 
     loop {
-        let work_status = request_work(&mut worker).await?;
+        let work_status = worker.request_work().await?;
         *completed_pulls += 1;
         println!(
             "connected worker {} via {} and received {}",
@@ -232,59 +284,9 @@ async fn run_connected_worker(
     }
 }
 
-async fn connect_worker(config: &WorkerConfig) -> Result<ConnectedWorker> {
-    let request_url = worker_websocket_url(&config.connect, &config.token)?;
-    let (mut socket, _) = connect_async(&request_url)
-        .await
-        .map_err(|error| websocket_connect_error(&request_url, error))?;
-
-    send_json(&mut socket, json!(["1", "1", CRF_SEARCH_TOPIC, "phx_join", {}])).await?;
-    let join: JoinResponse = expect_reply(&mut socket, "1", "phx_join").await?;
-
-    send_json(
-        &mut socket,
-        json!([
-            "1",
-            "2",
-            CRF_SEARCH_TOPIC,
-            "announce",
-            AnnouncePayload {
-                worker_id: &config.worker_id,
-                protocol_version: config.protocol_version,
-                version: &config.version,
-                capabilities: Capabilities { crf_search: true },
-            }
-        ]),
-    )
-    .await?;
-    let announce: AnnounceResponse = expect_reply(&mut socket, "2", "announce").await?;
-    if !announce.accepted {
-        bail!("worker announcement was not accepted");
-    }
-
-    Ok(ConnectedWorker {
-        assigned_worker_id: join.worker_id,
-        negotiated_protocol_version: announce.protocol_version,
-        next_ref: 3,
-        socket,
-    })
-}
-
-async fn request_work(worker: &mut ConnectedWorker) -> Result<PullWorkResponse> {
-    let request_ref = worker.next_ref.to_string();
-    worker.next_ref += 1;
-
-    send_json(
-        &mut worker.socket,
-        json!(["1", request_ref, CRF_SEARCH_TOPIC, "pull_work", {}]),
-    )
-    .await?;
-    expect_reply(&mut worker.socket, &request_ref, "pull_work").await
-}
-
 async fn run_worker_session(config: &WorkerConfig) -> Result<WorkerSession> {
-    let mut worker = connect_worker(config).await?;
-    let pull_work = request_work(&mut worker).await?;
+    let mut worker = ConnectedWorker::connect(config).await?;
+    let pull_work = worker.request_work().await?;
 
     Ok(WorkerSession {
         assigned_worker_id: worker.assigned_worker_id,
