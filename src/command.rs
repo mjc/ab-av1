@@ -7,6 +7,7 @@ pub(crate) mod rules;
 pub mod sample_encode;
 pub mod vmaf;
 pub mod worker;
+pub(crate) mod worker_protocol;
 pub mod xpsnr;
 
 pub use auto_encode::auto_encode;
