@@ -139,6 +139,13 @@ pub(crate) struct JobAssignedPayload {
     pub(crate) chunk_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ErrorReplyPayload {
+    pub(crate) reason: String,
+    #[serde(default)]
+    pub(crate) supported_protocol_versions: Vec<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

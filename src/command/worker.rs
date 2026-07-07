@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use crate::command::worker_protocol::{
-    AnnouncePayload, Capabilities, ClientEvent, ClientFrame, CRF_SEARCH_TOPIC, ServerFrame,
-    ServerReply,
+    AnnouncePayload, Capabilities, ClientEvent, ClientFrame, CRF_SEARCH_TOPIC, ErrorReplyPayload,
+    ServerFrame, ServerReply,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -333,10 +333,23 @@ where
 
                 return match body.status.as_str() {
                     "ok" => serde_json::from_value(body.response).context("decode phoenix ok reply"),
-                    "error" => Err(anyhow!(
-                        "{expected_event} failed: {}",
-                        body.response
-                    )),
+                    "error" => {
+                        let error: ErrorReplyPayload = serde_json::from_value(body.response)
+                            .context("decode phoenix error reply")?;
+                        let supported_versions = match error.supported_protocol_versions.is_empty()
+                        {
+                            true => String::new(),
+                            false => format!(
+                                " (supported_protocol_versions={:?})",
+                                error.supported_protocol_versions
+                            ),
+                        };
+                        Err(anyhow!(
+                            "{expected_event} failed: {}{}",
+                            error.reason,
+                            supported_versions
+                        ))
+                    }
                     other => Err(anyhow!("unexpected phoenix status {other}")),
                 };
             }
@@ -505,6 +518,55 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_reports_supported_versions_on_protocol_mismatch() -> Result<()> {
+        let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let socket = accept_async(stream).await.expect("accept websocket");
+            let (mut writer, mut reader) = socket.split();
+
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce(&mut reader, 99).await;
+            send_announce_error_reply(
+                &mut writer,
+                2,
+                json!({
+                    "reason": "unsupported_protocol_version",
+                    "supported_protocol_versions": [1]
+                }),
+            )
+            .await;
+        });
+
+        let error = run_worker_session(&WorkerConfig {
+            connect: format!("http://{address}"),
+            token: "test-worker-token".into(),
+            worker_id: "abav1-dev".into(),
+            version: "0.11.4".into(),
+            protocol_version: 99,
+            once: false,
+        })
+        .await
+        .expect_err("protocol mismatch should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported_protocol_version"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("[1]"),
+            "unexpected error: {error}"
+        );
+
+        server.await.expect("server task");
+        Ok(())
+    }
+
     #[test]
     fn reconnect_backoff_grows_and_caps() {
         let mut backoff = ReconnectBackoff::new(
@@ -546,7 +608,7 @@ mod tests {
         );
     }
 
-    async fn expect_announce<R>(reader: &mut R)
+    async fn expect_announce<R>(reader: &mut R, protocol_version: u64)
     where
         R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
             + Unpin,
@@ -557,7 +619,7 @@ mod tests {
                 2,
                 ClientEvent::Announce(AnnouncePayload {
                     worker_id: "abav1-dev".into(),
-                    protocol_version: 1,
+                    protocol_version,
                     version: "0.11.4".into(),
                     capabilities: Capabilities { crf_search: true },
                 }),
@@ -634,6 +696,22 @@ mod tests {
             .expect("send pull_work reply");
     }
 
+    async fn send_announce_error_reply<W>(writer: &mut W, request_ref: u64, response: Value)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        writer
+            .send(Message::Text(
+                json!([null, request_ref.to_string(), CRF_SEARCH_TOPIC, "phx_reply", {
+                    "status": "error",
+                    "response": response
+                }])
+                .to_string(),
+            ))
+            .await
+            .expect("send announce error reply");
+    }
+
     async fn serve_no_work_session(listener: TcpListener, no_work_replies: usize) {
         let (stream, _) = listener.accept().await.expect("accept connection");
         let socket = accept_async(stream).await.expect("accept websocket");
@@ -641,7 +719,7 @@ mod tests {
 
         expect_join(&mut reader).await;
         send_join_reply(&mut writer).await;
-        expect_announce(&mut reader).await;
+        expect_announce(&mut reader, 1).await;
         send_announce_reply(&mut writer).await;
 
         for request_ref in 3..(3 + no_work_replies as u64) {
