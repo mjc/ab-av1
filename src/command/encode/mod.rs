@@ -145,6 +145,51 @@ mod tests {
         assert!(Args::try_parse_from(["ab-av1", "--input", "input.mkv", "--crf", "NaN"]).is_err());
     }
 
+    #[test]
+    fn parse_passthrough_errors_are_reported_by_clap() {
+        let svt_err = match Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "input.mkv",
+            "--crf",
+            "30",
+            "--svt",
+            "crf=32",
+        ]) {
+            Ok(_) => panic!("reserved svt arg should fail"),
+            Err(err) => err,
+        };
+        assert!(svt_err.to_string().contains("crf"));
+
+        let enc_err = match Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "input.mkv",
+            "--crf",
+            "30",
+            "--enc",
+            "-svtav1-params=crf=32",
+        ]) {
+            Ok(_) => panic!("reserved encoder arg should fail"),
+            Err(err) => err,
+        };
+        assert!(enc_err.to_string().contains("svtav1-params"));
+
+        let enc_input_err = match Args::try_parse_from([
+            "ab-av1",
+            "--input",
+            "input.mkv",
+            "--crf",
+            "30",
+            "--enc-input",
+            "-svtav1-params=crf=32",
+        ]) {
+            Ok(_) => panic!("reserved encoder input arg should fail"),
+            Err(err) => err,
+        };
+        assert!(enc_input_err.to_string().contains("svtav1-params"));
+    }
+
     // ab-kgc.89: default output extension must preserve input container for webm/mov
     #[test_case("clip.mp4", false, "mp4"; "video mp4 keeps mp4")]
     #[test_case("clip.mkv", false, "mkv"; "video mkv keeps mkv")]

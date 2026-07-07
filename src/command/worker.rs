@@ -1,6 +1,6 @@
 use crate::command::worker_protocol::{
-    AnnouncePayload, CRF_SEARCH_TOPIC, Capabilities, ClientEvent, ClientFrame, ErrorReplyPayload,
-    JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
+    AnnouncePayload, CRF_SEARCH_TOPIC, Capabilities, CancelPayload, ClientEvent, ClientFrame,
+    ErrorReplyPayload, JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
 };
 use crate::command::{args, crf_search, sample_encode};
 use crate::ffprobe::Ffprobe;
@@ -239,8 +239,8 @@ impl Default for WorkerRuntime {
     fn default() -> Self {
         Self {
             idle_delay: Duration::from_secs(5),
-            reconnect_base_delay: Duration::from_secs(1),
-            reconnect_max_delay: Duration::from_secs(30),
+            reconnect_base_delay: Duration::ZERO,
+            reconnect_max_delay: Duration::ZERO,
             max_pulls: None,
         }
     }
@@ -271,6 +271,13 @@ impl ReconnectBackoff {
     fn reset(&mut self) {
         self.current = self.base;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingJobOutcome {
+    Waiting,
+    Ready,
+    Canceled,
 }
 
 type WorkerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -329,6 +336,51 @@ impl ConnectedWorker {
         .await?;
         expect_reply(&mut self.socket, &request_ref.to_string(), "pull_work").await
     }
+
+    async fn wait_for_pending_job(
+        &mut self,
+        job: &WorkerJob,
+        idle_delay: Duration,
+    ) -> Result<PendingJobOutcome> {
+        tokio::select! {
+            frame = self.socket.next() => {
+                match frame {
+                    Some(Ok(Message::Ping(payload))) => {
+                        self.socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("send websocket pong")?;
+                        Ok(PendingJobOutcome::Waiting)
+                    }
+                    Some(Ok(Message::Pong(_))) => Ok(PendingJobOutcome::Waiting),
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(cancel) = decode_cancel_push(&text)?
+                            && cancel.job_id == job.assignment.job_id
+                        {
+                            eprintln!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+                            return Ok(PendingJobOutcome::Canceled);
+                        }
+                        Ok(PendingJobOutcome::Waiting)
+                    }
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
+                        Ok(PendingJobOutcome::Waiting)
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        bail!("websocket closed while waiting for worker input: {frame:?}")
+                    }
+                    Some(Err(error)) => Err(error).context("read websocket message"),
+                    None => bail!("websocket ended while waiting for worker input"),
+                }
+            }
+            _ = tokio::time::sleep(idle_delay) => {
+                if job.input_path().exists() {
+                    Ok(PendingJobOutcome::Ready)
+                } else {
+                    Ok(PendingJobOutcome::Waiting)
+                }
+            }
+        }
+    }
 }
 
 pub async fn worker(config: WorkerConfig) -> Result<()> {
@@ -370,8 +422,34 @@ async fn run_connected_worker(
     completed_pulls: &mut usize,
 ) -> Result<()> {
     let mut worker = ConnectedWorker::connect(config).await?;
+    let mut pending_job: Option<WorkerJob> = None;
 
     loop {
+        if let Some(job) = pending_job.as_ref() {
+            match worker.wait_for_pending_job(job, runtime.idle_delay).await? {
+                PendingJobOutcome::Waiting => continue,
+                PendingJobOutcome::Canceled => {
+                    temporary::clean(true).await;
+                    pending_job = None;
+                    continue;
+                }
+                PendingJobOutcome::Ready => {
+                    let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
+                    let best = run_worker_job(job.clone(), probe).await;
+                    temporary::clean(true).await;
+                    let best = best?;
+
+                    println!(
+                        "{}",
+                        serde_json::to_string(&job.result_payload(&best))
+                            .context("serialize worker job result")?
+                    );
+                    pending_job = None;
+                    continue;
+                }
+            }
+        }
+
         let work_status = worker.request_work().await?;
         *completed_pulls += 1;
         let status = work_status_label(&work_status);
@@ -386,16 +464,25 @@ async fn run_connected_worker(
             temporary::add(&input_dir, temporary::TempKind::NotKeepable);
 
             let job = WorkerJob::new(assignment, input_dir);
-            let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
-            let best = run_worker_job(job.clone(), probe).await;
-            temporary::clean(true).await;
-            let best = best?;
+            if job.input_path().exists() {
+                let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
+                let best = run_worker_job(job.clone(), probe).await;
+                temporary::clean(true).await;
+                let best = best?;
 
-            println!(
-                "{}",
-                serde_json::to_string(&job.result_payload(&best))
-                    .context("serialize worker job result")?
-            );
+                println!(
+                    "{}",
+                    serde_json::to_string(&job.result_payload(&best))
+                        .context("serialize worker job result")?
+                );
+            } else {
+                eprintln!(
+                    "waiting for worker input file {} before starting {}",
+                    job.input_path().display(),
+                    job.assignment.job_id
+                );
+                pending_job = Some(job);
+            }
             continue;
         }
 
@@ -431,6 +518,19 @@ fn work_status_label(reply: &ServerReply) -> String {
             format!("{} (job_id={})", payload.status.as_str(), payload.job_id)
         }
     }
+}
+
+fn decode_cancel_push(text: &str) -> Result<Option<CancelPayload>> {
+    let frame: ServerPushFrame<Value> = match serde_json::from_str(text) {
+        Ok(frame) => frame,
+        Err(_) => return Ok(None),
+    };
+    if frame.2 != CRF_SEARCH_TOPIC || frame.3 != "cancel" {
+        return Ok(None);
+    }
+
+    let cancel = serde_json::from_value::<CancelPayload>(frame.4).context("decode cancel push")?;
+    Ok(Some(cancel))
 }
 
 fn websocket_connect_error(request_url: &str, error: WsError) -> anyhow::Error {
@@ -746,9 +846,8 @@ mod tests {
             serve_no_work_session(listener, 1).await;
         };
 
-        let (worker, replacement) = tokio::join!(worker, replacement);
+        let (worker, _replacement) = tokio::join!(worker, replacement);
         worker?;
-        let _ = replacement;
         Ok(())
     }
 
