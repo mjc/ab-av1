@@ -74,6 +74,7 @@ pub(crate) struct ServerFrame<T>(
 );
 
 impl<T> ServerFrame<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reply(reference: u64, body: ReplyBody<T>) -> Self {
         Self(
             None,
@@ -92,6 +93,7 @@ pub(crate) struct ReplyBody<T> {
 }
 
 impl<T> ReplyBody<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn ok(response: T) -> Self {
         Self {
             status: "ok".into(),
@@ -112,6 +114,15 @@ pub(crate) enum ServerReply {
 pub(crate) enum WorkStatus {
     NoWork,
     JobAssigned,
+}
+
+impl WorkStatus {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoWork => "no_work",
+            Self::JobAssigned => "job_assigned",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,8 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use crate::command::worker_protocol::{
+    AnnouncePayload, Capabilities, ClientEvent, ClientFrame, CRF_SEARCH_TOPIC, ServerFrame,
+    ServerReply,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -12,7 +15,6 @@ use tokio_tungstenite::{
 };
 
 const PHOENIX_VSN: &str = "2.0.0";
-const CRF_SEARCH_TOPIC: &str = "workers:crf_search";
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
 
 /// Connect to a Reencodarr websocket worker endpoint and request one job.
@@ -82,16 +84,6 @@ pub struct WorkerSession {
     pub work_status: String,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct ReplyEnvelope(Option<String>, Option<String>, String, String, ReplyBody);
-
-#[derive(Debug, Deserialize)]
-struct ReplyBody {
-    status: String,
-    response: Value,
-}
-
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct JoinResponse {
     worker_id: String,
@@ -101,24 +93,6 @@ struct JoinResponse {
 struct AnnounceResponse {
     accepted: bool,
     protocol_version: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct PullWorkResponse {
-    status: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AnnouncePayload<'a> {
-    worker_id: &'a str,
-    protocol_version: u64,
-    version: &'a str,
-    capabilities: Capabilities,
-}
-
-#[derive(Debug, Serialize)]
-struct Capabilities {
-    crf_search: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,23 +157,20 @@ impl ConnectedWorker {
             .await
             .map_err(|error| websocket_connect_error(&request_url, error))?;
 
-        send_json(&mut socket, json!(["1", "1", CRF_SEARCH_TOPIC, "phx_join", {}])).await?;
+        send_json(&mut socket, ClientFrame::new(1, ClientEvent::Join)).await?;
         let join: JoinResponse = expect_reply(&mut socket, "1", "phx_join").await?;
 
         send_json(
             &mut socket,
-            json!([
-                "1",
-                "2",
-                CRF_SEARCH_TOPIC,
-                "announce",
-                AnnouncePayload {
-                    worker_id: &config.worker_id,
+            ClientFrame::new(
+                2,
+                ClientEvent::Announce(AnnouncePayload {
+                    worker_id: config.worker_id.clone(),
                     protocol_version: config.protocol_version,
-                    version: &config.version,
+                    version: config.version.clone(),
                     capabilities: Capabilities { crf_search: true },
-                }
-            ]),
+                }),
+            ),
         )
         .await?;
         let announce: AnnounceResponse = expect_reply(&mut socket, "2", "announce").await?;
@@ -215,16 +186,12 @@ impl ConnectedWorker {
         })
     }
 
-    async fn request_work(&mut self) -> Result<PullWorkResponse> {
-        let request_ref = self.next_ref.to_string();
+    async fn request_work(&mut self) -> Result<ServerReply> {
+        let request_ref = self.next_ref;
         self.next_ref += 1;
 
-        send_json(
-            &mut self.socket,
-            json!(["1", request_ref, CRF_SEARCH_TOPIC, "pull_work", {}]),
-        )
-        .await?;
-        expect_reply(&mut self.socket, &request_ref, "pull_work").await
+        send_json(&mut self.socket, ClientFrame::new(request_ref, ClientEvent::PullWork)).await?;
+        expect_reply(&mut self.socket, &request_ref.to_string(), "pull_work").await
     }
 }
 
@@ -271,9 +238,13 @@ async fn run_connected_worker(
     loop {
         let work_status = worker.request_work().await?;
         *completed_pulls += 1;
+        let status = match &work_status {
+            ServerReply::NoWork(payload) => payload.status.as_str(),
+            ServerReply::JobAssigned(payload) => payload.status.as_str(),
+        };
         println!(
             "connected worker {} via {} and received {}",
-            worker.assigned_worker_id, worker.negotiated_protocol_version, work_status.status
+            worker.assigned_worker_id, worker.negotiated_protocol_version, status
         );
 
         if runtime.max_pulls == Some(*completed_pulls) {
@@ -287,11 +258,15 @@ async fn run_connected_worker(
 async fn run_worker_session(config: &WorkerConfig) -> Result<WorkerSession> {
     let mut worker = ConnectedWorker::connect(config).await?;
     let pull_work = worker.request_work().await?;
+    let work_status = match pull_work {
+        ServerReply::NoWork(payload) => payload.status.as_str().into(),
+        ServerReply::JobAssigned(payload) => payload.status.as_str().into(),
+    };
 
     Ok(WorkerSession {
         assigned_worker_id: worker.assigned_worker_id,
         negotiated_protocol_version: worker.negotiated_protocol_version,
-        work_status: pull_work.status,
+        work_status,
     })
 }
 
@@ -328,12 +303,15 @@ fn worker_websocket_url(base_url: &str, token: &str) -> Result<String> {
     ))
 }
 
-async fn send_json<W>(writer: &mut W, value: Value) -> Result<()>
+async fn send_json<W, T>(writer: &mut W, value: T) -> Result<()>
 where
     W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    T: serde::Serialize,
 {
     writer
-        .send(Message::Text(value.to_string()))
+        .send(Message::Text(
+            serde_json::to_string(&value).context("encode websocket message")?,
+        ))
         .await
         .context("send websocket message")
 }
@@ -347,9 +325,9 @@ where
     while let Some(message) = reader.next().await {
         match message.context("read websocket message")? {
             Message::Text(text) => {
-                let ReplyEnvelope(_, msg_ref, topic, event, body) =
+                let ServerFrame(_, msg_ref, topic, event, body) =
                     serde_json::from_str(&text).context("decode phoenix reply")?;
-                if topic != CRF_SEARCH_TOPIC || event != "phx_reply" || msg_ref.as_deref() != Some(expected_ref) {
+                if topic != CRF_SEARCH_TOPIC || event != "phx_reply" || msg_ref != expected_ref {
                     continue;
                 }
 
@@ -374,6 +352,8 @@ where
 mod tests {
     use super::*;
     use anyhow::Result;
+    use crate::command::worker_protocol::{ReplyBody, WorkStatus};
+    use serde_json::{Value, json};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -562,7 +542,7 @@ mod tests {
     {
         assert_text_message(
             reader.next().await.expect("join frame").expect("join message"),
-            json!(["1", "1", CRF_SEARCH_TOPIC, "phx_join", {}]),
+            serde_json::to_value(ClientFrame::new(1, ClientEvent::Join)).expect("join frame json"),
         );
     }
 
@@ -573,18 +553,16 @@ mod tests {
     {
         assert_text_message(
             reader.next().await.expect("announce frame").expect("announce message"),
-            json!([
-                "1",
-                "2",
-                CRF_SEARCH_TOPIC,
-                "announce",
-                {
-                    "worker_id": "abav1-dev",
-                    "protocol_version": 1,
-                    "version": "0.11.4",
-                    "capabilities": {"crf_search": true}
-                }
-            ]),
+            serde_json::to_value(ClientFrame::new(
+                2,
+                ClientEvent::Announce(AnnouncePayload {
+                    worker_id: "abav1-dev".into(),
+                    protocol_version: 1,
+                    version: "0.11.4".into(),
+                    capabilities: Capabilities { crf_search: true },
+                }),
+            ))
+            .expect("announce frame json"),
         );
     }
 
@@ -599,7 +577,8 @@ mod tests {
                 .await
                 .expect("pull_work frame")
                 .expect("pull_work message"),
-            json!(["1", request_ref.to_string(), CRF_SEARCH_TOPIC, "pull_work", {}]),
+            serde_json::to_value(ClientFrame::new(request_ref, ClientEvent::PullWork))
+                .expect("pull_work frame json"),
         );
     }
 
@@ -625,11 +604,11 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                json!([null, "2", CRF_SEARCH_TOPIC, "phx_reply", {
-                    "status": "ok",
-                    "response": {"accepted": true, "protocol_version": 1}
-                }])
-                .to_string(),
+                serde_json::to_string(&ServerFrame::<Value>::reply(
+                    2,
+                    ReplyBody::ok(json!({"accepted": true, "protocol_version": 1})),
+                ))
+                .expect("announce reply json"),
             ))
             .await
             .expect("send announce reply");
@@ -641,11 +620,15 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                json!([null, request_ref.to_string(), CRF_SEARCH_TOPIC, "phx_reply", {
-                    "status": "ok",
-                    "response": {"status": "no_work"}
-                }])
-                .to_string(),
+                serde_json::to_string(&ServerFrame::reply(
+                    request_ref,
+                    ReplyBody::ok(ServerReply::NoWork(
+                        crate::command::worker_protocol::NoWorkPayload {
+                            status: WorkStatus::NoWork,
+                        },
+                    )),
+                ))
+                .expect("no_work reply json"),
             ))
             .await
             .expect("send pull_work reply");
