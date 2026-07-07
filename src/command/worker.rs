@@ -124,7 +124,8 @@ struct Capabilities {
 #[derive(Debug, Clone, Copy)]
 struct WorkerRuntime {
     idle_delay: Duration,
-    reconnect_delay: Duration,
+    reconnect_base_delay: Duration,
+    reconnect_max_delay: Duration,
     max_pulls: Option<usize>,
 }
 
@@ -132,9 +133,37 @@ impl Default for WorkerRuntime {
     fn default() -> Self {
         Self {
             idle_delay: Duration::from_secs(5),
-            reconnect_delay: Duration::from_secs(1),
+            reconnect_base_delay: Duration::from_secs(1),
+            reconnect_max_delay: Duration::from_secs(30),
             max_pulls: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReconnectBackoff {
+    current: Duration,
+    base: Duration,
+    max: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            current: base,
+            base,
+            max,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = self.current.saturating_mul(2).min(self.max);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.current = self.base;
     }
 }
 
@@ -163,13 +192,18 @@ pub async fn worker(config: WorkerConfig) -> Result<()> {
 
 async fn run_worker_until(config: &WorkerConfig, runtime: WorkerRuntime) -> Result<()> {
     let mut completed_pulls = 0usize;
+    let mut reconnect_backoff =
+        ReconnectBackoff::new(runtime.reconnect_base_delay, runtime.reconnect_max_delay);
 
     loop {
         match run_connected_worker(config, runtime, &mut completed_pulls).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                reconnect_backoff.reset();
+                return Ok(());
+            }
             Err(error) => {
                 eprintln!("worker connection lost: {error}");
-                tokio::time::sleep(runtime.reconnect_delay).await;
+                tokio::time::sleep(reconnect_backoff.next_delay()).await;
             }
         }
     }
@@ -358,24 +392,17 @@ mod tests {
     }
 
     impl FakeCoordinator {
-        async fn with_no_work_replies(no_work_replies: usize) -> Result<Self> {
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
+        async fn bind(address: &str) -> Result<(TcpListener, std::net::SocketAddr)> {
+            let listener = TcpListener::bind(address).await?;
             let address = listener.local_addr()?;
+            Ok((listener, address))
+        }
+
+        async fn with_no_work_replies(no_work_replies: usize) -> Result<Self> {
+            let (listener, address) = Self::bind("127.0.0.1:0").await?;
 
             let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.expect("accept connection");
-                let socket = accept_async(stream).await.expect("accept websocket");
-                let (mut writer, mut reader) = socket.split();
-
-                expect_join(&mut reader).await;
-                send_join_reply(&mut writer).await;
-                expect_announce(&mut reader).await;
-                send_announce_reply(&mut writer).await;
-
-                for request_ref in 3..(3 + no_work_replies as u64) {
-                    expect_pull_work(&mut reader, request_ref).await;
-                    send_no_work_reply(&mut writer, request_ref).await;
-                }
+                serve_no_work_session(listener, no_work_replies).await;
             });
 
             Ok(Self { address, server })
@@ -453,7 +480,8 @@ mod tests {
             &coordinator.worker_config(WorkerTestConfig::continuous()),
             WorkerRuntime {
                 idle_delay: Duration::from_millis(1),
-                reconnect_delay: Duration::from_millis(1),
+                reconnect_base_delay: Duration::from_millis(1),
+                reconnect_max_delay: Duration::from_millis(1),
                 max_pulls: Some(2),
             },
         )
@@ -461,6 +489,68 @@ mod tests {
 
         coordinator.finish().await;
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_reconnects_after_disconnect_and_continues_pulling_work() -> Result<()> {
+        let coordinator = FakeCoordinator::with_no_work_replies(1).await?;
+        let address = coordinator.address;
+
+        let worker = tokio::spawn(async move {
+            run_worker_until(
+                &coordinator.worker_config(WorkerTestConfig::continuous()),
+                WorkerRuntime {
+                    idle_delay: Duration::from_millis(1),
+                    reconnect_base_delay: Duration::from_millis(1),
+                    reconnect_max_delay: Duration::from_millis(2),
+                    max_pulls: Some(2),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let replacement = tokio::spawn(async move {
+            let listener = TcpListener::bind(address)
+                .await
+                .expect("bind replacement coordinator");
+            serve_no_work_session(listener, 1).await;
+        });
+
+        worker.await.expect("worker task")?;
+        replacement.await.expect("replacement task");
+        Ok(())
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_and_caps() {
+        let mut backoff = ReconnectBackoff::new(
+            Duration::from_millis(100),
+            Duration::from_millis(1_000),
+        );
+
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(200));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(400));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(800));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(1_000));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_after_success() {
+        let mut backoff = ReconnectBackoff::new(
+            Duration::from_millis(100),
+            Duration::from_millis(1_000),
+        );
+
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(200));
+
+        backoff.reset();
+
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
     }
 
     async fn expect_join<R>(reader: &mut R)
@@ -557,6 +647,22 @@ mod tests {
             ))
             .await
             .expect("send pull_work reply");
+    }
+
+    async fn serve_no_work_session(listener: TcpListener, no_work_replies: usize) {
+        let (stream, _) = listener.accept().await.expect("accept connection");
+        let socket = accept_async(stream).await.expect("accept websocket");
+        let (mut writer, mut reader) = socket.split();
+
+        expect_join(&mut reader).await;
+        send_join_reply(&mut writer).await;
+        expect_announce(&mut reader).await;
+        send_announce_reply(&mut writer).await;
+
+        for request_ref in 3..(3 + no_work_replies as u64) {
+            expect_pull_work(&mut reader, request_ref).await;
+            send_no_work_reply(&mut writer, request_ref).await;
+        }
     }
 
     fn assert_text_message(message: Message, expected: Value) {
