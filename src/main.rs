@@ -29,6 +29,7 @@ enum Command {
     Encode(command::encode::Args),
     CrfSearch(command::crf_search::Args),
     AutoEncode(command::auto_encode::Args),
+    Worker(command::worker::Args),
     PrintCompletions(command::print_completions::Args),
 }
 
@@ -65,6 +66,7 @@ async fn main() {
         Command::AutoEncode(args) => {
             command::auto_encode(command::auto_encode::AutoEncodeConfig::from(args)).boxed_local()
         }
+        Command::Worker(args) => command::worker(args.into()).boxed_local(),
         Command::PrintCompletions(args) => return command::print_completions(args.into()),
     });
 
@@ -131,6 +133,7 @@ mod tests {
             .expect("parse print-completions command");
 
         match command {
+            Command::Worker(_) => {}
             Command::PrintCompletions(_) => {}
             _ => panic!("expected print-completions command"),
         }
