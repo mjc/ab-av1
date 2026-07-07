@@ -8,6 +8,7 @@ pub mod sample_encode;
 pub mod vmaf;
 pub mod worker;
 pub(crate) mod worker_protocol;
+pub(crate) mod worker_transfer;
 pub mod xpsnr;
 
 pub use auto_encode::auto_encode;

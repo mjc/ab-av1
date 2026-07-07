@@ -3,13 +3,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const CRF_SEARCH_TOPIC: &str = "workers:crf_search";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ClientFrame(
-    String,
-    String,
-    String,
-    String,
-    ClientPayload,
-);
+pub(crate) struct ClientFrame(String, String, String, String, ClientPayload);
 
 impl ClientFrame {
     pub(crate) fn new(reference: u64, event: ClientEvent) -> Self {
@@ -64,7 +58,7 @@ pub(crate) struct Capabilities {
     pub(crate) crf_search: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ServerFrame<T>(
     pub(crate) Option<String>,
     pub(crate) String,
@@ -86,7 +80,23 @@ impl<T> ServerFrame<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ServerPushFrame<T>(
+    pub(crate) Option<String>,
+    pub(crate) Option<String>,
+    pub(crate) String,
+    pub(crate) String,
+    pub(crate) T,
+);
+
+impl<T> ServerPushFrame<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(event: &str, payload: T) -> Self {
+        Self(None, None, CRF_SEARCH_TOPIC.into(), event.into(), payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReplyBody<T> {
     pub(crate) status: String,
     pub(crate) response: T,
@@ -110,7 +120,7 @@ impl<T> ReplyBody<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum ServerReply {
     JobAssigned(JobAssignedPayload),
@@ -138,13 +148,15 @@ pub(crate) struct NoWorkPayload {
     pub(crate) status: WorkStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct JobAssignedPayload {
     pub(crate) status: WorkStatus,
     pub(crate) job_id: String,
+    pub(crate) video_id: u64,
     pub(crate) source_name: String,
     pub(crate) size_bytes: u64,
     pub(crate) chunk_size_bytes: u64,
+    pub(crate) target_vmaf: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +164,61 @@ pub(crate) struct ErrorReplyPayload {
     pub(crate) reason: String,
     #[serde(default)]
     pub(crate) supported_protocol_versions: Vec<u64>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CancelPayload {
+    pub(crate) job_id: String,
+    pub(crate) reason: String,
+}
+
+/// Chunk bytes travel in binary websocket frames.
+/// These metadata messages stay on the text side channel.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChunkTransferPayload {
+    pub(crate) job_id: String,
+    pub(crate) index: u64,
+    pub(crate) offset: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) checksum: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TransferProgressPayload {
+    pub(crate) job_id: String,
+    pub(crate) received_bytes: u64,
+    pub(crate) expected_bytes: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TransferCompletePayload {
+    pub(crate) job_id: String,
+    pub(crate) final_path: String,
+    pub(crate) final_size_bytes: u64,
+    pub(crate) final_digest: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TransferFailurePayload {
+    pub(crate) job_id: String,
+    pub(crate) stage: TransferStage,
+    pub(crate) retriable: bool,
+    pub(crate) reason: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransferStage {
+    ReceiveChunk,
+    ValidateChunk,
+    FinalizeTransfer,
+    RunCrfSearch,
 }
 
 impl ErrorReplyPayload {
@@ -241,9 +308,11 @@ mod tests {
                 "response": {
                     "status": "job_assigned",
                     "job_id": "job-123",
+                    "video_id": 123,
                     "source_name": "movie.mkv",
                     "size_bytes": 1024,
-                    "chunk_size_bytes": 256
+                    "chunk_size_bytes": 256,
+                    "target_vmaf": 96.5
                 }
             }
         ]))
@@ -256,9 +325,11 @@ mod tests {
                 ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
                     status: WorkStatus::JobAssigned,
                     job_id: "job-123".into(),
+                    video_id: 123,
                     source_name: "movie.mkv".into(),
                     size_bytes: 1024,
                     chunk_size_bytes: 256,
+                    target_vmaf: 96.5,
                 })),
             )
         );
@@ -290,6 +361,74 @@ mod tests {
                         .with_supported_protocol_versions(vec![1]),
                 ),
             )
+        );
+    }
+
+    #[test]
+    fn server_push_parses_cancel_payload() {
+        let push: ServerPushFrame<CancelPayload> = serde_json::from_value(json!([
+            null,
+            null,
+            "workers:crf_search",
+            "cancel",
+            {
+                "job_id": "job-123",
+                "reason": "shutdown"
+            }
+        ]))
+        .expect("parse cancel push");
+
+        assert_eq!(
+            push,
+            ServerPushFrame::new(
+                "cancel",
+                CancelPayload {
+                    job_id: "job-123".into(),
+                    reason: "shutdown".into(),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn chunk_transfer_payload_serializes_metadata_side_channel() {
+        let payload = ChunkTransferPayload {
+            job_id: "job-123".into(),
+            index: 7,
+            offset: 8192,
+            size_bytes: 4096,
+            checksum: "deadbeef".into(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).expect("serialize chunk transfer"),
+            json!({
+                "job_id": "job-123",
+                "index": 7,
+                "offset": 8192,
+                "size_bytes": 4096,
+                "checksum": "deadbeef",
+            })
+        );
+    }
+
+    #[test]
+    fn transfer_failure_payload_serializes_stage_and_retry_hint() {
+        let payload = TransferFailurePayload {
+            job_id: "job-123".into(),
+            stage: TransferStage::FinalizeTransfer,
+            retriable: true,
+            reason: "disk full".into(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).expect("serialize transfer failure"),
+            json!({
+                "job_id": "job-123",
+                "stage": "finalize_transfer",
+                "retriable": true,
+                "reason": "disk full",
+            })
         );
     }
 }

@@ -1,17 +1,23 @@
+use crate::command::worker_protocol::{
+    AnnouncePayload, CRF_SEARCH_TOPIC, Capabilities, ClientEvent, ClientFrame, ErrorReplyPayload,
+    ReplyBody, ServerPushFrame, ServerReply,
+};
+use crate::command::{args, crf_search, sample_encode};
+use crate::ffprobe::Ffprobe;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use crate::command::worker_protocol::{
-    AnnouncePayload, Capabilities, ClientEvent, ClientFrame, CRF_SEARCH_TOPIC, ErrorReplyPayload,
-    ServerFrame, ServerReply,
-};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use serde_json::Value;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Error as WsError, Message},
-    MaybeTlsStream, WebSocketStream,
 };
 
 const PHOENIX_VSN: &str = "2.0.0";
@@ -77,11 +83,98 @@ impl From<Args> for WorkerConfig {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct WorkerSession {
     pub assigned_worker_id: String,
     pub negotiated_protocol_version: u64,
     pub work_status: String,
+    pub assigned_job: Option<crate::command::worker_protocol::JobAssignedPayload>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone)]
+struct WorkerJob {
+    assignment: crate::command::worker_protocol::JobAssignedPayload,
+    input_dir: PathBuf,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl WorkerJob {
+    fn new(
+        assignment: crate::command::worker_protocol::JobAssignedPayload,
+        input_dir: PathBuf,
+    ) -> Self {
+        Self {
+            assignment,
+            input_dir,
+        }
+    }
+
+    fn input_path(&self) -> PathBuf {
+        self.input_dir.join(&self.assignment.source_name)
+    }
+
+    fn crf_search_config(&self, encoder: args::Encoder) -> Result<crf_search::CrfSearchConfig> {
+        Ok(crf_search::CrfSearchConfig {
+            args: args::Encode {
+                encoder,
+                input: self.input_path(),
+                vfilter: None,
+                pix_format: None,
+                preset: None,
+                keyint: None,
+                scd: None,
+                svt_args: vec![],
+                enc_args: vec![],
+                enc_input_args: vec![],
+            },
+            min_vmaf: Some(crf_search::MinScore::new(self.assignment.target_vmaf)?),
+            min_xpsnr: None,
+            max_encoded_percent: crf_search::MaxEncodedPercent::new(80.0)?,
+            min_crf: None,
+            max_crf: None,
+            thorough: false,
+            crf_increment: None,
+            high_crf_means_hq: None,
+            cache: true,
+            sample: args::Sample {
+                samples: None,
+                sample_every: args::SampleDuration::new(Duration::from_secs(12 * 60))?,
+                min_samples: None,
+                sample_duration: args::SampleDuration::new(Duration::from_secs(20))?,
+                keep: false,
+                temp_dir: Some(self.input_dir.clone()),
+                extension: None,
+            },
+            scoring: sample_encode::ScoringConfig {
+                score: args::ScoreArgs {
+                    reference_vfilter: None,
+                }
+                .into(),
+                vmaf: args::Vmaf::default().into(),
+                xpsnr: false,
+                xpsnr_opts: args::Xpsnr::default().into(),
+            },
+            verbose: clap_verbosity_flag::Verbosity::new(0, 0),
+        })
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn run_worker_job(job: WorkerJob, probe: Arc<Ffprobe>) -> Result<crf_search::Sample> {
+    let config = job.crf_search_config("libsvtav1".parse().expect("default encoder"))?;
+    let mut run = std::pin::pin!(crf_search::run(config, probe));
+
+    while let Some(update) = run.next().await {
+        match update? {
+            crf_search::Update::Done(best) => return Ok(best),
+            crf_search::Update::Status { .. }
+            | crf_search::Update::SampleResult { .. }
+            | crf_search::Update::RunResult(_) => {}
+        }
+    }
+
+    unreachable!("crf-search stream should finish with Done")
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -190,7 +283,11 @@ impl ConnectedWorker {
         let request_ref = self.next_ref;
         self.next_ref += 1;
 
-        send_json(&mut self.socket, ClientFrame::new(request_ref, ClientEvent::PullWork)).await?;
+        send_json(
+            &mut self.socket,
+            ClientFrame::new(request_ref, ClientEvent::PullWork),
+        )
+        .await?;
         expect_reply(&mut self.socket, &request_ref.to_string(), "pull_work").await
     }
 }
@@ -238,14 +335,15 @@ async fn run_connected_worker(
     loop {
         let work_status = worker.request_work().await?;
         *completed_pulls += 1;
-        let status = match &work_status {
-            ServerReply::NoWork(payload) => payload.status.as_str(),
-            ServerReply::JobAssigned(payload) => payload.status.as_str(),
-        };
+        let status = work_status_label(&work_status);
         println!(
             "connected worker {} via {} and received {}",
             worker.assigned_worker_id, worker.negotiated_protocol_version, status
         );
+
+        if matches!(work_status, ServerReply::JobAssigned(_)) {
+            return Ok(());
+        }
 
         if runtime.max_pulls == Some(*completed_pulls) {
             return Ok(());
@@ -258,16 +356,29 @@ async fn run_connected_worker(
 async fn run_worker_session(config: &WorkerConfig) -> Result<WorkerSession> {
     let mut worker = ConnectedWorker::connect(config).await?;
     let pull_work = worker.request_work().await?;
-    let work_status = match pull_work {
-        ServerReply::NoWork(payload) => payload.status.as_str().into(),
-        ServerReply::JobAssigned(payload) => payload.status.as_str().into(),
+    let work_status = work_status_label(&pull_work);
+    let assigned_job = match pull_work {
+        ServerReply::JobAssigned(payload) => Some(payload),
+        ServerReply::NoWork(_) => None,
     };
 
     Ok(WorkerSession {
         assigned_worker_id: worker.assigned_worker_id,
         negotiated_protocol_version: worker.negotiated_protocol_version,
         work_status,
+        assigned_job,
     })
+}
+
+fn work_status_label(reply: &ServerReply) -> String {
+    match reply {
+        ServerReply::NoWork(payload) => payload.status.as_str().into(),
+        ServerReply::JobAssigned(payload) => format!(
+            "{} (job_id={})",
+            payload.status.as_str(),
+            payload.job_id
+        ),
+    }
 }
 
 fn websocket_connect_error(request_url: &str, error: WsError) -> anyhow::Error {
@@ -279,7 +390,10 @@ fn websocket_connect_error(request_url: &str, error: WsError) -> anyhow::Error {
                 .as_ref()
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .unwrap_or_default();
-            anyhow!("connect websocket {request_url}: HTTP {status} {}", body.trim())
+            anyhow!(
+                "connect websocket {request_url}: HTTP {status} {}",
+                body.trim()
+            )
         }
         other => anyhow!("connect websocket {request_url}: {other}"),
     }
@@ -325,16 +439,21 @@ where
     while let Some(message) = reader.next().await {
         match message.context("read websocket message")? {
             Message::Text(text) => {
-                let ServerFrame(_, msg_ref, topic, event, body) =
-                    serde_json::from_str(&text).context("decode phoenix reply")?;
-                if topic != CRF_SEARCH_TOPIC || event != "phx_reply" || msg_ref != expected_ref {
+                let ServerPushFrame(_, msg_ref, topic, event, body): ServerPushFrame<Value> =
+                    serde_json::from_str(&text).context("decode phoenix frame")?;
+                if topic != CRF_SEARCH_TOPIC
+                    || event != "phx_reply"
+                    || msg_ref.as_deref() != Some(expected_ref)
+                {
                     continue;
                 }
 
-                return match body.status.as_str() {
-                    "ok" => serde_json::from_value(body.response).context("decode phoenix ok reply"),
+                let ReplyBody { status, response } = serde_json::from_value::<ReplyBody<_>>(body)
+                    .context("decode phoenix reply body")?;
+                return match status.as_str() {
+                    "ok" => serde_json::from_value(response).context("decode phoenix ok reply"),
                     "error" => {
-                        let error: ErrorReplyPayload = serde_json::from_value(body.response)
+                        let error: ErrorReplyPayload = serde_json::from_value(response)
                             .context("decode phoenix error reply")?;
                         let supported_versions = match error.supported_protocol_versions.is_empty()
                         {
@@ -353,8 +472,12 @@ where
                     other => Err(anyhow!("unexpected phoenix status {other}")),
                 };
             }
-            Message::Close(frame) => bail!("websocket closed before {expected_event} reply: {frame:?}"),
-            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => continue,
+            Message::Close(frame) => {
+                bail!("websocket closed before {expected_event} reply: {frame:?}")
+            }
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {
+                continue;
+            }
         }
     }
 
@@ -364,9 +487,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::worker_protocol::{
+        CancelPayload, ErrorReplyPayload, JobAssignedPayload, ReplyBody, ServerFrame,
+        ServerPushFrame, WorkStatus,
+    };
+    use crate::{
+        command::crf_search::test_hooks as crf_test_hooks,
+        ffprobe::Ffprobe,
+    };
     use anyhow::Result;
-    use crate::command::worker_protocol::{ErrorReplyPayload, ReplyBody, WorkStatus};
     use serde_json::{Value, json};
+    use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -409,6 +540,25 @@ mod tests {
 
             let server = tokio::spawn(async move {
                 serve_no_work_session(listener, no_work_replies).await;
+            });
+
+            Ok(Self { address, server })
+        }
+
+        async fn with_job_assignment() -> Result<Self> {
+            let (listener, address) = Self::bind("127.0.0.1:0").await?;
+
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept connection");
+                let socket = accept_async(stream).await.expect("accept websocket");
+                let (mut writer, mut reader) = socket.split();
+
+                expect_join(&mut reader).await;
+                send_join_reply(&mut writer).await;
+                expect_announce(&mut reader, 1).await;
+                send_announce_reply(&mut writer).await;
+                expect_pull_work(&mut reader, 3).await;
+                send_job_assigned_reply(&mut writer).await;
             });
 
             Ok(Self { address, server })
@@ -463,7 +613,8 @@ mod tests {
     async fn worker_session_joins_announces_and_requests_work() -> Result<()> {
         let coordinator = FakeCoordinator::with_no_work_replies(1).await?;
 
-        let session = run_worker_session(&coordinator.worker_config(WorkerTestConfig::continuous())).await?;
+        let session =
+            run_worker_session(&coordinator.worker_config(WorkerTestConfig::continuous())).await?;
 
         assert_eq!(
             session,
@@ -471,8 +622,31 @@ mod tests {
                 assigned_worker_id: "worker-123".into(),
                 negotiated_protocol_version: 1,
                 work_status: "no_work".into(),
+                assigned_job: None,
             }
         );
+
+        coordinator.finish().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_session_exposes_assigned_job_payload() -> Result<()> {
+        let coordinator = FakeCoordinator::with_job_assignment().await?;
+
+        let session =
+            run_worker_session(&coordinator.worker_config(WorkerTestConfig::continuous())).await?;
+
+        let job = session.assigned_job.expect("assigned job");
+        assert_eq!(session.assigned_worker_id, "worker-123");
+        assert_eq!(session.negotiated_protocol_version, 1);
+        assert_eq!(session.work_status, "job_assigned (job_id=job-123)");
+        assert_eq!(job.job_id, "job-123");
+        assert_eq!(job.video_id, 123);
+        assert_eq!(job.source_name, "movie.mkv");
+        assert_eq!(job.size_bytes, 1024);
+        assert_eq!(job.chunk_size_bytes, 256);
+        assert_eq!(job.target_vmaf, 96.5);
 
         coordinator.finish().await;
         Ok(())
@@ -552,18 +726,18 @@ mod tests {
             .await;
         });
 
-        let error = run_worker_session(&FakeCoordinator {
-            address,
-            server: tokio::spawn(async {}),
-        }
-        .worker_config(WorkerTestConfig::with_protocol_version(99)))
+        let error = run_worker_session(
+            &FakeCoordinator {
+                address,
+                server: tokio::spawn(async {}),
+            }
+            .worker_config(WorkerTestConfig::with_protocol_version(99)),
+        )
         .await
         .expect_err("protocol mismatch should fail");
 
         assert!(
-            error
-                .to_string()
-                .contains("unsupported_protocol_version"),
+            error.to_string().contains("unsupported_protocol_version"),
             "unexpected error: {error}"
         );
         assert!(
@@ -575,12 +749,134 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_ignores_cancel_push_while_waiting_for_pull_work_reply() -> Result<()> {
+        let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let socket = accept_async(stream).await.expect("accept websocket");
+            let (mut writer, mut reader) = socket.split();
+
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce(&mut reader, 1).await;
+            send_announce_reply(&mut writer).await;
+            expect_pull_work(&mut reader, 3).await;
+            send_cancel_push(&mut writer, "job-123", "shutdown").await;
+            send_no_work_reply(&mut writer, 3).await;
+        });
+
+        let session = run_worker_session(
+            &FakeCoordinator {
+                address,
+                server: tokio::spawn(async {}),
+            }
+            .worker_config(WorkerTestConfig::continuous()),
+        )
+        .await?;
+
+        assert_eq!(session.work_status, "no_work");
+
+        server.await.expect("server task");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_formats_assigned_job_status_with_job_id() {
+        let status = work_status_label(&ServerReply::JobAssigned(JobAssignedPayload {
+            status: WorkStatus::JobAssigned,
+            job_id: "job-123".into(),
+            video_id: 123,
+            source_name: "movie.mkv".into(),
+            size_bytes: 1024,
+            chunk_size_bytes: 256,
+            target_vmaf: 96.5,
+        }));
+
+        assert_eq!(status, "job_assigned (job_id=job-123)");
+    }
+
+    #[test]
+    fn worker_job_lowering_uses_an_isolated_temp_dir_and_target_vmaf() {
+        let job_dir = std::env::temp_dir().join(format!(
+            "ab-av1-worker-job-{}",
+            std::process::id()
+        ));
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_id: "job-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 1024,
+                chunk_size_bytes: 256,
+                target_vmaf: 96.5,
+            },
+            job_dir.clone(),
+        );
+
+        let config = job
+            .crf_search_config("libsvtav1".parse().expect("encoder"))
+            .expect("job config");
+
+        assert_eq!(config.args.input, job_dir.join("movie.mkv"));
+        assert_eq!(config.sample.temp_dir.as_deref(), Some(job_dir.as_path()));
+        assert_eq!(config.min_vmaf.expect("target vmaf").get(), 96.5);
+        assert!(config.cache);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_job_runs_crf_search_from_fake_probe() -> Result<()> {
+        crf_test_hooks::set(|_crf| sample_encode::Output {
+            vmaf_score: Some(97.0),
+            xpsnr_score: None,
+            predicted_encode_size: 100,
+            encode_percent: 50.0,
+            predicted_encode_time: Duration::from_secs(1),
+            from_cache: false,
+        });
+
+        let job_dir = std::env::temp_dir().join(format!(
+            "ab-av1-worker-exec-{}",
+            std::process::id()
+        ));
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_id: "job-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 1024,
+                chunk_size_bytes: 256,
+                target_vmaf: 96.5,
+            },
+            job_dir,
+        );
+
+        let probe = Arc::new(Ffprobe {
+            duration: Ok(Duration::from_secs(600)),
+            has_audio: false,
+            max_audio_channels: None,
+            fps: Ok(24.0),
+            resolution: Some((1280, 720)),
+            is_image: false,
+            pix_fmt: Some("yuv420p10le".into()),
+        });
+
+        let best = run_worker_job(job, probe).await?;
+        crf_test_hooks::clear();
+
+        assert!(best.crf.is_finite());
+        assert_eq!(best.enc.vmaf_score, Some(97.0));
+        assert_eq!(best.enc.encode_percent, 50.0);
+        Ok(())
+    }
+
     #[test]
     fn reconnect_backoff_grows_and_caps() {
-        let mut backoff = ReconnectBackoff::new(
-            Duration::from_millis(100),
-            Duration::from_millis(1_000),
-        );
+        let mut backoff =
+            ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(1_000));
 
         assert_eq!(backoff.next_delay(), Duration::from_millis(100));
         assert_eq!(backoff.next_delay(), Duration::from_millis(200));
@@ -592,10 +888,8 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_resets_after_success() {
-        let mut backoff = ReconnectBackoff::new(
-            Duration::from_millis(100),
-            Duration::from_millis(1_000),
-        );
+        let mut backoff =
+            ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(1_000));
 
         assert_eq!(backoff.next_delay(), Duration::from_millis(100));
         assert_eq!(backoff.next_delay(), Duration::from_millis(200));
@@ -611,7 +905,11 @@ mod tests {
             + Unpin,
     {
         assert_text_message(
-            reader.next().await.expect("join frame").expect("join message"),
+            reader
+                .next()
+                .await
+                .expect("join frame")
+                .expect("join message"),
             serde_json::to_value(ClientFrame::new(1, ClientEvent::Join)).expect("join frame json"),
         );
     }
@@ -622,7 +920,11 @@ mod tests {
             + Unpin,
     {
         assert_text_message(
-            reader.next().await.expect("announce frame").expect("announce message"),
+            reader
+                .next()
+                .await
+                .expect("announce frame")
+                .expect("announce message"),
             serde_json::to_value(ClientFrame::new(
                 2,
                 ClientEvent::Announce(AnnouncePayload {
@@ -704,6 +1006,30 @@ mod tests {
             .expect("send pull_work reply");
     }
 
+    async fn send_job_assigned_reply<W>(writer: &mut W)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        writer
+            .send(Message::Text(
+                serde_json::to_string(&ServerFrame::reply(
+                    3,
+                    ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
+                        status: WorkStatus::JobAssigned,
+                        job_id: "job-123".into(),
+                        video_id: 123,
+                        source_name: "movie.mkv".into(),
+                        size_bytes: 1024,
+                        chunk_size_bytes: 256,
+                        target_vmaf: 96.5,
+                    })),
+                ))
+                .expect("job assigned reply json"),
+            ))
+            .await
+            .expect("send job assigned reply");
+    }
+
     async fn send_announce_error_reply<W>(writer: &mut W, request_ref: u64, response: Value)
     where
         W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -721,6 +1047,25 @@ mod tests {
             ))
             .await
             .expect("send announce error reply");
+    }
+
+    async fn send_cancel_push<W>(writer: &mut W, job_id: &str, reason: &str)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        writer
+            .send(Message::Text(
+                serde_json::to_string(&ServerPushFrame::new(
+                    "cancel",
+                    CancelPayload {
+                        job_id: job_id.into(),
+                        reason: reason.into(),
+                    },
+                ))
+                .expect("cancel push json"),
+            ))
+            .await
+            .expect("send cancel push");
     }
 
     async fn serve_no_work_session(listener: TcpListener, no_work_replies: usize) {
