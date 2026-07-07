@@ -1,13 +1,10 @@
 #![allow(unused_crate_dependencies)]
 
 use anyhow::Result;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::process::Stdio;
-use tokio::{
-    net::TcpListener,
-    process::Command,
-};
-use futures_util::{SinkExt, StreamExt};
+use tokio::{net::TcpListener, process::Command};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[tokio::test(flavor = "current_thread")]
@@ -21,7 +18,11 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
         let (mut writer, mut reader) = socket.split();
 
         expect_text_message(
-            reader.next().await.expect("join frame").expect("join message"),
+            reader
+                .next()
+                .await
+                .expect("join frame")
+                .expect("join message"),
             json!(["1", "1", "workers:crf_search", "phx_join", {}]),
         );
         send_text_message(
@@ -34,7 +35,11 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
         .await;
 
         expect_text_message(
-            reader.next().await.expect("announce frame").expect("announce message"),
+            reader
+                .next()
+                .await
+                .expect("announce frame")
+                .expect("announce message"),
             json!(["1", "2", "workers:crf_search", "announce", {
                 "worker_id": "abav1-dev",
                 "protocol_version": 1,
@@ -52,7 +57,11 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
         .await;
 
         expect_text_message(
-            reader.next().await.expect("pull_work frame").expect("pull_work message"),
+            reader
+                .next()
+                .await
+                .expect("pull_work frame")
+                .expect("pull_work message"),
             json!(["1", "3", "workers:crf_search", "pull_work", {}]),
         );
         send_text_message(

@@ -159,6 +159,21 @@ pub(crate) struct JobAssignedPayload {
     pub(crate) target_vmaf: f32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct JobResultPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) source_name: String,
+    pub(crate) crf: f32,
+    pub(crate) vmaf_score: Option<f32>,
+    pub(crate) xpsnr_score: Option<f32>,
+    pub(crate) predicted_encode_size: u64,
+    pub(crate) encode_percent: f64,
+    pub(crate) predicted_encode_time_secs: f64,
+    pub(crate) from_cache: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ErrorReplyPayload {
     pub(crate) reason: String,
@@ -332,6 +347,38 @@ mod tests {
                     target_vmaf: 96.5,
                 })),
             )
+        );
+    }
+
+    #[test]
+    fn job_result_payload_serializes_structured_result_summary() {
+        let payload = JobResultPayload {
+            job_id: "job-123".into(),
+            video_id: 123,
+            source_name: "movie.mkv".into(),
+            crf: 31.5,
+            vmaf_score: Some(96.2),
+            xpsnr_score: None,
+            predicted_encode_size: 123_456,
+            encode_percent: 42.5,
+            predicted_encode_time_secs: 87.5,
+            from_cache: false,
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).expect("serialize job result"),
+            json!({
+                "job_id": "job-123",
+                "video_id": 123,
+                "source_name": "movie.mkv",
+                "crf": 31.5,
+                "vmaf_score": 96.19999694824219,
+                "xpsnr_score": null,
+                "predicted_encode_size": 123456,
+                "encode_percent": 42.5,
+                "predicted_encode_time_secs": 87.5,
+                "from_cache": false,
+            })
         );
     }
 

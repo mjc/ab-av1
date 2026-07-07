@@ -1,19 +1,16 @@
 use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, Capabilities, ClientEvent, ClientFrame, ErrorReplyPayload,
-    ReplyBody, ServerPushFrame, ServerReply,
+    JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
 };
 use crate::command::{args, crf_search, sample_encode};
 use crate::ffprobe::Ffprobe;
+use crate::temporary;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
@@ -158,23 +155,65 @@ impl WorkerJob {
             verbose: clap_verbosity_flag::Verbosity::new(0, 0),
         })
     }
+
+    fn result_payload(&self, best: &crf_search::Sample) -> JobResultPayload {
+        JobResultPayload {
+            job_id: self.assignment.job_id.clone(),
+            video_id: self.assignment.video_id,
+            source_name: self.assignment.source_name.clone(),
+            crf: best.crf,
+            vmaf_score: best.enc.vmaf_score,
+            xpsnr_score: best.enc.xpsnr_score,
+            predicted_encode_size: best.enc.predicted_encode_size,
+            encode_percent: best.enc.encode_percent,
+            predicted_encode_time_secs: best.enc.predicted_encode_time.as_secs_f64(),
+            from_cache: best.enc.from_cache,
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 async fn run_worker_job(job: WorkerJob, probe: Arc<Ffprobe>) -> Result<crf_search::Sample> {
+    run_worker_job_until(job, probe, std::future::pending::<()>()).await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn run_worker_job_until<S>(
+    job: WorkerJob,
+    probe: Arc<Ffprobe>,
+    shutdown: S,
+) -> Result<crf_search::Sample>
+where
+    S: std::future::Future<Output = ()>,
+{
     let config = job.crf_search_config("libsvtav1".parse().expect("default encoder"))?;
     let mut run = std::pin::pin!(crf_search::run(config, probe));
+    tokio::pin!(shutdown);
 
-    while let Some(update) = run.next().await {
-        match update? {
-            crf_search::Update::Done(best) => return Ok(best),
-            crf_search::Update::Status { .. }
-            | crf_search::Update::SampleResult { .. }
-            | crf_search::Update::RunResult(_) => {}
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => bail!("worker shutdown"),
+            update = run.next() => match update {
+                Some(Ok(crf_search::Update::Done(best))) => return Ok(best),
+                Some(Ok(crf_search::Update::Status { .. }))
+                | Some(Ok(crf_search::Update::SampleResult { .. }))
+                | Some(Ok(crf_search::Update::RunResult(_))) => {}
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
+            },
         }
     }
 
     unreachable!("crf-search stream should finish with Done")
+}
+
+fn worker_job_input_dir(job_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "ab-av1-worker-{}-{}-{}",
+        std::process::id(),
+        job_id,
+        fastrand::u64(..)
+    ))
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -341,8 +380,23 @@ async fn run_connected_worker(
             worker.assigned_worker_id, worker.negotiated_protocol_version, status
         );
 
-        if matches!(work_status, ServerReply::JobAssigned(_)) {
-            return Ok(());
+        if let ServerReply::JobAssigned(assignment) = work_status {
+            let input_dir = worker_job_input_dir(&assignment.job_id);
+            std::fs::create_dir_all(&input_dir).context("create worker job dir")?;
+            temporary::add(&input_dir, temporary::TempKind::NotKeepable);
+
+            let job = WorkerJob::new(assignment, input_dir);
+            let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
+            let best = run_worker_job(job.clone(), probe).await;
+            temporary::clean(true).await;
+            let best = best?;
+
+            println!(
+                "{}",
+                serde_json::to_string(&job.result_payload(&best))
+                    .context("serialize worker job result")?
+            );
+            continue;
         }
 
         if runtime.max_pulls == Some(*completed_pulls) {
@@ -373,11 +427,9 @@ async fn run_worker_session(config: &WorkerConfig) -> Result<WorkerSession> {
 fn work_status_label(reply: &ServerReply) -> String {
     match reply {
         ServerReply::NoWork(payload) => payload.status.as_str().into(),
-        ServerReply::JobAssigned(payload) => format!(
-            "{} (job_id={})",
-            payload.status.as_str(),
-            payload.job_id
-        ),
+        ServerReply::JobAssigned(payload) => {
+            format!("{} (job_id={})", payload.status.as_str(), payload.job_id)
+        }
     }
 }
 
@@ -491,10 +543,7 @@ mod tests {
         CancelPayload, ErrorReplyPayload, JobAssignedPayload, ReplyBody, ServerFrame,
         ServerPushFrame, WorkStatus,
     };
-    use crate::{
-        command::crf_search::test_hooks as crf_test_hooks,
-        ffprobe::Ffprobe,
-    };
+    use crate::{command::crf_search::test_hooks as crf_test_hooks, ffprobe::Ffprobe};
     use anyhow::Result;
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -676,7 +725,7 @@ mod tests {
         let coordinator = FakeCoordinator::with_no_work_replies(1).await?;
         let address = coordinator.address;
 
-        let worker = tokio::spawn(async move {
+        let worker = async move {
             run_worker_until(
                 &coordinator.worker_config(WorkerTestConfig::continuous()),
                 WorkerRuntime {
@@ -687,19 +736,19 @@ mod tests {
                 },
             )
             .await
-        });
+        };
 
-        tokio::time::sleep(Duration::from_millis(5)).await;
-
-        let replacement = tokio::spawn(async move {
+        let replacement = async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
             let listener = TcpListener::bind(address)
                 .await
                 .expect("bind replacement coordinator");
             serve_no_work_session(listener, 1).await;
-        });
+        };
 
-        worker.await.expect("worker task")?;
-        replacement.await.expect("replacement task");
+        let (worker, replacement) = tokio::join!(worker, replacement);
+        worker?;
+        let _ = replacement;
         Ok(())
     }
 
@@ -799,10 +848,8 @@ mod tests {
 
     #[test]
     fn worker_job_lowering_uses_an_isolated_temp_dir_and_target_vmaf() {
-        let job_dir = std::env::temp_dir().join(format!(
-            "ab-av1-worker-job-{}",
-            std::process::id()
-        ));
+        let job_dir =
+            std::env::temp_dir().join(format!("ab-av1-worker-job-{}", std::process::id()));
         let job = WorkerJob::new(
             JobAssignedPayload {
                 status: WorkStatus::JobAssigned,
@@ -837,10 +884,8 @@ mod tests {
             from_cache: false,
         });
 
-        let job_dir = std::env::temp_dir().join(format!(
-            "ab-av1-worker-exec-{}",
-            std::process::id()
-        ));
+        let job_dir =
+            std::env::temp_dir().join(format!("ab-av1-worker-exec-{}", std::process::id()));
         let job = WorkerJob::new(
             JobAssignedPayload {
                 status: WorkStatus::JobAssigned,
@@ -864,12 +909,27 @@ mod tests {
             pix_fmt: Some("yuv420p10le".into()),
         });
 
-        let best = run_worker_job(job, probe).await?;
+        let best = run_worker_job(job.clone(), probe).await?;
         crf_test_hooks::clear();
 
         assert!(best.crf.is_finite());
         assert_eq!(best.enc.vmaf_score, Some(97.0));
         assert_eq!(best.enc.encode_percent, 50.0);
+        assert_eq!(
+            job.result_payload(&best),
+            JobResultPayload {
+                job_id: "job-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                crf: best.crf,
+                vmaf_score: Some(97.0),
+                xpsnr_score: None,
+                predicted_encode_size: 100,
+                encode_percent: 50.0,
+                predicted_encode_time_secs: 1.0,
+                from_cache: false,
+            }
+        );
         Ok(())
     }
 

@@ -114,10 +114,9 @@ impl ChunkReceiver {
                 expected_offset: self.next_offset,
             });
         }
-        if self
-            .max_size
-            .is_some_and(|max_size| self.next_offset.saturating_add(chunk.bytes.len() as u64) > max_size)
-        {
+        if self.max_size.is_some_and(|max_size| {
+            self.next_offset.saturating_add(chunk.bytes.len() as u64) > max_size
+        }) {
             return Err(ChunkReceiverError::FileTooLarge {
                 size: self.next_offset.saturating_add(chunk.bytes.len() as u64),
                 max_size: self.max_size.expect("checked max_size"),
@@ -304,7 +303,10 @@ mod tests {
         assert_eq!(receiver.received_bytes(), 5);
         assert!(matches!(
             receiver.push(chunk(1, 5, b"world!")),
-            Err(ChunkReceiverError::FileTooLarge { size: 11, max_size: 10 })
+            Err(ChunkReceiverError::FileTooLarge {
+                size: 11,
+                max_size: 10
+            })
         ));
         let _ = fs::remove_dir_all(temp_dir);
     }
