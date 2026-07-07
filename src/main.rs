@@ -13,12 +13,11 @@ mod test_support;
 mod vmaf;
 mod xpsnr;
 
-use ::log::LevelFilter;
 use anyhow::anyhow;
 use clap::Parser;
 use futures_util::FutureExt;
-use std::io::IsTerminal;
 use tokio::signal;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -35,16 +34,18 @@ enum Command {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    env_logger::builder()
-        .filter_module(
-            "ab_av1",
-            match std::io::stderr().is_terminal() {
-                true => LevelFilter::Off,
-                false => LevelFilter::Info,
-            },
-        )
-        .parse_default_env()
-        .init();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls crypto provider");
+
+    let default_filter = if cfg!(debug_assertions) {
+        "ab_av1=debug"
+    } else {
+        "ab_av1=info"
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    fmt().with_env_filter(filter).init();
 
     let action = Command::parse();
     let keep = action.keep_temp_files();

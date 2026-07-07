@@ -6,6 +6,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+use tracing::debug;
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +80,12 @@ impl ChunkReceiver {
             .open(&temp_path)
             .context("create chunk temp file")?;
         temporary::add(&temp_path, temporary::TempKind::NotKeepable);
+        debug!(
+            final_path = %final_path.display(),
+            temp_path = %temp_path.display(),
+            max_size = ?max_size,
+            "created chunk receiver"
+        );
 
         Ok(Self {
             final_path,
@@ -100,6 +107,13 @@ impl ChunkReceiver {
         if self.finished {
             return Err(ChunkReceiverError::Finished);
         }
+        debug!(
+            index = chunk.index,
+            offset = chunk.offset,
+            size = chunk.bytes.len(),
+            final_path = %self.final_path.display(),
+            "receiving chunk"
+        );
         if chunk.index < self.next_index {
             return Err(ChunkReceiverError::DuplicateChunk { index: chunk.index });
         }
@@ -162,10 +176,16 @@ impl ChunkReceiver {
         if self.final_path.exists() {
             return Err(ChunkReceiverError::DestinationExists);
         }
+        debug!(
+            temp_path = %self.temp_path.display(),
+            final_path = %self.final_path.display(),
+            "finalizing chunk receiver"
+        );
         fs::rename(&self.temp_path, &self.final_path)?;
         let final_path = self.final_path.clone();
         temporary::unadd(&self.temp_path);
         self.finished = true;
+        debug!(final_path = %final_path.display(), "chunk receiver finished");
         Ok(final_path)
     }
 }

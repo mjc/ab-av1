@@ -1,5 +1,5 @@
 use crate::command::worker_protocol::{
-    AnnouncePayload, CRF_SEARCH_TOPIC, Capabilities, CancelPayload, ClientEvent, ClientFrame,
+    AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent, ClientFrame,
     ErrorReplyPayload, JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
 };
 use crate::command::{args, crf_search, sample_encode};
@@ -16,6 +16,7 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Error as WsError, Message},
 };
+use tracing::debug;
 
 const PHOENIX_VSN: &str = "2.0.0";
 const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
@@ -384,11 +385,19 @@ impl ConnectedWorker {
 }
 
 async fn run_worker_job_and_publish(job: &WorkerJob) -> Result<()> {
+    debug!(
+        job_id = %job.assignment.job_id,
+        input = %job.input_path().display(),
+        "starting worker job"
+    );
     let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
+    debug!(job_id = %job.assignment.job_id, "probe complete, running crf search");
     let best = run_worker_job(job.clone(), probe).await;
+    debug!(job_id = %job.assignment.job_id, "cleaning temp files");
     temporary::clean(true).await;
     let best = best?;
 
+    debug!(job_id = %job.assignment.job_id, "publishing worker result");
     println!(
         "{}",
         serde_json::to_string(&job.result_payload(&best)).context("serialize worker job result")?
@@ -396,7 +405,9 @@ async fn run_worker_job_and_publish(job: &WorkerJob) -> Result<()> {
     Ok(())
 }
 
-fn build_worker_job(assignment: crate::command::worker_protocol::JobAssignedPayload) -> Result<WorkerJob> {
+fn build_worker_job(
+    assignment: crate::command::worker_protocol::JobAssignedPayload,
+) -> Result<WorkerJob> {
     let input_dir = worker_job_input_dir(&assignment.job_id);
     std::fs::create_dir_all(&input_dir).context("create worker job dir")?;
     temporary::add(&input_dir, temporary::TempKind::NotKeepable);
@@ -441,26 +452,41 @@ async fn run_connected_worker(
     runtime: WorkerRuntime,
     completed_pulls: &mut usize,
 ) -> Result<()> {
+    debug!(
+        connect = %config.connect,
+        worker_id = %config.worker_id,
+        once = config.once,
+        "connecting worker"
+    );
     let mut worker = ConnectedWorker::connect(config).await?;
     let mut pending_job: Option<WorkerJob> = None;
 
     loop {
         if let Some(job) = pending_job.as_ref() {
+            debug!(
+                job_id = %job.assignment.job_id,
+                input = %job.input_path().display(),
+                "waiting for pending job input"
+            );
             let next = worker.wait_for_pending_job(job, runtime.idle_delay).await?;
             if matches!(next, PendingJobOutcome::Waiting) {
+                debug!(job_id = %job.assignment.job_id, "pending job still waiting");
                 continue;
             }
             if matches!(next, PendingJobOutcome::Canceled) {
+                debug!(job_id = %job.assignment.job_id, "pending job canceled");
                 temporary::clean(true).await;
                 pending_job = None;
                 continue;
             }
 
+            debug!(job_id = %job.assignment.job_id, "pending job input arrived");
             run_worker_job_and_publish(job).await?;
             pending_job = None;
             continue;
         }
 
+        debug!("requesting work");
         let work_status = worker.request_work().await?;
         *completed_pulls += 1;
         let status = work_status_label(&work_status);
@@ -471,13 +497,19 @@ async fn run_connected_worker(
 
         if let ServerReply::JobAssigned(assignment) = work_status {
             let job = build_worker_job(assignment)?;
+            debug!(
+                job_id = %job.assignment.job_id,
+                input = %job.input_path().display(),
+                "job assigned"
+            );
             if job.input_path().exists() {
+                debug!(job_id = %job.assignment.job_id, "input already present, starting job");
                 run_worker_job_and_publish(&job).await?;
             } else {
-                eprintln!(
-                    "waiting for worker input file {} before starting {}",
-                    job.input_path().display(),
-                    job.assignment.job_id
+                debug!(
+                    job_id = %job.assignment.job_id,
+                    input = %job.input_path().display(),
+                    "waiting for worker input file"
                 );
                 pending_job = Some(job);
             }
