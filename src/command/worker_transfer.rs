@@ -35,6 +35,8 @@ pub(crate) enum ChunkReceiverError {
     DigestMismatch,
     #[error("final size mismatch")]
     SizeMismatch,
+    #[error("destination already exists")]
+    DestinationExists,
     #[error("file would exceed max size {max_size} bytes")]
     FileTooLarge { size: u64, max_size: u64 },
     #[error("receiver already finished")]
@@ -154,6 +156,12 @@ impl ChunkReceiver {
 
         self.file.as_mut().expect("open chunk file").sync_all()?;
         let _ = self.file.take();
+        if let Some(parent) = self.final_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if self.final_path.exists() {
+            return Err(ChunkReceiverError::DestinationExists);
+        }
         fs::rename(&self.temp_path, &self.final_path)?;
         let final_path = self.final_path.clone();
         temporary::unadd(&self.temp_path);
@@ -212,6 +220,49 @@ mod tests {
 
         assert_eq!(written, final_path);
         assert_eq!(fs::read(&final_path).expect("read final"), b"hello world");
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[serial]
+    #[test]
+    fn finish_creates_parent_directory() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ab-av1-worker-transfer-parent-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let final_path = temp_dir.join("nested").join("movie.mkv");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+
+        receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
+        receiver
+            .finish(Some(5), Some(blake3::hash(b"hello")))
+            .expect("finish");
+
+        assert_eq!(fs::read(&final_path).expect("read final"), b"hello");
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[serial]
+    #[test]
+    fn finish_refuses_to_overwrite_existing_destination() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ab-av1-worker-transfer-overwrite-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let final_path = temp_dir.join("nested").join("movie.mkv");
+        fs::create_dir_all(final_path.parent().expect("parent")).expect("create parent");
+        fs::write(&final_path, b"existing").expect("seed final");
+
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
+
+        assert!(matches!(
+            receiver.finish(Some(5), Some(blake3::hash(b"hello"))),
+            Err(ChunkReceiverError::DestinationExists)
+        ));
+        assert_eq!(fs::read(&final_path).expect("read final"), b"existing");
         let _ = fs::remove_dir_all(temp_dir);
     }
 

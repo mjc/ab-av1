@@ -1,7 +1,7 @@
 #![allow(unused_crate_dependencies)]
 
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::process::Stdio;
 use tokio::{net::TcpListener, process::Command};
@@ -43,7 +43,7 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
             json!(["1", "2", "workers:crf_search", "announce", {
                 "worker_id": "abav1-dev",
                 "protocol_version": 1,
-                "version": "0.11.4",
+                "version": env!("CARGO_PKG_VERSION"),
                 "capabilities": {"crf_search": true}
             }]),
         );
@@ -110,7 +110,7 @@ async fn worker_binary_handles_job_assignment() -> Result<()> {
 
 async fn send_text_message<W>(writer: &mut W, value: Value)
 where
-    W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    W: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     writer
         .send(Message::Text(value.to_string()))

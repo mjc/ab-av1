@@ -263,7 +263,7 @@ impl VCodecSpecific for Arc<str> {
 }
 
 pub fn remove_arg(args: &mut Vec<Arc<String>>, arg: &'static str) {
-    if let Some(i) = args.iter().position(|a| a.as_str() == arg) {
+    while let Some(i) = args.iter().position(|a| a.as_str() == arg) {
         args.remove(i);
         if i < args.len() && !args[i].as_str().starts_with('-') {
             args.remove(i);
@@ -378,9 +378,9 @@ mod tests {
         assert_ne!(hash_a.finish(), hash_b.finish());
     }
 
-    // ab-kgc.24: duplicate ffmpeg flags should survive single removal
+    // ab-kgc.24: duplicate ffmpeg flags should all be stripped when removing a flag pair
     #[test]
-    fn remove_arg_strips_only_first_matching_pair() {
+    fn remove_arg_strips_all_matching_pairs() {
         // setup — duplicate flags should require multiple removals or retain extras
         let mut args = vec![
             Arc::new("-preset".to_string()),
@@ -394,10 +394,10 @@ mod tests {
         // execute
         remove_arg(&mut args, "-preset");
 
-        // assert — second -preset pair must survive one removal
+        // assert — both -preset pairs must be removed
         assert_eq!(
             args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            vec!["-preset", "6", "-crf", "30"]
+            vec!["-crf", "30"]
         );
     }
 

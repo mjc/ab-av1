@@ -383,6 +383,26 @@ impl ConnectedWorker {
     }
 }
 
+async fn run_worker_job_and_publish(job: &WorkerJob) -> Result<()> {
+    let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
+    let best = run_worker_job(job.clone(), probe).await;
+    temporary::clean(true).await;
+    let best = best?;
+
+    println!(
+        "{}",
+        serde_json::to_string(&job.result_payload(&best)).context("serialize worker job result")?
+    );
+    Ok(())
+}
+
+fn build_worker_job(assignment: crate::command::worker_protocol::JobAssignedPayload) -> Result<WorkerJob> {
+    let input_dir = worker_job_input_dir(&assignment.job_id);
+    std::fs::create_dir_all(&input_dir).context("create worker job dir")?;
+    temporary::add(&input_dir, temporary::TempKind::NotKeepable);
+    Ok(WorkerJob::new(assignment, input_dir))
+}
+
 pub async fn worker(config: WorkerConfig) -> Result<()> {
     if config.once {
         let session = run_worker_session(&config).await?;
@@ -426,28 +446,19 @@ async fn run_connected_worker(
 
     loop {
         if let Some(job) = pending_job.as_ref() {
-            match worker.wait_for_pending_job(job, runtime.idle_delay).await? {
-                PendingJobOutcome::Waiting => continue,
-                PendingJobOutcome::Canceled => {
-                    temporary::clean(true).await;
-                    pending_job = None;
-                    continue;
-                }
-                PendingJobOutcome::Ready => {
-                    let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
-                    let best = run_worker_job(job.clone(), probe).await;
-                    temporary::clean(true).await;
-                    let best = best?;
-
-                    println!(
-                        "{}",
-                        serde_json::to_string(&job.result_payload(&best))
-                            .context("serialize worker job result")?
-                    );
-                    pending_job = None;
-                    continue;
-                }
+            let next = worker.wait_for_pending_job(job, runtime.idle_delay).await?;
+            if matches!(next, PendingJobOutcome::Waiting) {
+                continue;
             }
+            if matches!(next, PendingJobOutcome::Canceled) {
+                temporary::clean(true).await;
+                pending_job = None;
+                continue;
+            }
+
+            run_worker_job_and_publish(job).await?;
+            pending_job = None;
+            continue;
         }
 
         let work_status = worker.request_work().await?;
@@ -459,22 +470,9 @@ async fn run_connected_worker(
         );
 
         if let ServerReply::JobAssigned(assignment) = work_status {
-            let input_dir = worker_job_input_dir(&assignment.job_id);
-            std::fs::create_dir_all(&input_dir).context("create worker job dir")?;
-            temporary::add(&input_dir, temporary::TempKind::NotKeepable);
-
-            let job = WorkerJob::new(assignment, input_dir);
+            let job = build_worker_job(assignment)?;
             if job.input_path().exists() {
-                let probe = Arc::new(crate::ffprobe::probe(&job.input_path()));
-                let best = run_worker_job(job.clone(), probe).await;
-                temporary::clean(true).await;
-                let best = best?;
-
-                println!(
-                    "{}",
-                    serde_json::to_string(&job.result_payload(&best))
-                        .context("serialize worker job result")?
-                );
+                run_worker_job_and_publish(&job).await?;
             } else {
                 eprintln!(
                     "waiting for worker input file {} before starting {}",
