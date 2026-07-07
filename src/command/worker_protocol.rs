@@ -100,6 +100,14 @@ impl<T> ReplyBody<T> {
             response,
         }
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn error(response: T) -> Self {
+        Self {
+            status: "error".into(),
+            response,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +152,22 @@ pub(crate) struct ErrorReplyPayload {
     pub(crate) reason: String,
     #[serde(default)]
     pub(crate) supported_protocol_versions: Vec<u64>,
+}
+
+impl ErrorReplyPayload {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            supported_protocol_versions: Vec::new(),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_supported_protocol_versions(mut self, versions: Vec<u64>) -> Self {
+        self.supported_protocol_versions = versions;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +260,35 @@ mod tests {
                     size_bytes: 1024,
                     chunk_size_bytes: 256,
                 })),
+            )
+        );
+    }
+
+    #[test]
+    fn server_error_reply_parses_protocol_mismatch_payload() {
+        let reply: ServerFrame<ErrorReplyPayload> = serde_json::from_value(json!([
+            null,
+            "2",
+            "workers:crf_search",
+            "phx_reply",
+            {
+                "status": "error",
+                "response": {
+                    "reason": "unsupported_protocol_version",
+                    "supported_protocol_versions": [1]
+                }
+            }
+        ]))
+        .expect("parse error reply");
+
+        assert_eq!(
+            reply,
+            ServerFrame::reply(
+                2,
+                ReplyBody::error(
+                    ErrorReplyPayload::new("unsupported_protocol_version")
+                        .with_supported_protocol_versions(vec![1]),
+                ),
             )
         );
     }

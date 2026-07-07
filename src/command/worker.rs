@@ -365,7 +365,7 @@ where
 mod tests {
     use super::*;
     use anyhow::Result;
-    use crate::command::worker_protocol::{ReplyBody, WorkStatus};
+    use crate::command::worker_protocol::{ErrorReplyPayload, ReplyBody, WorkStatus};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -373,11 +373,22 @@ mod tests {
     #[derive(Clone, Copy)]
     struct WorkerTestConfig {
         once: bool,
+        protocol_version: u64,
     }
 
     impl WorkerTestConfig {
         fn continuous() -> Self {
-            Self { once: false }
+            Self {
+                once: false,
+                protocol_version: 1,
+            }
+        }
+
+        fn with_protocol_version(protocol_version: u64) -> Self {
+            Self {
+                once: false,
+                protocol_version,
+            }
         }
     }
 
@@ -409,7 +420,7 @@ mod tests {
                 token: "test-worker-token".into(),
                 worker_id: "abav1-dev".into(),
                 version: "0.11.4".into(),
-                protocol_version: 1,
+                protocol_version: config.protocol_version,
                 once: config.once,
             }
         }
@@ -541,14 +552,11 @@ mod tests {
             .await;
         });
 
-        let error = run_worker_session(&WorkerConfig {
-            connect: format!("http://{address}"),
-            token: "test-worker-token".into(),
-            worker_id: "abav1-dev".into(),
-            version: "0.11.4".into(),
-            protocol_version: 99,
-            once: false,
-        })
+        let error = run_worker_session(&FakeCoordinator {
+            address,
+            server: tokio::spawn(async {}),
+        }
+        .worker_config(WorkerTestConfig::with_protocol_version(99)))
         .await
         .expect_err("protocol mismatch should fail");
 
@@ -702,11 +710,14 @@ mod tests {
     {
         writer
             .send(Message::Text(
-                json!([null, request_ref.to_string(), CRF_SEARCH_TOPIC, "phx_reply", {
-                    "status": "error",
-                    "response": response
-                }])
-                .to_string(),
+                serde_json::to_string(&crate::command::worker_protocol::ServerFrame::reply(
+                    request_ref,
+                    ReplyBody::error(
+                        serde_json::from_value::<ErrorReplyPayload>(response)
+                            .expect("error payload"),
+                    ),
+                ))
+                .expect("announce error reply json"),
             ))
             .await
             .expect("send announce error reply");
