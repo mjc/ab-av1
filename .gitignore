@@ -1,5 +1,7 @@
 /target
 /aur
+.envrc
+.direnv/
 *.log
 .DS_Store
 *.json
