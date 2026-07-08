@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use sysinfo::{Disks, Pid, System};
 use tokio::net::TcpStream;
@@ -371,46 +371,79 @@ async fn run_worker_job_with_reporting(
 ) -> Result<crf_search::Sample> {
     let config = job.crf_search_config("libsvtav1".parse().expect("default encoder"))?;
     let mut run = std::pin::pin!(crf_search::run(config, probe));
-    let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL;
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            worker
-                .send_event(ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir)))
-                .await?;
-            last_heartbeat = Instant::now();
-        }
-
-        match run.next().await {
-            Some(Ok(crf_search::Update::Done(best))) => {
+        tokio::select! {
+            _ = heartbeat.tick() => {
                 worker
-                    .send_event(ClientEvent::CrfSearchResult(
-                        job.crf_result_payload(&best, true),
-                    ))
-                    .await?;
-                return Ok(best);
-            }
-            Some(Ok(crf_search::Update::Status { sample, .. })) => {
-                worker
-                    .send_event(ClientEvent::CrfSearchProgress(
-                        job.progress_payload(&sample),
-                    ))
+                    .send_event(ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir)))
                     .await?;
             }
-            Some(Ok(crf_search::Update::SampleResult { .. })) => {}
-            Some(Ok(crf_search::Update::RunResult(sample))) => {
-                worker
-                    .send_event(ClientEvent::CrfSearchResult(
-                        job.crf_result_payload(&sample, false),
-                    ))
-                    .await?;
+            frame = worker.socket.next() => {
+                handle_job_websocket_frame(&mut worker.socket, frame, &job.assignment.job_id).await?;
             }
-            Some(Err(error)) => return Err(error.into()),
-            None => break,
+            update = run.next() => match update {
+                Some(Ok(crf_search::Update::Done(best))) => {
+                    worker
+                        .send_event(ClientEvent::CrfSearchResult(
+                            job.crf_result_payload(&best, true),
+                        ))
+                        .await?;
+                    return Ok(best);
+                }
+                Some(Ok(crf_search::Update::Status { sample, .. })) => {
+                    worker
+                        .send_event(ClientEvent::CrfSearchProgress(
+                            job.progress_payload(&sample),
+                        ))
+                        .await?;
+                }
+                Some(Ok(crf_search::Update::SampleResult { .. })) => {}
+                Some(Ok(crf_search::Update::RunResult(sample))) => {
+                    worker
+                        .send_event(ClientEvent::CrfSearchResult(
+                            job.crf_result_payload(&sample, false),
+                        ))
+                        .await?;
+                }
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
+            },
         }
     }
 
     unreachable!("crf-search stream should finish with Done")
+}
+
+async fn handle_job_websocket_frame(
+    socket: &mut WorkerSocket,
+    frame: Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    job_id: &str,
+) -> Result<()> {
+    match frame {
+        Some(Ok(Message::Ping(payload))) => {
+            socket
+                .send(Message::Pong(payload))
+                .await
+                .context("send websocket pong during worker job")?;
+        }
+        Some(Ok(Message::Pong(_))) => {}
+        Some(Ok(Message::Text(text))) => {
+            if let Some(WorkerPush::Cancel(cancel)) = decode_worker_push(&text)?
+                && cancel.job_id == job_id
+            {
+                bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
+            }
+        }
+        Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
+        Some(Ok(Message::Close(frame))) => bail!("websocket closed during worker job: {frame:?}"),
+        Some(Err(error)) => return Err(error).context("read websocket message during worker job"),
+        None => bail!("websocket ended during worker job"),
+    }
+
+    Ok(())
 }
 
 fn heartbeat_payload(path: &Path) -> HeartbeatPayload {
