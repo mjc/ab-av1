@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const CRF_SEARCH_TOPIC: &str = "workers:crf_search";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ClientFrame(String, String, String, String, ClientPayload);
 
 impl ClientFrame {
@@ -18,11 +18,14 @@ impl ClientFrame {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ClientEvent {
     Join,
     Announce(AnnouncePayload),
     PullWork,
+    Heartbeat(HeartbeatPayload),
+    CrfSearchProgress(CrfSearchProgressPayload),
+    CrfSearchResult(CrfSearchResultPayload),
 }
 
 impl ClientEvent {
@@ -31,15 +34,23 @@ impl ClientEvent {
             Self::Join => ("phx_join", ClientPayload::Empty(EmptyPayload {})),
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
             Self::PullWork => ("pull_work", ClientPayload::Empty(EmptyPayload {})),
+            Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
+            Self::CrfSearchProgress(payload) => {
+                ("crf_search_progress", ClientPayload::Progress(payload))
+            }
+            Self::CrfSearchResult(payload) => ("crf_search_result", ClientPayload::Result(payload)),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 enum ClientPayload {
     Empty(EmptyPayload),
     Announce(AnnouncePayload),
+    Heartbeat(HeartbeatPayload),
+    Progress(CrfSearchProgressPayload),
+    Result(CrfSearchResultPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,6 +67,41 @@ pub(crate) struct AnnouncePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Capabilities {
     pub(crate) crf_search: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct HeartbeatPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_percent: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_rss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disk_free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disk_total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CrfSearchProgressPayload {
+    pub(crate) video_id: u64,
+    pub(crate) percent: f32,
+    pub(crate) filename: String,
+    pub(crate) eta: Option<f64>,
+    pub(crate) fps: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CrfSearchResultPayload {
+    pub(crate) crf: f32,
+    pub(crate) score: f32,
+    pub(crate) percent: f64,
+    pub(crate) size: u64,
+    pub(crate) time: f64,
+    pub(crate) params: serde_json::Value,
+    pub(crate) target: f32,
+    pub(crate) chosen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,6 +342,105 @@ mod tests {
                     "protocol_version": 1,
                     "version": "0.11.4",
                     "capabilities": { "crf_search": true }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn heartbeat_serializes_worker_telemetry_event() {
+        let frame = ClientFrame::new(
+            4,
+            ClientEvent::Heartbeat(HeartbeatPayload {
+                cpu_percent: Some(12.5),
+                memory_rss_bytes: Some(1234),
+                memory_total_bytes: Some(8192),
+                disk_free_bytes: Some(4096),
+                disk_total_bytes: Some(16_384),
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize heartbeat"),
+            json!([
+                "1",
+                "4",
+                "workers:crf_search",
+                "heartbeat",
+                {
+                    "cpu_percent": 12.5,
+                    "memory_rss_bytes": 1234,
+                    "memory_total_bytes": 8192,
+                    "disk_free_bytes": 4096,
+                    "disk_total_bytes": 16_384,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn crf_search_progress_serializes_reencodarr_progress_event() {
+        let frame = ClientFrame::new(
+            5,
+            ClientEvent::CrfSearchProgress(CrfSearchProgressPayload {
+                video_id: 123,
+                percent: 42.5,
+                filename: "movie.mkv".into(),
+                eta: None,
+                fps: 27.25,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize crf progress"),
+            json!([
+                "1",
+                "5",
+                "workers:crf_search",
+                "crf_search_progress",
+                {
+                    "video_id": 123,
+                    "percent": 42.5,
+                    "filename": "movie.mkv",
+                    "eta": null,
+                    "fps": 27.25,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn crf_search_result_serializes_reencodarr_vmaf_model_event() {
+        let frame = ClientFrame::new(
+            6,
+            ClientEvent::CrfSearchResult(CrfSearchResultPayload {
+                crf: 31.5,
+                score: 96.2,
+                percent: 42.5,
+                size: 123_456,
+                time: 87.5,
+                params: json!({ "encoder": "libsvtav1", "preset": 8 }),
+                target: 95.0,
+                chosen: true,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize crf result"),
+            json!([
+                "1",
+                "6",
+                "workers:crf_search",
+                "crf_search_result",
+                {
+                    "crf": 31.5,
+                    "score": 96.19999694824219,
+                    "percent": 42.5,
+                    "size": 123456,
+                    "time": 87.5,
+                    "params": { "encoder": "libsvtav1", "preset": 8 },
+                    "target": 95.0,
+                    "chosen": true,
                 }
             ])
         );

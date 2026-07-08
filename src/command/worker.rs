@@ -1,7 +1,8 @@
 use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ChunkTransferPayload,
-    ClientEvent, ClientFrame, ErrorReplyPayload, JobResultPayload, ReplyBody, ServerPushFrame,
-    ServerReply, TransferStartedPayload,
+    ClientEvent, ClientFrame, CrfSearchProgressPayload, CrfSearchResultPayload, ErrorReplyPayload,
+    HeartbeatPayload, JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
+    TransferStartedPayload,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{args, crf_search, sample_encode};
@@ -12,12 +13,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
+use sysinfo::{Disks, Pid, System};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
@@ -33,6 +35,7 @@ const TRANSFER_CHUNK_VERSION: u8 = 1;
 const TRANSFER_CHUNK_TYPE: u8 = 1;
 const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Connect to a Reencodarr websocket worker endpoint and request one job.
 #[derive(Parser, Debug, Clone)]
@@ -194,6 +197,33 @@ impl WorkerJob {
             from_cache: best.enc.from_cache,
         }
     }
+
+    fn progress_payload(&self, status: &sample_encode::Status) -> CrfSearchProgressPayload {
+        CrfSearchProgressPayload {
+            video_id: self.assignment.video_id,
+            percent: (status.progress.clamp(0.0, 1.0) * 100.0),
+            filename: self.assignment.source_name.clone(),
+            eta: None,
+            fps: status.fps,
+        }
+    }
+
+    fn crf_result_payload(
+        &self,
+        sample: &crf_search::Sample,
+        chosen: bool,
+    ) -> CrfSearchResultPayload {
+        CrfSearchResultPayload {
+            crf: sample.crf,
+            score: sample.enc.single_score(),
+            percent: sample.enc.encode_percent,
+            size: sample.enc.predicted_encode_size,
+            time: sample.enc.predicted_encode_time.as_secs_f64(),
+            params: json!({ "encoder": "libsvtav1", "preset": 8 }),
+            target: self.assignment.target_vmaf,
+            chosen,
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -332,6 +362,78 @@ where
     }
 
     unreachable!("crf-search stream should finish with Done")
+}
+
+async fn run_worker_job_with_reporting(
+    job: WorkerJob,
+    probe: Arc<Ffprobe>,
+    worker: &mut ConnectedWorker,
+) -> Result<crf_search::Sample> {
+    let config = job.crf_search_config("libsvtav1".parse().expect("default encoder"))?;
+    let mut run = std::pin::pin!(crf_search::run(config, probe));
+    let mut last_heartbeat = Instant::now() - HEARTBEAT_INTERVAL;
+
+    loop {
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            worker
+                .send_event(ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir)))
+                .await?;
+            last_heartbeat = Instant::now();
+        }
+
+        match run.next().await {
+            Some(Ok(crf_search::Update::Done(best))) => {
+                worker
+                    .send_event(ClientEvent::CrfSearchResult(
+                        job.crf_result_payload(&best, true),
+                    ))
+                    .await?;
+                return Ok(best);
+            }
+            Some(Ok(crf_search::Update::Status { sample, .. })) => {
+                worker
+                    .send_event(ClientEvent::CrfSearchProgress(
+                        job.progress_payload(&sample),
+                    ))
+                    .await?;
+            }
+            Some(Ok(crf_search::Update::SampleResult { .. })) => {}
+            Some(Ok(crf_search::Update::RunResult(sample))) => {
+                worker
+                    .send_event(ClientEvent::CrfSearchResult(
+                        job.crf_result_payload(&sample, false),
+                    ))
+                    .await?;
+            }
+            Some(Err(error)) => return Err(error.into()),
+            None => break,
+        }
+    }
+
+    unreachable!("crf-search stream should finish with Done")
+}
+
+fn heartbeat_payload(path: &Path) -> HeartbeatPayload {
+    let mut system = System::new();
+    system.refresh_cpu();
+    system.refresh_memory();
+
+    let pid = Pid::from_u32(std::process::id());
+    let memory_rss_bytes = system.process(pid).map(|process| process.memory());
+
+    let disks = Disks::new_with_refreshed_list();
+    let disk = disks
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len());
+
+    HeartbeatPayload {
+        cpu_percent: Some(system.global_cpu_info().cpu_usage()),
+        memory_rss_bytes,
+        memory_total_bytes: Some(system.total_memory()),
+        disk_free_bytes: disk.map(|disk| disk.available_space()),
+        disk_total_bytes: disk.map(|disk| disk.total_space()),
+    }
 }
 
 fn worker_job_input_dir(job_id: &str) -> PathBuf {
@@ -501,6 +603,12 @@ impl ConnectedWorker {
         expect_reply(&mut self.socket, &request_ref.to_string(), "pull_work").await
     }
 
+    async fn send_event(&mut self, event: ClientEvent) -> Result<()> {
+        let request_ref = self.next_ref;
+        self.next_ref += 1;
+        send_json(&mut self.socket, ClientFrame::new(request_ref, event)).await
+    }
+
     async fn wait_for_pending_job(
         &mut self,
         pending_job: &mut PendingJob,
@@ -646,7 +754,7 @@ impl ConnectedWorker {
     }
 }
 
-async fn run_worker_job_and_publish(job: &WorkerJob) -> Result<()> {
+async fn run_worker_job_and_publish(worker: &mut ConnectedWorker, job: &WorkerJob) -> Result<()> {
     debug!(
         job_id = %job.assignment.job_id,
         input = %job.input_path().display(),
@@ -654,7 +762,7 @@ async fn run_worker_job_and_publish(job: &WorkerJob) -> Result<()> {
     );
     let probe = Arc::new(crate::ffprobe::probe(job.input_path()));
     debug!(job_id = %job.assignment.job_id, "probe complete, running crf search");
-    let best = run_worker_job(job.clone(), probe).await?;
+    let best = run_worker_job_with_reporting(job.clone(), probe, worker).await?;
 
     debug!(job_id = %job.assignment.job_id, "publishing worker result");
     println!(
@@ -749,7 +857,7 @@ async fn run_connected_worker(
                 PendingJobOutcome::Ready => {
                     let job = pending_job.take().expect("pending job");
                     debug!(job_id = %job.job.assignment.job_id, "pending job input arrived");
-                    run_worker_job_and_publish(&job.job).await?;
+                    run_worker_job_and_publish(&mut worker, &job.job).await?;
                     continue;
                 }
             }
@@ -773,7 +881,7 @@ async fn run_connected_worker(
             );
             if job.input_path().exists() {
                 debug!(job_id = %job.assignment.job_id, "input already present, starting job");
-                run_worker_job_and_publish(&job).await?;
+                run_worker_job_and_publish(&mut worker, &job).await?;
             } else if config.local_path.is_some() {
                 bail!(
                     "local input path does not exist: {}",
