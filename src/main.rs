@@ -17,7 +17,7 @@ use anyhow::anyhow;
 use clap::Parser;
 use futures_util::FutureExt;
 use tokio::signal;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
 #[command(version, about)]

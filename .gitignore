@@ -1,5 +1,6 @@
 /target
 /aur
+/ab-av1-worker-*/
 .envrc
 .direnv/
 *.log

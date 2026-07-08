@@ -188,16 +188,31 @@ pub(crate) struct CancelPayload {
     pub(crate) reason: String,
 }
 
-/// Chunk bytes travel in binary websocket frames.
-/// These metadata messages stay on the text side channel.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TransferStartedPayload {
+    pub(crate) chunk_size_bytes: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) source_name: String,
+    pub(crate) status: String,
+    pub(crate) total_bytes: u64,
+    pub(crate) total_chunks: u64,
+    pub(crate) transfer_id: String,
+    pub(crate) video_id: u64,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChunkTransferPayload {
-    pub(crate) job_id: String,
-    pub(crate) index: u64,
-    pub(crate) offset: u64,
-    pub(crate) size_bytes: u64,
-    pub(crate) checksum: String,
+    pub(crate) bytes_sent: u64,
+    pub(crate) chunk_index: u64,
+    pub(crate) crc32: u64,
+    pub(crate) data: String,
+    pub(crate) status: String,
+    pub(crate) total_bytes: u64,
+    pub(crate) total_chunks: u64,
+    pub(crate) transfer_id: String,
+    pub(crate) video_id: u64,
 }
 
 #[allow(dead_code)]
@@ -438,23 +453,59 @@ mod tests {
     }
 
     #[test]
+    fn transfer_started_payload_serializes_metadata_side_channel() {
+        let payload = TransferStartedPayload {
+            chunk_size_bytes: 1_048_576,
+            size_bytes: 9_560_739_312,
+            source_name: "movie.mkv".into(),
+            status: "transfer_started".into(),
+            total_bytes: 9_560_739_312,
+            total_chunks: 9_118,
+            transfer_id: "job-123".into(),
+            video_id: 123,
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).expect("serialize transfer started"),
+            json!({
+                "chunk_size_bytes": 1_048_576,
+                "size_bytes": 9_560_739_312u64,
+                "source_name": "movie.mkv",
+                "status": "transfer_started",
+                "total_bytes": 9_560_739_312u64,
+                "total_chunks": 9_118,
+                "transfer_id": "job-123",
+                "video_id": 123,
+            })
+        );
+    }
+
+    #[test]
     fn chunk_transfer_payload_serializes_metadata_side_channel() {
         let payload = ChunkTransferPayload {
-            job_id: "job-123".into(),
-            index: 7,
-            offset: 8192,
-            size_bytes: 4096,
-            checksum: "deadbeef".into(),
+            bytes_sent: 4096,
+            chunk_index: 7,
+            crc32: 0xdead_beef,
+            data: "deadbeef".into(),
+            status: "transfer_chunk".into(),
+            total_bytes: 9_560_739_312,
+            total_chunks: 9_118,
+            transfer_id: "job-123".into(),
+            video_id: 123,
         };
 
         assert_eq!(
             serde_json::to_value(payload).expect("serialize chunk transfer"),
             json!({
-                "job_id": "job-123",
-                "index": 7,
-                "offset": 8192,
-                "size_bytes": 4096,
-                "checksum": "deadbeef",
+                "bytes_sent": 4096,
+                "chunk_index": 7,
+                "crc32": 3735928559u64,
+                "data": "deadbeef",
+                "status": "transfer_chunk",
+                "total_bytes": 9_560_739_312u64,
+                "total_chunks": 9_118,
+                "transfer_id": "job-123",
+                "video_id": 123,
             })
         );
     }

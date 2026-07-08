@@ -6,7 +6,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-use tracing::debug;
+use tracing::{debug, trace};
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub(crate) struct Chunk {
     pub index: u64,
     pub offset: u64,
     pub bytes: Vec<u8>,
-    pub checksum: Hash,
+    pub checksum: u64,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -107,7 +107,7 @@ impl ChunkReceiver {
         if self.finished {
             return Err(ChunkReceiverError::Finished);
         }
-        debug!(
+        trace!(
             index = chunk.index,
             offset = chunk.offset,
             size = chunk.bytes.len(),
@@ -138,7 +138,7 @@ impl ChunkReceiver {
                 max_size: self.max_size.expect("checked max_size"),
             });
         }
-        if blake3::hash(&chunk.bytes) != chunk.checksum {
+        if crc32fast::hash(&chunk.bytes) as u64 != chunk.checksum {
             return Err(ChunkReceiverError::CorruptChunk { index: chunk.index });
         }
 
@@ -221,7 +221,7 @@ mod tests {
             index,
             offset,
             bytes: bytes.to_vec(),
-            checksum: blake3::hash(bytes),
+            checksum: crc32fast::hash(bytes) as u64,
         }
     }
 
@@ -293,7 +293,7 @@ mod tests {
         let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
 
         let mut bad = chunk(0, 0, b"hello");
-        bad.checksum = blake3::hash(b"hell0");
+        bad.checksum = crc32fast::hash(b"hell0") as u64;
 
         assert!(matches!(
             receiver.push(bad),
