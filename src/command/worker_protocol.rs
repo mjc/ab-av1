@@ -24,6 +24,7 @@ pub(crate) enum ClientEvent {
     Announce(AnnouncePayload),
     PullWork,
     Heartbeat(HeartbeatPayload),
+    TransferProgress(TransferProgressPayload),
     CrfSearchProgress(CrfSearchProgressPayload),
     CrfSearchResult(CrfSearchResultPayload),
 }
@@ -35,6 +36,10 @@ impl ClientEvent {
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
             Self::PullWork => ("pull_work", ClientPayload::Empty(EmptyPayload {})),
             Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
+            Self::TransferProgress(payload) => (
+                "transfer_progress",
+                ClientPayload::TransferProgress(payload),
+            ),
             Self::CrfSearchProgress(payload) => {
                 ("crf_search_progress", ClientPayload::Progress(payload))
             }
@@ -49,6 +54,7 @@ enum ClientPayload {
     Empty(EmptyPayload),
     Announce(AnnouncePayload),
     Heartbeat(HeartbeatPayload),
+    TransferProgress(TransferProgressPayload),
     Progress(CrfSearchProgressPayload),
     Result(CrfSearchResultPayload),
 }
@@ -261,12 +267,20 @@ pub(crate) struct ChunkTransferPayload {
     pub(crate) video_id: u64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TransferProgressPayload {
     pub(crate) job_id: String,
+    pub(crate) transfer_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) filename: String,
     pub(crate) received_bytes: u64,
     pub(crate) expected_bytes: Option<u64>,
+    pub(crate) percent: f64,
+    pub(crate) bytes_per_second: f64,
+    pub(crate) eta: Option<f64>,
+    pub(crate) chunk_index: u64,
+    pub(crate) total_chunks: u64,
 }
 
 #[allow(dead_code)]
@@ -373,6 +387,49 @@ mod tests {
                     "memory_total_bytes": 8192,
                     "disk_free_bytes": 4096,
                     "disk_total_bytes": 16_384,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn transfer_progress_serializes_transfer_stats_event() {
+        let frame = ClientFrame::new(
+            5,
+            ClientEvent::TransferProgress(TransferProgressPayload {
+                job_id: "job-123".into(),
+                transfer_id: "job-123".into(),
+                video_id: 123,
+                filename: "movie.mkv".into(),
+                received_bytes: 512,
+                expected_bytes: Some(1024),
+                percent: 50.0,
+                bytes_per_second: 256.0,
+                eta: Some(2.0),
+                chunk_index: 3,
+                total_chunks: 8,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize transfer progress"),
+            json!([
+                "1",
+                "5",
+                "workers:crf_search",
+                "transfer_progress",
+                {
+                    "job_id": "job-123",
+                    "transfer_id": "job-123",
+                    "video_id": 123,
+                    "filename": "movie.mkv",
+                    "received_bytes": 512,
+                    "expected_bytes": 1024,
+                    "percent": 50.0,
+                    "bytes_per_second": 256.0,
+                    "eta": 2.0,
+                    "chunk_index": 3,
+                    "total_chunks": 8,
                 }
             ])
         );

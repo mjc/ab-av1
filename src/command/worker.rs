@@ -2,7 +2,7 @@ use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ChunkTransferPayload,
     ClientEvent, ClientFrame, CrfSearchProgressPayload, CrfSearchResultPayload, ErrorReplyPayload,
     HeartbeatPayload, JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
-    TransferStartedPayload,
+    TransferProgressPayload, TransferStartedPayload,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{args, crf_search, sample_encode};
@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sysinfo::{Disks, Pid, System};
 use tokio::net::TcpStream;
@@ -231,6 +231,7 @@ impl WorkerJob {
 struct PendingJob {
     job: WorkerJob,
     receiver: Option<ChunkReceiver>,
+    transfer_started_at: Instant,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -239,6 +240,7 @@ impl PendingJob {
         Self {
             job,
             receiver: Some(receiver),
+            transfer_started_at: Instant::now(),
         }
     }
 
@@ -310,6 +312,46 @@ impl PendingJob {
             checksum: chunk.crc32,
         })?;
         Ok(())
+    }
+
+    fn transfer_progress_payload(
+        &self,
+        chunk_index: u64,
+        total_chunks: u64,
+    ) -> TransferProgressPayload {
+        let received_bytes = self
+            .receiver
+            .as_ref()
+            .map(ChunkReceiver::received_bytes)
+            .unwrap_or(self.job.assignment.size_bytes);
+        let expected_bytes = Some(self.job.assignment.size_bytes);
+        let elapsed = self.transfer_started_at.elapsed().as_secs_f64().max(0.001);
+        let bytes_per_second = received_bytes as f64 / elapsed;
+        let remaining_bytes = self
+            .job
+            .assignment
+            .size_bytes
+            .saturating_sub(received_bytes);
+        let eta = (bytes_per_second > 0.0).then_some(remaining_bytes as f64 / bytes_per_second);
+        let percent = if self.job.assignment.size_bytes == 0 {
+            100.0
+        } else {
+            100.0 * received_bytes as f64 / self.job.assignment.size_bytes as f64
+        };
+
+        TransferProgressPayload {
+            job_id: self.job.assignment.job_id.clone(),
+            transfer_id: self.job.assignment.job_id.clone(),
+            video_id: self.job.assignment.video_id,
+            filename: self.job.assignment.source_name.clone(),
+            received_bytes,
+            expected_bytes,
+            percent,
+            bytes_per_second,
+            eta,
+            chunk_index,
+            total_chunks,
+        }
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -705,7 +747,13 @@ impl ConnectedWorker {
                                         "received chunk"
                                     );
                                 }
+                                let chunk_index = chunk.chunk_index;
+                                let total_chunks = chunk.total_chunks;
                                 pending_job.apply_chunk(chunk)?;
+                                self.send_event(ClientEvent::TransferProgress(
+                                    pending_job.transfer_progress_payload(chunk_index, total_chunks),
+                                ))
+                                .await?;
                                 if pending_job.receiver.as_ref().is_some_and(|receiver| {
                                     receiver.received_bytes()
                                         == pending_job.job.assignment.size_bytes
@@ -747,7 +795,13 @@ impl ConnectedWorker {
                                     "received binary chunk"
                                 );
                             }
+                            let chunk_index = chunk.chunk_index;
+                            let total_chunks = chunk.total_chunks;
                             pending_job.apply_raw_chunk(chunk)?;
+                            self.send_event(ClientEvent::TransferProgress(
+                                pending_job.transfer_progress_payload(chunk_index, total_chunks),
+                            ))
+                            .await?;
                             if pending_job.receiver.as_ref().is_some_and(|receiver| {
                                 receiver.received_bytes() == pending_job.job.assignment.size_bytes
                             }) {
