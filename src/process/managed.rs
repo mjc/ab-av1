@@ -381,8 +381,11 @@ impl MustCompleteProcess {
     /// and only then yields `ProcessDone`.
     pub fn stderr_events(self) -> impl Stream<Item = anyhow::Result<ManagedEvent>> {
         async_stream::try_stream! {
-            let mut process = self.0;
-            let mut stderr = process.handle.stderr().try_subscribe()?;
+            let mut process = TerminateOnDropProcess(Some(self.0));
+            let Some(inner) = process.0.as_mut() else {
+                return;
+            };
+            let mut stderr = inner.handle.stderr().try_subscribe()?;
             while let Some(event) = stderr.next_event().await {
                 match managed_event_from_stream_event(event)? {
                     Some(ManagedEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
@@ -392,7 +395,13 @@ impl MustCompleteProcess {
                 }
             }
 
-            yield ManagedEvent::ProcessDone(wait_for_process_done(&mut process).await?);
+            drop(stderr);
+            let Some(inner) = process.0.as_mut() else {
+                return;
+            };
+            let done = wait_for_process_done(inner).await?;
+            drop(process.0.take());
+            yield ManagedEvent::ProcessDone(done);
         }
     }
 }

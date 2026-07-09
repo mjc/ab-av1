@@ -2,12 +2,12 @@ use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ChunkTransferPayload,
     ClientEvent, ClientFrame, CrfSearchProgressPayload, CrfSearchResultPayload, ErrorReplyPayload,
     HeartbeatPayload, JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
-    TransferProgressPayload, TransferStartedPayload,
+    TransferFailurePayload, TransferProgressPayload, TransferStage, TransferStartedPayload,
+    WorkStatus,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
-use crate::command::{args, crf_search, sample_encode};
+use crate::command::{crf_search, sample_encode};
 use crate::ffprobe::Ffprobe;
-use crate::temporary;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
@@ -15,8 +15,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use sysinfo::{Disks, Pid, System};
@@ -35,7 +36,8 @@ const TRANSFER_CHUNK_VERSION: u8 = 1;
 const TRANSFER_CHUNK_TYPE: u8 = 1;
 const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 /// Connect to a Reencodarr websocket worker endpoint and request one job.
 #[derive(Parser, Debug, Clone)]
@@ -138,49 +140,27 @@ impl WorkerJob {
         &self.input_path
     }
 
-    fn crf_search_config(&self, encoder: args::Encoder) -> Result<crf_search::CrfSearchConfig> {
-        Ok(crf_search::CrfSearchConfig {
-            args: args::Encode {
-                encoder,
-                input: self.input_path().to_path_buf(),
-                vfilter: None,
-                pix_format: None,
-                preset: None,
-                keyint: None,
-                scd: None,
-                svt_args: vec![],
-                enc_args: vec![],
-                enc_input_args: vec![],
-            },
-            min_vmaf: Some(crf_search::MinScore::new(self.assignment.target_vmaf)?),
-            min_xpsnr: None,
-            max_encoded_percent: crf_search::MaxEncodedPercent::new(80.0)?,
-            min_crf: None,
-            max_crf: None,
-            thorough: false,
-            crf_increment: None,
-            high_crf_means_hq: None,
-            cache: true,
-            sample: args::Sample {
-                samples: None,
-                sample_every: args::SampleDuration::new(Duration::from_secs(12 * 60))?,
-                min_samples: None,
-                sample_duration: args::SampleDuration::new(Duration::from_secs(20))?,
-                keep: false,
-                temp_dir: Some(self.input_dir.clone()),
-                extension: None,
-            },
-            scoring: sample_encode::ScoringConfig {
-                score: args::ScoreArgs {
-                    reference_vfilter: None,
-                }
-                .into(),
-                vmaf: args::Vmaf::default().into(),
-                xpsnr: false,
-                xpsnr_opts: args::Xpsnr::default().into(),
-            },
-            verbose: clap_verbosity_flag::Verbosity::new(0, 0),
-        })
+    fn crf_search_config(&self) -> Result<crf_search::CrfSearchConfig> {
+        let mut argv = self.assignment.crf_search_args.clone();
+        if argv.is_empty() {
+            bail!(
+                "job {} missing crf_search_args; server must provide CRF search arguments",
+                self.assignment.job_id
+            );
+        }
+
+        if argv.first().is_some_and(|arg| arg == "ab-av1") {
+            argv.remove(0);
+        }
+        if argv.first().is_some_and(|arg| arg == "crf-search") {
+            argv.remove(0);
+        }
+        argv.insert(0, "crf-search".into());
+
+        let mut config = crf_search::CrfSearchConfig::from(crf_search::Args::try_parse_from(argv)?);
+        config.args.input = self.input_path().to_path_buf();
+        config.sample.temp_dir = Some(self.input_dir.clone());
+        Ok(config)
     }
 
     fn result_payload(&self, best: &crf_search::Sample) -> JobResultPayload {
@@ -214,7 +194,16 @@ impl WorkerJob {
         chosen: bool,
     ) -> CrfSearchResultPayload {
         CrfSearchResultPayload {
+            job_id: self.assignment.job_id.clone(),
+            video_id: self.assignment.video_id,
+            source_name: self.assignment.source_name.clone(),
             crf: sample.crf,
+            vmaf_score: sample.enc.vmaf_score,
+            xpsnr_score: sample.enc.xpsnr_score,
+            predicted_encode_size: sample.enc.predicted_encode_size,
+            encode_percent: sample.enc.encode_percent,
+            predicted_encode_time_secs: sample.enc.predicted_encode_time.as_secs_f64(),
+            from_cache: sample.enc.from_cache,
             score: sample.enc.single_score(),
             percent: sample.enc.encode_percent,
             size: sample.enc.predicted_encode_size,
@@ -224,6 +213,18 @@ impl WorkerJob {
             chosen,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WorkerJobReportState {
+    connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat: Option<HeartbeatPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transfer_progress: Option<TransferProgressPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crf_progress: Option<CrfSearchProgressPayload>,
+    crf_results: Vec<CrfSearchResultPayload>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -236,10 +237,10 @@ struct PendingJob {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl PendingJob {
-    fn new(job: WorkerJob, receiver: ChunkReceiver) -> Self {
+    fn waiting(job: WorkerJob) -> Self {
         Self {
             job,
-            receiver: Some(receiver),
+            receiver: None,
             transfer_started_at: Instant::now(),
         }
     }
@@ -268,6 +269,22 @@ impl PendingJob {
         })
     }
 
+    fn ensure_receiver(&mut self, chunk_size_bytes: u64) -> Result<()> {
+        if self.receiver.is_some() {
+            return Ok(());
+        }
+
+        let input_path = self.job.input_path().to_path_buf();
+        let input_dir = self.job.input_dir.clone();
+        let size_bytes = self.job.assignment.size_bytes;
+        self.receiver = Some(
+            ChunkReceiver::new(input_path, &input_dir, Some(size_bytes), chunk_size_bytes)
+                .context("prepare worker input transfer")?,
+        );
+        self.transfer_started_at = Instant::now();
+        Ok(())
+    }
+
     fn apply_raw_chunk(&mut self, chunk: TransferChunk) -> Result<()> {
         if chunk.transfer_id != self.job.assignment.job_id {
             bail!(
@@ -289,6 +306,10 @@ impl PendingJob {
                 self.job.assignment.size_bytes,
                 chunk.total_bytes
             );
+        }
+        if self.receiver.is_none() {
+            self.ensure_receiver(chunk.bytes.len() as u64)
+                .context("prepare worker input transfer from first chunk")?;
         }
         let offset = self
             .receiver
@@ -385,7 +406,7 @@ async fn run_worker_job_until<S>(
 where
     S: std::future::Future<Output = ()>,
 {
-    let config = job.crf_search_config("libsvtav1".parse().expect("default encoder"))?;
+    let config = job.crf_search_config()?;
     let mut run = std::pin::pin!(crf_search::run(config, probe));
     tokio::pin!(shutdown);
 
@@ -407,93 +428,291 @@ where
 }
 
 async fn run_worker_job_with_reporting(
+    config: &WorkerConfig,
     job: WorkerJob,
     probe: Arc<Ffprobe>,
-    worker: &mut ConnectedWorker,
+    worker: &mut Option<ConnectedWorker>,
 ) -> Result<crf_search::Sample> {
-    let config = job.crf_search_config("libsvtav1".parse().expect("default encoder"))?;
-    let mut run = std::pin::pin!(crf_search::run(config, probe));
+    let crf_config = job.crf_search_config()?;
+    let mut run = std::pin::pin!(crf_search::run(crf_config, probe));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut state = WorkerJobReportState {
+        connected: true,
+        ..WorkerJobReportState::default()
+    };
+    let mut reconnect = tokio::time::interval(Duration::from_secs(5));
+    reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                worker
-                    .send_event(ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir)))
-                    .await?;
+        match worker.as_mut() {
+            Some(current_worker) => {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        let heartbeat = heartbeat_payload(&job.input_dir, Some(job.assignment.video_id));
+                        state.heartbeat = Some(heartbeat.clone());
+                        state.connected = true;
+                        if let Some(current_worker) = worker.as_mut() {
+                            debug!(
+                                job_id = %job.assignment.job_id,
+                                active_video_id = job.assignment.video_id,
+                                "sending worker heartbeat"
+                            );
+                            if let Err(error) = current_worker
+                                .send_event(ClientEvent::Heartbeat(heartbeat))
+                                .await
+                            {
+                                debug!(
+                                    job_id = %job.assignment.job_id,
+                                    error = %error,
+                                    "worker heartbeat failed; reconnecting while job continues"
+                                );
+                                state.connected = false;
+                                *worker = None;
+                            }
+                        }
+                    }
+                    frame = current_worker.socket.next() => {
+                        match frame {
+                            Some(Ok(Message::Ping(payload))) => {
+                                current_worker
+                                    .socket
+                                    .send(Message::Pong(payload))
+                                    .await
+                                    .context("send websocket pong")?;
+                            }
+                            Some(Ok(Message::Pong(_))) => {}
+                            Some(Ok(Message::Text(text))) => {
+                                match decode_worker_push(&text)? {
+                                    Some(WorkerPush::Cancel(cancel))
+                                        if cancel.job_id == job.assignment.job_id =>
+                                    {
+                                        eprintln!(
+                                            "worker job {} canceled: {}",
+                                            cancel.job_id, cancel.reason
+                                        );
+                                        return Err(anyhow!(
+                                            "worker job {} canceled: {}",
+                                            cancel.job_id, cancel.reason
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
+                            Some(Ok(Message::Close(frame))) => {
+                                debug!(job_id = %job.assignment.job_id, ?frame, "worker socket closed during job");
+                                state.connected = false;
+                                *worker = None;
+                            }
+                            Some(Err(error)) => {
+                                debug!(job_id = %job.assignment.job_id, error = %error, "worker socket lost during job");
+                                state.connected = false;
+                                *worker = None;
+                            }
+                            None => {
+                                debug!(job_id = %job.assignment.job_id, "worker websocket ended during job");
+                                state.connected = false;
+                                *worker = None;
+                            }
+                        }
+                    }
+                    update = run.next() => {
+                        let (best, disconnected) = handle_crf_update(
+                            &job,
+                            &mut state,
+                            Some(current_worker),
+                            update,
+                        ).await?;
+                        if disconnected {
+                            state.connected = false;
+                            *worker = None;
+                        }
+                        if let Some(best) = best {
+                            return Ok(best);
+                        }
+                    }
+                }
             }
-            frame = worker.socket.next() => {
-                handle_job_websocket_frame(&mut worker.socket, frame, &job.assignment.job_id).await?;
+            None => {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        state.heartbeat = Some(heartbeat_payload(&job.input_dir, Some(job.assignment.video_id)));
+                        state.connected = false;
+                    }
+                    _ = reconnect.tick() => {
+                        match ConnectedWorker::connect(config).await {
+                            Ok(mut reconnected) => {
+                                replay_worker_state(&mut reconnected, &state).await;
+                                state.connected = true;
+                                *worker = Some(reconnected);
+                            }
+                            Err(error) => {
+                                trace!(job_id = %job.assignment.job_id, error = %error, "worker reconnect attempt failed");
+                            }
+                        }
+                    }
+                    update = run.next() => {
+                        let (best, _) = handle_crf_update(
+                            &job,
+                            &mut state,
+                            None,
+                            update,
+                        ).await?;
+                        if let Some(best) = best {
+                            return Ok(best);
+                        }
+                    }
+                }
             }
-            update = run.next() => match update {
-                Some(Ok(crf_search::Update::Done(best))) => {
-                    worker
-                        .send_event(ClientEvent::CrfSearchResult(
-                            job.crf_result_payload(&best, true),
-                        ))
-                        .await?;
-                    return Ok(best);
-                }
-                Some(Ok(crf_search::Update::Status { sample, .. })) => {
-                    worker
-                        .send_event(ClientEvent::CrfSearchProgress(
-                            job.progress_payload(&sample),
-                        ))
-                        .await?;
-                }
-                Some(Ok(crf_search::Update::SampleResult { .. })) => {}
-                Some(Ok(crf_search::Update::RunResult(sample))) => {
-                    worker
-                        .send_event(ClientEvent::CrfSearchResult(
-                            job.crf_result_payload(&sample, false),
-                        ))
-                        .await?;
-                }
-                Some(Err(error)) => return Err(error.into()),
-                None => break,
-            },
         }
     }
-
-    unreachable!("crf-search stream should finish with Done")
 }
 
-async fn handle_job_websocket_frame(
-    socket: &mut WorkerSocket,
-    frame: Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>,
+async fn handle_crf_update(
+    job: &WorkerJob,
+    state: &mut WorkerJobReportState,
+    worker: Option<&mut ConnectedWorker>,
+    update: Option<Result<crf_search::Update, crf_search::Error>>,
+) -> Result<(Option<crf_search::Sample>, bool)> {
+    let Some(update) = update else {
+        return Ok((None, false));
+    };
+
+    match update {
+        Ok(crf_search::Update::Done(best)) => {
+            let payload = job.crf_result_payload(&best, true);
+            state.crf_results.push(payload.clone());
+            let mut disconnected = false;
+            if let Some(worker) = worker {
+                disconnected = !send_worker_event(
+                    worker,
+                    ClientEvent::CrfSearchResult(payload),
+                    &job.assignment.job_id,
+                    "crf_result",
+                )
+                .await;
+            }
+            Ok((Some(best), disconnected))
+        }
+        Ok(crf_search::Update::Status { sample, .. }) => {
+            let payload = job.progress_payload(&sample);
+            state.crf_progress = Some(payload.clone());
+            let mut disconnected = false;
+            if let Some(worker) = worker {
+                disconnected = !send_worker_event(
+                    worker,
+                    ClientEvent::CrfSearchProgress(payload),
+                    &job.assignment.job_id,
+                    "crf_progress",
+                )
+                .await;
+            }
+            Ok((None, disconnected))
+        }
+        Ok(crf_search::Update::SampleResult {
+            crf,
+            sample,
+            result,
+        }) => {
+            debug!(
+                job_id = %job.assignment.job_id,
+                crf,
+                sample,
+                vmaf = ?result.vmaf_score,
+                "recorded sample result"
+            );
+            Ok((None, false))
+        }
+        Ok(crf_search::Update::RunResult(sample)) => {
+            let payload = job.crf_result_payload(&sample, false);
+            state.crf_results.push(payload.clone());
+            let mut disconnected = false;
+            if let Some(worker) = worker {
+                disconnected = !send_worker_event(
+                    worker,
+                    ClientEvent::CrfSearchResult(payload),
+                    &job.assignment.job_id,
+                    "crf_run_result",
+                )
+                .await;
+            }
+            Ok((None, disconnected))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobReportState) {
+    if let Some(heartbeat) = &state.heartbeat {
+        send_worker_event(
+            worker,
+            ClientEvent::Heartbeat(heartbeat.clone()),
+            "state",
+            "heartbeat",
+        )
+        .await;
+    }
+    if let Some(progress) = &state.transfer_progress {
+        send_worker_event(
+            worker,
+            ClientEvent::TransferProgress(progress.clone()),
+            "state",
+            "transfer_progress",
+        )
+        .await;
+    }
+    if let Some(progress) = &state.crf_progress {
+        send_worker_event(
+            worker,
+            ClientEvent::CrfSearchProgress(progress.clone()),
+            "state",
+            "crf_progress",
+        )
+        .await;
+    }
+    for result in &state.crf_results {
+        send_worker_event(
+            worker,
+            ClientEvent::CrfSearchResult(result.clone()),
+            "state",
+            "crf_result",
+        )
+        .await;
+    }
+}
+
+async fn send_worker_event(
+    worker: &mut ConnectedWorker,
+    event: ClientEvent,
     job_id: &str,
-) -> Result<()> {
-    match frame {
-        Some(Ok(Message::Ping(payload))) => {
-            socket
-                .send(Message::Pong(payload))
-                .await
-                .context("send websocket pong during worker job")?;
-        }
-        Some(Ok(Message::Pong(_))) => {}
-        Some(Ok(Message::Text(text))) => {
-            if let Some(WorkerPush::Cancel(cancel)) = decode_worker_push(&text)?
-                && cancel.job_id == job_id
-            {
-                bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
-            }
-        }
-        Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
-        Some(Ok(Message::Close(frame))) => bail!("websocket closed during worker job: {frame:?}"),
-        Some(Err(error)) => return Err(error).context("read websocket message during worker job"),
-        None => bail!("websocket ended during worker job"),
+    event_name: &'static str,
+) -> bool {
+    if let Err(error) = worker.send_event(event).await {
+        debug!(
+            job_id = %job_id,
+            event = event_name,
+            error = %error,
+            "worker event send failed; keeping job and waiting to reconnect"
+        );
+        false
+    } else {
+        true
     }
-
-    Ok(())
 }
 
-fn heartbeat_payload(path: &Path) -> HeartbeatPayload {
-    let mut system = System::new();
+fn heartbeat_payload(path: &Path, active_video_id: Option<u64>) -> HeartbeatPayload {
+    let system = HEARTBEAT_SYSTEM.get_or_init(|| {
+        let mut system = System::new_all();
+        system.refresh_cpu();
+        Mutex::new(system)
+    });
+    let mut system = system.lock().expect("heartbeat system lock");
     system.refresh_cpu();
     system.refresh_memory();
 
     let pid = Pid::from_u32(std::process::id());
+    system.refresh_process(pid);
     let memory_rss_bytes = system.process(pid).map(|process| process.memory());
 
     let disks = Disks::new_with_refreshed_list();
@@ -508,18 +727,14 @@ fn heartbeat_payload(path: &Path) -> HeartbeatPayload {
         memory_total_bytes: Some(system.total_memory()),
         disk_free_bytes: disk.map(|disk| disk.available_space()),
         disk_total_bytes: disk.map(|disk| disk.total_space()),
+        active_video_id,
     }
 }
 
 fn worker_job_input_dir(job_id: &str) -> PathBuf {
     std::env::current_dir()
         .expect("current working directory")
-        .join(format!(
-            "ab-av1-worker-{}-{}-{}",
-            std::process::id(),
-            job_id,
-            fastrand::u64(..)
-        ))
+        .join(format!("ab-av1-worker-{}", job_id))
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -669,12 +884,14 @@ impl ConnectedWorker {
     async fn request_work(&mut self) -> Result<ServerReply> {
         let request_ref = self.next_ref;
         self.next_ref += 1;
+        let frame = ClientFrame::new(request_ref, ClientEvent::PullWork);
+        debug!(
+            request_ref = request_ref,
+            frame = %serde_json::to_string(&frame).context("serialize pull_work frame")?,
+            "sending pull_work"
+        );
 
-        send_json(
-            &mut self.socket,
-            ClientFrame::new(request_ref, ClientEvent::PullWork),
-        )
-        .await?;
+        send_json(&mut self.socket, frame).await?;
         expect_reply(&mut self.socket, &request_ref.to_string(), "pull_work").await
     }
 
@@ -682,6 +899,24 @@ impl ConnectedWorker {
         let request_ref = self.next_ref;
         self.next_ref += 1;
         send_json(&mut self.socket, ClientFrame::new(request_ref, event)).await
+    }
+
+    async fn send_transfer_progress(&mut self, payload: TransferProgressPayload) -> Result<()> {
+        let throughput = format_bytes_per_second(payload.bytes_per_second);
+        debug!(
+            job_id = %payload.job_id,
+            transfer_id = %payload.transfer_id,
+            video_id = payload.video_id,
+            received_bytes = payload.received_bytes,
+            expected_bytes = ?payload.expected_bytes,
+            percent = payload.percent,
+            bytes_per_second = %throughput,
+            chunk_index = payload.chunk_index,
+            total_chunks = payload.total_chunks,
+            "sending transfer progress"
+        );
+        self.send_event(ClientEvent::TransferProgress(payload))
+            .await
     }
 
     async fn wait_for_pending_job(
@@ -714,6 +949,7 @@ impl ConnectedWorker {
                             Some(WorkerPush::Started(started))
                                 if started.transfer_id == pending_job.job().assignment.job_id =>
                             {
+                                pending_job.ensure_receiver(started.chunk_size_bytes)?;
                                 debug!(
                                     job_id = %started.transfer_id,
                                     source_name = %started.source_name,
@@ -721,6 +957,11 @@ impl ConnectedWorker {
                                     size_bytes = started.size_bytes,
                                     total_bytes = started.total_bytes,
                                     total_chunks = started.total_chunks,
+                                    received_bytes = pending_job
+                                        .receiver
+                                        .as_ref()
+                                        .map(ChunkReceiver::received_bytes)
+                                        .unwrap_or_default(),
                                     "transfer started"
                                 );
                                 Ok(PendingJobOutcome::Waiting)
@@ -750,9 +991,9 @@ impl ConnectedWorker {
                                 let chunk_index = chunk.chunk_index;
                                 let total_chunks = chunk.total_chunks;
                                 pending_job.apply_chunk(chunk)?;
-                                self.send_event(ClientEvent::TransferProgress(
+                                self.send_transfer_progress(
                                     pending_job.transfer_progress_payload(chunk_index, total_chunks),
-                                ))
+                                )
                                 .await?;
                                 if pending_job.receiver.as_ref().is_some_and(|receiver| {
                                     receiver.received_bytes()
@@ -798,9 +1039,9 @@ impl ConnectedWorker {
                             let chunk_index = chunk.chunk_index;
                             let total_chunks = chunk.total_chunks;
                             pending_job.apply_raw_chunk(chunk)?;
-                            self.send_event(ClientEvent::TransferProgress(
+                            self.send_transfer_progress(
                                 pending_job.transfer_progress_payload(chunk_index, total_chunks),
-                            ))
+                            )
                             .await?;
                             if pending_job.receiver.as_ref().is_some_and(|receiver| {
                                 receiver.received_bytes() == pending_job.job.assignment.size_bytes
@@ -826,6 +1067,12 @@ impl ConnectedWorker {
                 }
             }
             _ = tokio::time::sleep(idle_delay) => {
+                self
+                    .send_event(ClientEvent::Heartbeat(heartbeat_payload(
+                        &pending_job.job.input_dir,
+                        Some(pending_job.job.assignment.video_id),
+                    )))
+                    .await?;
                 debug!(
                     job_id = %pending_job.job().assignment.job_id,
                     received_bytes = pending_job
@@ -833,7 +1080,7 @@ impl ConnectedWorker {
                         .as_ref()
                         .map(|receiver| receiver.received_bytes())
                         .unwrap_or_default(),
-                    "still waiting on websocket transfer"
+                    "pending job still waiting"
                 );
                 Ok(PendingJobOutcome::Waiting)
             }
@@ -841,7 +1088,16 @@ impl ConnectedWorker {
     }
 }
 
-async fn run_worker_job_and_publish(worker: &mut ConnectedWorker, job: &WorkerJob) -> Result<()> {
+fn format_bytes_per_second(bytes_per_second: f64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    format!("{:.1} MiB/s", bytes_per_second / MIB)
+}
+
+async fn run_worker_job_and_publish(
+    config: &WorkerConfig,
+    worker: &mut Option<ConnectedWorker>,
+    job: &WorkerJob,
+) -> Result<()> {
     debug!(
         job_id = %job.assignment.job_id,
         input = %job.input_path().display(),
@@ -849,7 +1105,7 @@ async fn run_worker_job_and_publish(worker: &mut ConnectedWorker, job: &WorkerJo
     );
     let probe = Arc::new(crate::ffprobe::probe(job.input_path()));
     debug!(job_id = %job.assignment.job_id, "probe complete, running crf search");
-    let best = run_worker_job_with_reporting(job.clone(), probe, worker).await?;
+    let best = run_worker_job_with_reporting(config, job.clone(), probe, worker).await?;
 
     debug!(job_id = %job.assignment.job_id, "publishing worker result");
     println!(
@@ -864,12 +1120,103 @@ fn build_worker_job(
     local_path: Option<&Path>,
 ) -> Result<WorkerJob> {
     let input_dir = worker_job_input_dir(&assignment.job_id);
-    std::fs::create_dir_all(&input_dir).context("create worker job dir")?;
-    temporary::add(&input_dir, temporary::TempKind::Keepable);
+    fs::create_dir_all(&input_dir).context("create worker job dir")?;
     let input_path = local_path
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| input_dir.join(&assignment.source_name));
+        .map(Ok)
+        .unwrap_or_else(|| worker_job_input_path(&input_dir, &assignment))?;
     Ok(WorkerJob::new(assignment, input_dir, input_path))
+}
+
+fn worker_job_input_path(
+    input_dir: &Path,
+    assignment: &crate::command::worker_protocol::JobAssignedPayload,
+) -> Result<PathBuf> {
+    let source_name = worker_source_file_name(assignment)?;
+    let expected = input_dir.join(&source_name);
+    if expected.exists() {
+        return Ok(expected);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(input_dir).context("read worker job dir")? {
+        let entry = entry.context("read worker job dir entry")?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .context("read worker job dir entry metadata")?;
+        debug!(
+            job_id = %assignment.job_id,
+            path = %path.display(),
+            is_file = metadata.is_file(),
+            len = metadata.len(),
+            expected_len = assignment.size_bytes,
+            "found worker input dir entry"
+        );
+        if !metadata.is_file() || metadata.len() != assignment.size_bytes {
+            continue;
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name == ".ab-av1-worker.part")
+        {
+            continue;
+        }
+        candidates.push(path);
+    }
+
+    match candidates.as_slice() {
+        [path] => {
+            debug!(
+                job_id = %assignment.job_id,
+                input = %path.display(),
+                expected = %expected.display(),
+                source_name = %assignment.source_name,
+                "using existing completed worker input"
+            );
+            Ok(path.clone())
+        }
+        [] => {
+            debug!(
+                job_id = %assignment.job_id,
+                expected = %expected.display(),
+                source_name = %assignment.source_name,
+                "no existing completed worker input found"
+            );
+            Ok(expected)
+        }
+        _ => {
+            debug!(
+                job_id = %assignment.job_id,
+                expected = %expected.display(),
+                source_name = %assignment.source_name,
+                candidates = candidates.len(),
+                "multiple existing worker inputs matched expected size"
+            );
+            Ok(expected)
+        }
+    }
+}
+
+fn worker_source_file_name(
+    assignment: &crate::command::worker_protocol::JobAssignedPayload,
+) -> Result<PathBuf> {
+    Path::new(&assignment.source_name)
+        .file_name()
+        .map(PathBuf::from)
+        .or_else(|| {
+            assignment
+                .crf_search_args
+                .windows(2)
+                .find(|args| args[0] == "--input")
+                .and_then(|args| Path::new(&args[1]).file_name().map(PathBuf::from))
+        })
+        .with_context(|| {
+            format!(
+                "job {} has no source filename in source_name or crf_search_args --input",
+                assignment.job_id
+            )
+        })
 }
 
 pub async fn worker(config: WorkerConfig) -> Result<()> {
@@ -917,7 +1264,7 @@ async fn run_connected_worker(
         local_path = ?config.local_path,
         "connecting worker"
     );
-    let mut worker = ConnectedWorker::connect(config).await?;
+    let mut worker = Some(ConnectedWorker::connect(config).await?);
     let mut pending_job: Option<PendingJob> = None;
 
     loop {
@@ -929,11 +1276,25 @@ async fn run_connected_worker(
                     input = %job.input_path().display(),
                     "waiting for pending job input"
                 );
-                worker.wait_for_pending_job(job, runtime.idle_delay).await?
+                worker
+                    .as_mut()
+                    .expect("connected worker")
+                    .wait_for_pending_job(job, runtime.idle_delay)
+                    .await?
             };
 
             match next {
-                PendingJobOutcome::Waiting => continue,
+                PendingJobOutcome::Waiting => {
+                    debug!(
+                        job_id = %pending_job.as_ref().expect("pending job").job.assignment.job_id,
+                        received_bytes = pending_job
+                            .as_ref()
+                            .and_then(|job| job.receiver.as_ref().map(ChunkReceiver::received_bytes))
+                            .unwrap_or_default(),
+                        "pending job still waiting"
+                    );
+                    continue;
+                }
                 PendingJobOutcome::Canceled => {
                     if let Some(job) = pending_job.as_ref() {
                         debug!(job_id = %job.job.assignment.job_id, "pending job canceled");
@@ -943,50 +1304,100 @@ async fn run_connected_worker(
                 }
                 PendingJobOutcome::Ready => {
                     let job = pending_job.take().expect("pending job");
-                    debug!(job_id = %job.job.assignment.job_id, "pending job input arrived");
-                    run_worker_job_and_publish(&mut worker, &job.job).await?;
+                    debug!(
+                        job_id = %job.job.assignment.job_id,
+                        input = %job.input_path().display(),
+                        "pending job input arrived"
+                    );
+                    run_worker_job_and_publish(config, &mut worker, &job.job).await?;
                     continue;
                 }
             }
         }
 
         debug!("requesting work");
-        let work_status = worker.request_work().await?;
+        let worker_ref = worker.as_mut().expect("connected worker");
+        let work_status = worker_ref.request_work().await?;
         *completed_pulls += 1;
         let status = work_status_label(&work_status);
         println!(
             "connected worker {} via {} and received {}",
-            worker.assigned_worker_id, worker.negotiated_protocol_version, status
+            worker_ref.assigned_worker_id, worker_ref.negotiated_protocol_version, status
         );
 
         if let ServerReply::JobAssigned(assignment) = work_status {
             let job = build_worker_job(assignment, config.local_path.as_deref())?;
             debug!(
                 job_id = %job.assignment.job_id,
+                status = %job.assignment.status.as_str(),
                 input = %job.input_path().display(),
+                already_present = job.input_path().exists(),
+                pending_transfer = job.assignment.status == WorkStatus::JobAssigned
+                    && !job.input_path().exists()
+                    && config.local_path.is_none(),
                 "job assigned"
             );
+            if let Some(current_worker) = worker.as_mut() {
+                current_worker
+                    .send_event(ClientEvent::Heartbeat(heartbeat_payload(
+                        &job.input_dir,
+                        Some(job.assignment.video_id),
+                    )))
+                    .await?;
+            }
             if job.input_path().exists() {
-                debug!(job_id = %job.assignment.job_id, "input already present, starting job");
-                run_worker_job_and_publish(&mut worker, &job).await?;
+                debug!(
+                    job_id = %job.assignment.job_id,
+                    input = %job.input_path().display(),
+                    "input already present, starting job"
+                );
+                run_worker_job_and_publish(config, &mut worker, &job).await?;
             } else if config.local_path.is_some() {
                 bail!(
                     "local input path does not exist: {}",
                     job.input_path().display()
                 );
-            } else {
-                let receiver = ChunkReceiver::new(
-                    job.input_path(),
-                    &job.input_dir,
-                    Some(job.assignment.size_bytes),
-                )
-                .context("prepare worker input transfer")?;
+            } else if job.assignment.status == WorkStatus::JobInProgress {
+                let reason = format!(
+                    "worker input is missing at {}; worker cannot resume job_in_progress without local file",
+                    job.input_path().display()
+                );
                 debug!(
                     job_id = %job.assignment.job_id,
                     input = %job.input_path().display(),
+                    reason = %reason,
+                    "reporting retriable transfer failure"
+                );
+                if let Some(current_worker) = worker.as_mut() {
+                    current_worker
+                        .send_event(ClientEvent::TransferFailure(TransferFailurePayload {
+                            job_id: job.assignment.job_id.clone(),
+                            stage: TransferStage::ReceiveChunk,
+                            retriable: true,
+                            reason,
+                        }))
+                        .await?;
+                }
+                pending_job = Some(PendingJob::waiting(job));
+                debug!(
+                    job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                    pending_job = true,
+                    "stored pending job after requesting transfer resend"
+                );
+            } else {
+                debug!(
+                    job_id = %job.assignment.job_id,
+                    input = %job.input_path().display(),
+                    temp_dir = %job.input_dir.display(),
+                    receiver_ready = false,
                     "waiting for worker input over websocket"
                 );
-                pending_job = Some(PendingJob::new(job, receiver));
+                pending_job = Some(PendingJob::waiting(job));
+                debug!(
+                    job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                    pending_job = true,
+                    "stored pending job"
+                );
             }
             continue;
         }
@@ -1031,6 +1442,9 @@ fn decode_worker_push(text: &str) -> Result<Option<WorkerPush>> {
         Err(_) => return Ok(None),
     };
     if frame.2 != CRF_SEARCH_TOPIC {
+        return Ok(None);
+    }
+    if frame.3 == "phx_reply" {
         return Ok(None);
     }
 
@@ -1271,11 +1685,26 @@ where
                 {
                     continue;
                 }
+                debug!(
+                    expected_event,
+                    raw = %text,
+                    "received phoenix reply"
+                );
 
-                let ReplyBody { status, response } = serde_json::from_value::<ReplyBody<_>>(body)
-                    .context("decode phoenix reply body")?;
+                let ReplyBody { status, response }: ReplyBody<Value> =
+                    serde_json::from_value::<ReplyBody<Value>>(body)
+                        .context("decode phoenix reply body")?;
+                debug!(
+                    expected_event,
+                    status = %status,
+                    response = %response,
+                    "decoded phoenix reply"
+                );
                 return match status.as_str() {
-                    "ok" => serde_json::from_value(response).context("decode phoenix ok reply"),
+                    "ok" => serde_json::from_value(response.clone()).map_err(|error| {
+                        let raw_response = response.to_string();
+                        anyhow!("decode phoenix ok reply: {error}; raw_response={raw_response}")
+                    }),
                     "error" => {
                         let error: ErrorReplyPayload = serde_json::from_value(response)
                             .context("decode phoenix error reply")?;
@@ -1614,6 +2043,13 @@ mod tests {
             size_bytes: 1024,
             chunk_size_bytes: 256,
             target_vmaf: 96.5,
+            crf_search_args: vec![
+                "crf-search".into(),
+                "--input".into(),
+                "/server/movie.mkv".into(),
+                "--min-vmaf".into(),
+                "96.5".into(),
+            ],
         }));
 
         assert_eq!(status, "job_assigned (job_id=job-123)");
@@ -1633,14 +2069,19 @@ mod tests {
                 size_bytes: 1024,
                 chunk_size_bytes: 256,
                 target_vmaf: 96.5,
+                crf_search_args: vec![
+                    "crf-search".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--min-vmaf".into(),
+                    "96.5".into(),
+                ],
             },
             job_dir.clone(),
             input_path,
         );
 
-        let config = job
-            .crf_search_config("libsvtav1".parse().expect("encoder"))
-            .expect("job config");
+        let config = job.crf_search_config().expect("job config");
 
         assert_eq!(config.args.input, job_dir.join("movie.mkv"));
         assert_eq!(config.sample.temp_dir.as_deref(), Some(job_dir.as_path()));
@@ -1658,6 +2099,13 @@ mod tests {
             size_bytes: 1024,
             chunk_size_bytes: 256,
             target_vmaf: 96.5,
+            crf_search_args: vec![
+                "crf-search".into(),
+                "--input".into(),
+                "/server/movie.mkv".into(),
+                "--min-vmaf".into(),
+                "96.5".into(),
+            ],
         };
         let local_path = std::env::temp_dir()
             .join(format!("ab-av1-worker-local-{}", std::process::id()))
@@ -1666,6 +2114,37 @@ mod tests {
         let job = build_worker_job(assignment, Some(local_path.as_path())).expect("worker job");
 
         assert_eq!(job.input_path(), local_path.as_path());
+    }
+
+    #[test]
+    fn build_worker_job_uses_source_basename_for_worker_file_lookup() -> Result<()> {
+        let job_dir = worker_job_input_dir("job-path-source");
+        fs::create_dir_all(&job_dir)?;
+        let input_path = job_dir.join("movie.mkv");
+        fs::write(&input_path, [0_u8; 4])?;
+
+        let job = build_worker_job(
+            JobAssignedPayload {
+                status: WorkStatus::JobInProgress,
+                job_id: "job-path-source".into(),
+                video_id: 123,
+                source_name: "/server/library/movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 0,
+                target_vmaf: 96.5,
+                crf_search_args: vec![
+                    "crf-search".into(),
+                    "--input".into(),
+                    "/server/library/movie.mkv".into(),
+                    "--min-vmaf".into(),
+                    "96.5".into(),
+                ],
+            },
+            None,
+        )?;
+
+        assert_eq!(job.input_path(), input_path.as_path());
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1691,6 +2170,13 @@ mod tests {
                 size_bytes: 1024,
                 chunk_size_bytes: 256,
                 target_vmaf: 96.5,
+                crf_search_args: vec![
+                    "crf-search".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--min-vmaf".into(),
+                    "96.5".into(),
+                ],
             },
             job_dir,
             input_path,
@@ -1727,6 +2213,18 @@ mod tests {
                 from_cache: false,
             }
         );
+        let result = job.crf_result_payload(&best, true);
+        assert_eq!(result.job_id, "job-123");
+        assert_eq!(result.video_id, 123);
+        assert_eq!(result.source_name, "movie.mkv");
+        assert_eq!(result.crf, best.crf);
+        assert_eq!(result.vmaf_score, Some(97.0));
+        assert_eq!(result.xpsnr_score, None);
+        assert_eq!(result.predicted_encode_size, 100);
+        assert_eq!(result.encode_percent, 50.0);
+        assert_eq!(result.predicted_encode_time_secs, 1.0);
+        assert!(!result.from_cache);
+        assert!(result.chosen);
         Ok(())
     }
 
@@ -1976,6 +2474,13 @@ mod tests {
                         size_bytes: 1024,
                         chunk_size_bytes: 256,
                         target_vmaf: 96.5,
+                        crf_search_args: vec![
+                            "crf-search".into(),
+                            "--input".into(),
+                            "/server/movie.mkv".into(),
+                            "--min-vmaf".into(),
+                            "96.5".into(),
+                        ],
                     })),
                 ))
                 .expect("job assigned reply json"),

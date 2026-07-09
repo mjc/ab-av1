@@ -1,9 +1,8 @@
-use crate::temporary;
 use anyhow::{Context, Result};
 use blake3::Hash;
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use tracing::{debug, trace};
@@ -65,37 +64,68 @@ impl ChunkReceiver {
         final_path: impl Into<PathBuf>,
         temp_dir: impl AsRef<Path>,
         max_size: Option<u64>,
+        chunk_size_bytes: u64,
     ) -> Result<Self> {
         let final_path = final_path.into();
         let temp_dir = temp_dir.as_ref();
         fs::create_dir_all(temp_dir).context("create chunk temp dir")?;
-        let temp_path = temp_dir.join(format!(
-            ".ab-av1-worker-{}-{}.part",
-            std::process::id(),
-            fastrand::u64(..)
-        ));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .context("create chunk temp file")?;
-        temporary::add(&temp_path, temporary::TempKind::NotKeepable);
-        debug!(
-            final_path = %final_path.display(),
-            temp_path = %temp_path.display(),
-            max_size = ?max_size,
-            "created chunk receiver"
-        );
+        let temp_path = temp_dir.join(".ab-av1-worker.part");
+        let (file, next_index, next_offset, hasher) = if temp_path.exists() {
+            let file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&temp_path)
+                .context("open chunk temp file for resume")?;
+            let metadata = file.metadata().context("inspect chunk temp file")?;
+            let next_offset = metadata.len();
+            let next_index = if chunk_size_bytes == 0 {
+                0
+            } else {
+                next_offset / chunk_size_bytes
+            };
+            let mut hasher = blake3::Hasher::new();
+            let mut reader = File::open(&temp_path).context("read chunk temp file for resume")?;
+            let mut buf = [0u8; 8192];
+            loop {
+                let read = reader.read(&mut buf).context("hash chunk temp file")?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buf[..read]);
+            }
+            debug!(
+                final_path = %final_path.display(),
+                temp_path = %temp_path.display(),
+                received_bytes = next_offset,
+                chunk_size_bytes,
+                max_size = ?max_size,
+                "resumed chunk receiver"
+            );
+            (Some(file), next_index, next_offset, hasher)
+        } else {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .context("create chunk temp file")?;
+            debug!(
+                final_path = %final_path.display(),
+                temp_path = %temp_path.display(),
+                max_size = ?max_size,
+                "created chunk receiver"
+            );
+            (Some(file), 0, 0, blake3::Hasher::new())
+        };
 
         Ok(Self {
             final_path,
             temp_path,
-            file: Some(file),
+            file,
             max_size,
-            next_index: 0,
-            next_offset: 0,
+            next_index,
+            next_offset,
             finished: false,
-            hasher: blake3::Hasher::new(),
+            hasher,
         })
     }
 
@@ -183,7 +213,6 @@ impl ChunkReceiver {
         );
         fs::rename(&self.temp_path, &self.final_path)?;
         let final_path = self.final_path.clone();
-        temporary::unadd(&self.temp_path);
         self.finished = true;
         debug!(final_path = %final_path.display(), "chunk receiver finished");
         Ok(final_path)
@@ -195,7 +224,6 @@ impl Drop for ChunkReceiver {
         if !self.finished {
             let _ = self.file.take();
             let _ = fs::remove_file(&self.temp_path);
-            let _ = temporary::unadd(&self.temp_path);
         }
     }
 }
@@ -229,11 +257,32 @@ mod tests {
     #[test]
     fn valid_transfer_writes_final_file() {
         let (temp_dir, final_path) = temp_paths("valid");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 6).expect("receiver");
 
         receiver.push(chunk(0, 0, b"hello ")).expect("chunk 0");
         receiver.push(chunk(1, 6, b"world")).expect("chunk 1");
 
+        let written = receiver
+            .finish(Some(11), Some(blake3::hash(b"hello world")))
+            .expect("finish");
+
+        assert_eq!(written, final_path);
+        assert_eq!(fs::read(&final_path).expect("read final"), b"hello world");
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[serial]
+    #[test]
+    fn resumes_existing_partial_transfer() {
+        let (temp_dir, final_path) = temp_paths("resume");
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        let temp_path = temp_dir.join(".ab-av1-worker.part");
+        fs::write(&temp_path, b"hello ").expect("seed temp file");
+
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 6).expect("receiver");
+        assert_eq!(receiver.received_bytes(), 6);
+
+        receiver.push(chunk(1, 6, b"world")).expect("chunk 1");
         let written = receiver
             .finish(Some(11), Some(blake3::hash(b"hello world")))
             .expect("finish");
@@ -252,7 +301,7 @@ mod tests {
             fastrand::u64(..)
         ));
         let final_path = temp_dir.join("nested").join("movie.mkv");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 5).expect("receiver");
 
         receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
         receiver
@@ -275,7 +324,7 @@ mod tests {
         fs::create_dir_all(final_path.parent().expect("parent")).expect("create parent");
         fs::write(&final_path, b"existing").expect("seed final");
 
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 5).expect("receiver");
         receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
 
         assert!(matches!(
@@ -290,7 +339,7 @@ mod tests {
     #[test]
     fn corrupt_chunk_is_rejected() {
         let (temp_dir, final_path) = temp_paths("corrupt");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 5).expect("receiver");
 
         let mut bad = chunk(0, 0, b"hello");
         bad.checksum = crc32fast::hash(b"hell0") as u64;
@@ -306,7 +355,7 @@ mod tests {
     #[test]
     fn missing_chunk_is_rejected_by_offset() {
         let (temp_dir, final_path) = temp_paths("missing");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 5).expect("receiver");
 
         receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
         assert!(matches!(
@@ -324,7 +373,7 @@ mod tests {
     #[test]
     fn duplicate_chunk_is_rejected() {
         let (temp_dir, final_path) = temp_paths("duplicate");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 5).expect("receiver");
 
         receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
         assert!(matches!(
@@ -338,7 +387,7 @@ mod tests {
     #[test]
     fn out_of_order_chunk_is_rejected() {
         let (temp_dir, final_path) = temp_paths("out-of-order");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 5).expect("receiver");
 
         assert!(matches!(
             receiver.push(chunk(1, 0, b"hello")),
@@ -354,7 +403,7 @@ mod tests {
     #[test]
     fn final_digest_mismatch_is_rejected() {
         let (temp_dir, final_path) = temp_paths("digest");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None).expect("receiver");
+        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, None, 5).expect("receiver");
 
         receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
         assert!(matches!(
@@ -368,7 +417,8 @@ mod tests {
     #[test]
     fn max_size_limit_is_enforced() {
         let (temp_dir, final_path) = temp_paths("max-size");
-        let mut receiver = ChunkReceiver::new(&final_path, &temp_dir, Some(10)).expect("receiver");
+        let mut receiver =
+            ChunkReceiver::new(&final_path, &temp_dir, Some(10), 5).expect("receiver");
 
         receiver.push(chunk(0, 0, b"hello")).expect("chunk 0");
         assert_eq!(receiver.received_bytes(), 5);
