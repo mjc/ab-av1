@@ -1,7 +1,7 @@
 use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ChunkTransferPayload,
     ClientEvent, ClientFrame, CrfSearchProgressPayload, CrfSearchResultPayload, ErrorReplyPayload,
-    HeartbeatPayload, JobResultPayload, ReplyBody, ServerPushFrame, ServerReply,
+    HeartbeatPayload, JobResultPayload, PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply,
     TransferFailurePayload, TransferProgressPayload, TransferStage, TransferStartedPayload,
     WorkStatus,
 };
@@ -795,6 +795,43 @@ impl ReconnectBackoff {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerJobPhase {
+    ReceivingInput,
+    InputMissing,
+    InputReady,
+    CrfSearching,
+}
+
+fn worker_job_phase(job: &WorkerJob, local_path: Option<&Path>) -> Result<WorkerJobPhase> {
+    if job.input_path().exists() {
+        return match job.assignment.status {
+            WorkStatus::JobAssigned => Ok(WorkerJobPhase::InputReady),
+            WorkStatus::JobInProgress => Ok(WorkerJobPhase::CrfSearching),
+            WorkStatus::NoWork => bail!(
+                "assigned job {} has invalid no_work status",
+                job.assignment.job_id
+            ),
+        };
+    }
+
+    if local_path.is_some() {
+        bail!(
+            "local input path does not exist: {}",
+            job.input_path().display()
+        );
+    }
+
+    match job.assignment.status {
+        WorkStatus::JobAssigned => Ok(WorkerJobPhase::ReceivingInput),
+        WorkStatus::JobInProgress => Ok(WorkerJobPhase::InputMissing),
+        WorkStatus::NoWork => bail!(
+            "assigned job {} has invalid no_work status",
+            job.assignment.job_id
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingJobOutcome {
     Waiting,
     Ready,
@@ -882,9 +919,13 @@ impl ConnectedWorker {
     }
 
     async fn request_work(&mut self) -> Result<ServerReply> {
+        self.request_work_with(PullWorkPayload::default()).await
+    }
+
+    async fn request_work_with(&mut self, payload: PullWorkPayload) -> Result<ServerReply> {
         let request_ref = self.next_ref;
         self.next_ref += 1;
-        let frame = ClientFrame::new(request_ref, ClientEvent::PullWork);
+        let frame = ClientFrame::new(request_ref, ClientEvent::PullWork(payload));
         debug!(
             request_ref = request_ref,
             frame = %serde_json::to_string(&frame).context("serialize pull_work frame")?,
@@ -944,7 +985,7 @@ impl ConnectedWorker {
                                     "worker job {} canceled: {}",
                                     cancel.job_id, cancel.reason
                                 );
-                                return Ok(PendingJobOutcome::Canceled);
+                                Ok(PendingJobOutcome::Canceled)
                             }
                             Some(WorkerPush::Started(started))
                                 if started.transfer_id == pending_job.job().assignment.job_id =>
@@ -1252,6 +1293,63 @@ async fn run_worker_until(config: &WorkerConfig, runtime: WorkerRuntime) -> Resu
     }
 }
 
+async fn request_input_resend(
+    worker: &mut ConnectedWorker,
+    job: &WorkerJob,
+    local_path: Option<&Path>,
+) -> Result<WorkerJob> {
+    let reason = format!(
+        "worker input is missing at {}; worker cannot resume job_in_progress without local file",
+        job.input_path().display()
+    );
+    debug!(
+        job_id = %job.assignment.job_id,
+        input = %job.input_path().display(),
+        reason = %reason,
+        "reporting retriable transfer failure"
+    );
+    worker
+        .send_event(ClientEvent::TransferFailure(TransferFailurePayload {
+            job_id: job.assignment.job_id.clone(),
+            stage: TransferStage::ReceiveChunk,
+            retriable: true,
+            reason,
+        }))
+        .await?;
+
+    debug!(
+        job_id = %job.assignment.job_id,
+        "requesting input resend for active job"
+    );
+    let resend = worker
+        .request_work_with(PullWorkPayload::input_missing())
+        .await?;
+
+    let ServerReply::JobAssigned(assignment) = resend else {
+        bail!(
+            "server returned no_work after input_missing for job {}",
+            job.assignment.job_id
+        );
+    };
+
+    if assignment.job_id != job.assignment.job_id {
+        bail!(
+            "server reassigned job {} after input_missing for job {}",
+            assignment.job_id,
+            job.assignment.job_id
+        );
+    }
+    if assignment.status != WorkStatus::JobAssigned {
+        bail!(
+            "server kept job {} in {} after input_missing; refusing to wait without transfer",
+            assignment.job_id,
+            assignment.status.as_str()
+        );
+    }
+
+    build_worker_job(assignment, local_path)
+}
+
 async fn run_connected_worker(
     config: &WorkerConfig,
     runtime: WorkerRuntime,
@@ -1345,59 +1443,55 @@ async fn run_connected_worker(
                     )))
                     .await?;
             }
-            if job.input_path().exists() {
-                debug!(
-                    job_id = %job.assignment.job_id,
-                    input = %job.input_path().display(),
-                    "input already present, starting job"
-                );
-                run_worker_job_and_publish(config, &mut worker, &job).await?;
-            } else if config.local_path.is_some() {
-                bail!(
-                    "local input path does not exist: {}",
-                    job.input_path().display()
-                );
-            } else if job.assignment.status == WorkStatus::JobInProgress {
-                let reason = format!(
-                    "worker input is missing at {}; worker cannot resume job_in_progress without local file",
-                    job.input_path().display()
-                );
-                debug!(
-                    job_id = %job.assignment.job_id,
-                    input = %job.input_path().display(),
-                    reason = %reason,
-                    "reporting retriable transfer failure"
-                );
-                if let Some(current_worker) = worker.as_mut() {
-                    current_worker
-                        .send_event(ClientEvent::TransferFailure(TransferFailurePayload {
-                            job_id: job.assignment.job_id.clone(),
-                            stage: TransferStage::ReceiveChunk,
-                            retriable: true,
-                            reason,
-                        }))
-                        .await?;
+            let phase = worker_job_phase(&job, config.local_path.as_deref())?;
+            match phase {
+                WorkerJobPhase::InputReady | WorkerJobPhase::CrfSearching => {
+                    debug!(
+                        job_id = %job.assignment.job_id,
+                        input = %job.input_path().display(),
+                        phase = ?phase,
+                        "input already present, starting job"
+                    );
+                    run_worker_job_and_publish(config, &mut worker, &job).await?;
                 }
-                pending_job = Some(PendingJob::waiting(job));
-                debug!(
-                    job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                    pending_job = true,
-                    "stored pending job after requesting transfer resend"
-                );
-            } else {
-                debug!(
-                    job_id = %job.assignment.job_id,
-                    input = %job.input_path().display(),
-                    temp_dir = %job.input_dir.display(),
-                    receiver_ready = false,
-                    "waiting for worker input over websocket"
-                );
-                pending_job = Some(PendingJob::waiting(job));
-                debug!(
-                    job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                    pending_job = true,
-                    "stored pending job"
-                );
+                WorkerJobPhase::InputMissing => {
+                    let resend_job = request_input_resend(
+                        worker.as_mut().expect("connected worker"),
+                        &job,
+                        config.local_path.as_deref(),
+                    )
+                    .await?;
+                    debug!(
+                        job_id = %resend_job.assignment.job_id,
+                        input = %resend_job.input_path().display(),
+                        temp_dir = %resend_job.input_dir.display(),
+                        phase = ?WorkerJobPhase::ReceivingInput,
+                        receiver_ready = false,
+                        "waiting for worker input over websocket"
+                    );
+                    pending_job = Some(PendingJob::waiting(resend_job));
+                    debug!(
+                        job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                        pending_job = true,
+                        "stored pending job after input resend request"
+                    );
+                }
+                WorkerJobPhase::ReceivingInput => {
+                    debug!(
+                        job_id = %job.assignment.job_id,
+                        input = %job.input_path().display(),
+                        temp_dir = %job.input_dir.display(),
+                        phase = ?phase,
+                        receiver_ready = false,
+                        "waiting for worker input over websocket"
+                    );
+                    pending_job = Some(PendingJob::waiting(job));
+                    debug!(
+                        job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                        pending_job = true,
+                        "stored pending job"
+                    );
+                }
             }
             continue;
         }
@@ -1529,12 +1623,12 @@ fn decode_binary_transfer_chunk(bytes: &[u8]) -> Result<TransferChunk> {
 
     Ok(TransferChunk {
         transfer_id,
-        video_id: read_u64(&bytes, 8),
-        chunk_index: read_u64(&bytes, 16),
-        total_chunks: read_u64(&bytes, 24),
-        bytes_sent: read_u64(&bytes, 32),
-        total_bytes: read_u64(&bytes, 40),
-        crc32: read_u32(&bytes, 48) as u64,
+        video_id: read_u64(bytes, 8),
+        chunk_index: read_u64(bytes, 16),
+        total_chunks: read_u64(bytes, 24),
+        bytes_sent: read_u64(bytes, 32),
+        total_bytes: read_u64(bytes, 40),
+        crc32: read_u32(bytes, 48) as u64,
         bytes: bytes[data_start..].to_vec(),
     })
 }
@@ -1951,6 +2045,64 @@ mod tests {
 
         let (worker, _replacement) = tokio::join!(worker, replacement);
         worker?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_requests_input_resend_when_resumed_job_lacks_local_file() -> Result<()> {
+        let job_id = "missing-input-resend";
+        let _ = fs::remove_dir_all(worker_job_input_dir(job_id));
+        let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let socket = accept_async(stream).await.expect("accept websocket");
+            let (mut writer, mut reader) = socket.split();
+
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce(&mut reader, 1).await;
+            send_announce_reply(&mut writer).await;
+
+            expect_pull_work(&mut reader, 3).await;
+            send_job_reply_with_job_id(&mut writer, 3, WorkStatus::JobInProgress, job_id).await;
+
+            let heartbeat = expect_client_event(&mut reader, 4, "heartbeat").await;
+            assert_eq!(heartbeat["active_video_id"], json!(123));
+
+            let failure = expect_client_event(&mut reader, 5, "transfer_failed").await;
+            assert_eq!(failure["job_id"], json!(job_id));
+            assert_eq!(failure["stage"], json!("receive_chunk"));
+            assert_eq!(failure["retriable"], json!(true));
+
+            expect_pull_work_payload(&mut reader, 6, PullWorkPayload::input_missing()).await;
+            send_job_reply_with_job_id(&mut writer, 6, WorkStatus::JobAssigned, job_id).await;
+        });
+
+        let config = FakeCoordinator {
+            address,
+            server: tokio::spawn(async {}),
+        }
+        .worker_config(WorkerTestConfig::continuous());
+        let mut completed_pulls = 0;
+        let error = run_connected_worker(
+            &config,
+            WorkerRuntime {
+                idle_delay: Duration::from_millis(50),
+                reconnect_base_delay: Duration::from_millis(1),
+                reconnect_max_delay: Duration::from_millis(1),
+                max_pulls: None,
+            },
+            &mut completed_pulls,
+        )
+        .await
+        .expect_err("server closes after resend assignment");
+
+        assert!(
+            error.to_string().contains("websocket"),
+            "unexpected error: {error}"
+        );
+        server.await.expect("server task");
         Ok(())
     }
 
@@ -2395,15 +2547,48 @@ mod tests {
         R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
             + Unpin,
     {
+        expect_pull_work_payload(reader, request_ref, PullWorkPayload::default()).await;
+    }
+
+    async fn expect_pull_work_payload<R>(reader: &mut R, request_ref: u64, payload: PullWorkPayload)
+    where
+        R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
         assert_text_message(
             reader
                 .next()
                 .await
                 .expect("pull_work frame")
                 .expect("pull_work message"),
-            serde_json::to_value(ClientFrame::new(request_ref, ClientEvent::PullWork))
-                .expect("pull_work frame json"),
+            serde_json::to_value(ClientFrame::new(
+                request_ref,
+                ClientEvent::PullWork(payload),
+            ))
+            .expect("pull_work frame json"),
         );
+    }
+
+    async fn expect_client_event<R>(reader: &mut R, request_ref: u64, event: &str) -> Value
+    where
+        R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let Message::Text(text) = reader
+            .next()
+            .await
+            .expect("client event frame")
+            .expect("client event message")
+        else {
+            panic!("expected text client event");
+        };
+        let actual: Value = serde_json::from_str(&text).expect("decode client event");
+        let frame = actual.as_array().expect("client event frame array");
+        assert_eq!(frame[0], json!("1"));
+        assert_eq!(frame[1], json!(request_ref.to_string()));
+        assert_eq!(frame[2], json!(CRF_SEARCH_TOPIC));
+        assert_eq!(frame[3], json!(event));
+        frame[4].clone()
     }
 
     async fn send_join_reply<W>(writer: &mut W)
@@ -2462,17 +2647,40 @@ mod tests {
     where
         W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
+        send_job_reply(writer, 3, WorkStatus::JobAssigned).await;
+    }
+
+    async fn send_job_reply<W>(writer: &mut W, request_ref: u64, status: WorkStatus)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        send_job_reply_with_job_id(writer, request_ref, status, "job-123").await;
+    }
+
+    async fn send_job_reply_with_job_id<W>(
+        writer: &mut W,
+        request_ref: u64,
+        status: WorkStatus,
+        job_id: &str,
+    ) where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        let chunk_size_bytes = if status == WorkStatus::JobAssigned {
+            256
+        } else {
+            0
+        };
         writer
             .send(Message::Text(
                 serde_json::to_string(&ServerFrame::reply(
-                    3,
+                    request_ref,
                     ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
-                        status: WorkStatus::JobAssigned,
-                        job_id: "job-123".into(),
+                        status,
+                        job_id: job_id.into(),
                         video_id: 123,
                         source_name: "movie.mkv".into(),
                         size_bytes: 1024,
-                        chunk_size_bytes: 256,
+                        chunk_size_bytes,
                         target_vmaf: 96.5,
                         crf_search_args: vec![
                             "crf-search".into(),
@@ -2483,10 +2691,10 @@ mod tests {
                         ],
                     })),
                 ))
-                .expect("job assigned reply json"),
+                .expect("job reply json"),
             ))
             .await
-            .expect("send job assigned reply");
+            .expect("send job reply");
     }
 
     async fn send_announce_error_reply<W>(writer: &mut W, request_ref: u64, response: Value)

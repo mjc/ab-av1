@@ -78,11 +78,9 @@ impl ChunkReceiver {
                 .context("open chunk temp file for resume")?;
             let metadata = file.metadata().context("inspect chunk temp file")?;
             let next_offset = metadata.len();
-            let next_index = if chunk_size_bytes == 0 {
-                0
-            } else {
-                next_offset / chunk_size_bytes
-            };
+            let next_index = next_offset
+                .checked_div(chunk_size_bytes)
+                .unwrap_or_default();
             let mut hasher = blake3::Hasher::new();
             let mut reader = File::open(&temp_path).context("read chunk temp file for resume")?;
             let mut buf = [0u8; 8192];

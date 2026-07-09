@@ -22,7 +22,7 @@ impl ClientFrame {
 pub(crate) enum ClientEvent {
     Join,
     Announce(AnnouncePayload),
-    PullWork,
+    PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     TransferProgress(TransferProgressPayload),
     TransferFailure(TransferFailurePayload),
@@ -35,7 +35,7 @@ impl ClientEvent {
         match self {
             Self::Join => ("phx_join", ClientPayload::Empty(EmptyPayload {})),
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
-            Self::PullWork => ("pull_work", ClientPayload::Empty(EmptyPayload {})),
+            Self::PullWork(payload) => ("pull_work", ClientPayload::PullWork(payload)),
             Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
             Self::TransferProgress(payload) => (
                 "transfer_progress",
@@ -57,6 +57,7 @@ impl ClientEvent {
 enum ClientPayload {
     Empty(EmptyPayload),
     Announce(AnnouncePayload),
+    PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
     TransferProgress(TransferProgressPayload),
     TransferFailure(TransferFailurePayload),
@@ -66,6 +67,24 @@ enum ClientPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct EmptyPayload {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PullWorkPayload {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) input_missing: bool,
+}
+
+impl PullWorkPayload {
+    pub(crate) fn input_missing() -> Self {
+        Self {
+            input_missing: true,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AnnouncePayload {
@@ -880,6 +899,18 @@ mod tests {
                 "transfer_id": "job-123",
                 "video_id": 123,
             })
+        );
+    }
+
+    #[test]
+    fn pull_work_payload_omits_default_and_reports_missing_input() {
+        assert_eq!(
+            serde_json::to_value(PullWorkPayload::default()).expect("serialize pull_work"),
+            json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(PullWorkPayload::input_missing()).expect("serialize pull_work"),
+            json!({"input_missing": true})
         );
     }
 
