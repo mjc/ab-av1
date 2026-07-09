@@ -123,7 +123,7 @@ pub(crate) struct CrfSearchProgressPayload {
     pub(crate) video_id: u64,
     pub(crate) percent: f32,
     pub(crate) filename: String,
-    pub(crate) eta: Option<f64>,
+    pub(crate) eta: Option<u64>,
     pub(crate) fps: f32,
 }
 
@@ -386,8 +386,8 @@ pub(crate) struct TransferProgressPayload {
     pub(crate) received_bytes: u64,
     pub(crate) expected_bytes: Option<u64>,
     pub(crate) percent: f64,
-    pub(crate) bytes_per_second: f64,
-    pub(crate) eta: Option<f64>,
+    pub(crate) bytes_per_second: u64,
+    pub(crate) eta: Option<u64>,
     pub(crate) chunk_index: u64,
     pub(crate) total_chunks: u64,
 }
@@ -515,8 +515,8 @@ mod tests {
                 received_bytes: 512,
                 expected_bytes: Some(1024),
                 percent: 50.0,
-                bytes_per_second: 256.0,
-                eta: Some(2.0),
+                bytes_per_second: 256,
+                eta: Some(2),
                 chunk_index: 3,
                 total_chunks: 8,
             }),
@@ -537,8 +537,8 @@ mod tests {
                     "received_bytes": 512,
                     "expected_bytes": 1024,
                     "percent": 50.0,
-                    "bytes_per_second": 256.0,
-                    "eta": 2.0,
+                    "bytes_per_second": 256,
+                    "eta": 2,
                     "chunk_index": 3,
                     "total_chunks": 8,
                 }

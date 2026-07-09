@@ -16,8 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs, io,
+    io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use sysinfo::{Disks, Pid, System};
@@ -37,6 +41,7 @@ const TRANSFER_CHUNK_TYPE: u8 = 1;
 const TRANSFER_CHUNK_HEADER_LEN: usize = 52;
 const MAX_TRANSFER_FRAME_BYTES: usize = 640 * 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HTTP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 static HEARTBEAT_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 /// Connect to a Reencodarr websocket worker endpoint and request one job.
@@ -363,14 +368,14 @@ impl PendingJob {
             .map(ChunkReceiver::received_bytes)
             .unwrap_or(self.job.assignment.size_bytes);
         let expected_bytes = Some(self.job.assignment.size_bytes);
-        let elapsed = self.transfer_started_at.elapsed().as_secs_f64().max(0.001);
-        let bytes_per_second = received_bytes as f64 / elapsed;
+        let elapsed = self.transfer_started_at.elapsed().as_secs().max(1);
+        let bytes_per_second = received_bytes / elapsed;
         let remaining_bytes = self
             .job
             .assignment
             .size_bytes
             .saturating_sub(received_bytes);
-        let eta = (bytes_per_second > 0.0).then_some(remaining_bytes as f64 / bytes_per_second);
+        let eta = (bytes_per_second > 0).then_some(remaining_bytes / bytes_per_second);
         let percent = if self.job.assignment.size_bytes == 0 {
             100.0
         } else {
@@ -1146,9 +1151,9 @@ impl ConnectedWorker {
     }
 }
 
-fn format_bytes_per_second(bytes_per_second: f64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    format!("{:.1} MiB/s", bytes_per_second / MIB)
+fn format_bytes_per_second(bytes_per_second: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!("{} MiB/s", bytes_per_second / MIB)
 }
 
 async fn run_worker_job_and_publish(
@@ -1302,7 +1307,7 @@ fn worker_source_file_name(
         })
 }
 
-async fn download_worker_input(job: &WorkerJob) -> Result<bool> {
+async fn download_worker_input(worker: &mut ConnectedWorker, job: &WorkerJob) -> Result<bool> {
     let Some(transfer) = job.assignment.transfer.clone() else {
         return Ok(false);
     };
@@ -1311,37 +1316,129 @@ async fn download_worker_input(job: &WorkerJob) -> Result<bool> {
         return Ok(true);
     }
 
-    let input_path = job.input_path().to_path_buf();
-    let expected_size = job.assignment.size_bytes;
-    let job_id = job.assignment.job_id.clone();
+    let parent = job
+        .input_path()
+        .parent()
+        .with_context(|| format!("worker input has no parent: {}", job.input_path().display()))?;
+    fs::create_dir_all(parent).context("create worker input dir")?;
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let parent = input_path
-            .parent()
-            .with_context(|| format!("worker input has no parent: {}", input_path.display()))?;
-        fs::create_dir_all(parent).context("create worker input dir")?;
-        let part_path = parent.join(".ab-av1-http.part");
+    let part_path = parent.join(".ab-av1-http.part");
+    let input_path = job.input_path().to_path_buf();
+    let job_id = job.assignment.job_id.clone();
+    let expected_size = job.assignment.size_bytes;
+    let received = Arc::new(AtomicU64::new(0));
+    let copy_received = Arc::clone(&received);
+
+    let mut copy = tokio::task::spawn_blocking(move || -> Result<u64> {
         let response = ureq::get(&transfer.url)
             .set(&transfer.auth.header, &transfer.auth.value)
             .call()
             .map_err(|error| anyhow!("HTTP input download failed for job {job_id}: {error}"))?;
 
-        let mut reader = response.into_reader();
+        let reader = CountingReader {
+            inner: response.into_reader(),
+            received: copy_received,
+        };
         let mut output =
             fs::File::create(&part_path).context("create HTTP worker input part file")?;
-        let bytes = io::copy(&mut reader, &mut output).context("write HTTP worker input")?;
+        let bytes = io::copy(&mut reader.take(expected_size), &mut output)
+            .context("write HTTP worker input")?;
+
         if expected_size > 0 && bytes != expected_size {
             bail!(
                 "HTTP input download for job {job_id} wrote {bytes} bytes, expected {expected_size}"
             );
         }
+
         fs::rename(&part_path, &input_path).context("move HTTP worker input into place")?;
-        Ok(())
-    })
-    .await
-    .context("join HTTP worker input download task")??;
+        Ok(bytes)
+    });
+
+    let started_at = Instant::now();
+    let mut progress = tokio::time::interval(HTTP_TRANSFER_PROGRESS_INTERVAL);
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = progress.tick() => {
+                let bytes = received.load(Ordering::Relaxed);
+                if bytes > 0 {
+                    worker
+                        .send_transfer_progress(http_transfer_progress_payload(
+                            &job.assignment.job_id,
+                            job.assignment.video_id,
+                            &job.assignment.source_name,
+                            job.assignment.size_bytes,
+                            bytes,
+                            started_at,
+                        ))
+                        .await?;
+                }
+            }
+            result = &mut copy => {
+                let bytes = result.context("join HTTP worker input download task")??;
+                worker
+                    .send_transfer_progress(http_transfer_progress_payload(
+                        &job.assignment.job_id,
+                        job.assignment.video_id,
+                        &job.assignment.source_name,
+                        job.assignment.size_bytes,
+                        bytes,
+                        started_at,
+                    ))
+                    .await?;
+                break;
+            }
+        }
+    }
 
     Ok(true)
+}
+
+struct CountingReader<R> {
+    inner: R,
+    received: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.received.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
+fn http_transfer_progress_payload(
+    job_id: &str,
+    video_id: u64,
+    filename: &str,
+    expected_size: u64,
+    received_bytes: u64,
+    started_at: Instant,
+) -> TransferProgressPayload {
+    let elapsed = started_at.elapsed().as_secs().max(1);
+    let bytes_per_second = received_bytes / elapsed;
+    let remaining_bytes = expected_size.saturating_sub(received_bytes);
+    let eta = (bytes_per_second > 0).then_some(remaining_bytes / bytes_per_second);
+    let percent = if expected_size == 0 {
+        100.0
+    } else {
+        100.0 * received_bytes as f64 / expected_size as f64
+    };
+
+    TransferProgressPayload {
+        job_id: job_id.to_owned(),
+        transfer_id: job_id.to_owned(),
+        video_id,
+        filename: filename.to_owned(),
+        received_bytes,
+        expected_bytes: Some(expected_size),
+        percent,
+        bytes_per_second,
+        eta,
+        chunk_index: 0,
+        total_chunks: 0,
+    }
 }
 
 pub async fn worker(config: WorkerConfig) -> Result<()> {
@@ -1538,65 +1635,69 @@ async fn run_connected_worker(
                     );
                     run_worker_job_and_publish(config, &mut worker, &job).await?;
                 }
-                WorkerJobPhase::InputMissing => match download_worker_input(&job).await {
-                    Ok(true) => {
-                        debug!(
-                            job_id = %job.assignment.job_id,
-                            input = %job.input_path().display(),
-                            "downloaded worker input over HTTP, starting job"
-                        );
-                        run_worker_job_and_publish(config, &mut worker, &job).await?;
+                WorkerJobPhase::InputMissing => {
+                    match download_worker_input(worker.as_mut().expect("connected worker"), &job)
+                        .await
+                    {
+                        Ok(true) => {
+                            debug!(
+                                job_id = %job.assignment.job_id,
+                                input = %job.input_path().display(),
+                                "downloaded worker input over HTTP, starting job"
+                            );
+                            run_worker_job_and_publish(config, &mut worker, &job).await?;
+                        }
+                        Ok(false) => {
+                            let resend_job = request_input_resend(
+                                worker.as_mut().expect("connected worker"),
+                                &job,
+                                config.local_path.as_deref(),
+                            )
+                            .await?;
+                            debug!(
+                                job_id = %resend_job.assignment.job_id,
+                                input = %resend_job.input_path().display(),
+                                temp_dir = %resend_job.input_dir.display(),
+                                phase = ?WorkerJobPhase::ReceivingInput,
+                                receiver_ready = false,
+                                "waiting for worker input over websocket"
+                            );
+                            pending_job = Some(PendingJob::waiting(resend_job));
+                            debug!(
+                                job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                                pending_job = true,
+                                "stored pending job after input resend request"
+                            );
+                        }
+                        Err(error) => {
+                            debug!(
+                                job_id = %job.assignment.job_id,
+                                error = %error,
+                                "HTTP worker input download failed, falling back to websocket transfer"
+                            );
+                            let resend_job = request_input_resend(
+                                worker.as_mut().expect("connected worker"),
+                                &job,
+                                config.local_path.as_deref(),
+                            )
+                            .await?;
+                            debug!(
+                                job_id = %resend_job.assignment.job_id,
+                                input = %resend_job.input_path().display(),
+                                temp_dir = %resend_job.input_dir.display(),
+                                phase = ?WorkerJobPhase::ReceivingInput,
+                                receiver_ready = false,
+                                "waiting for worker input over websocket"
+                            );
+                            pending_job = Some(PendingJob::waiting(resend_job));
+                            debug!(
+                                job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                                pending_job = true,
+                                "stored pending job after input resend request"
+                            );
+                        }
                     }
-                    Ok(false) => {
-                        let resend_job = request_input_resend(
-                            worker.as_mut().expect("connected worker"),
-                            &job,
-                            config.local_path.as_deref(),
-                        )
-                        .await?;
-                        debug!(
-                            job_id = %resend_job.assignment.job_id,
-                            input = %resend_job.input_path().display(),
-                            temp_dir = %resend_job.input_dir.display(),
-                            phase = ?WorkerJobPhase::ReceivingInput,
-                            receiver_ready = false,
-                            "waiting for worker input over websocket"
-                        );
-                        pending_job = Some(PendingJob::waiting(resend_job));
-                        debug!(
-                            job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                            pending_job = true,
-                            "stored pending job after input resend request"
-                        );
-                    }
-                    Err(error) => {
-                        debug!(
-                            job_id = %job.assignment.job_id,
-                            error = %error,
-                            "HTTP worker input download failed, falling back to websocket transfer"
-                        );
-                        let resend_job = request_input_resend(
-                            worker.as_mut().expect("connected worker"),
-                            &job,
-                            config.local_path.as_deref(),
-                        )
-                        .await?;
-                        debug!(
-                            job_id = %resend_job.assignment.job_id,
-                            input = %resend_job.input_path().display(),
-                            temp_dir = %resend_job.input_dir.display(),
-                            phase = ?WorkerJobPhase::ReceivingInput,
-                            receiver_ready = false,
-                            "waiting for worker input over websocket"
-                        );
-                        pending_job = Some(PendingJob::waiting(resend_job));
-                        debug!(
-                            job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                            pending_job = true,
-                            "stored pending job after input resend request"
-                        );
-                    }
-                },
+                }
                 WorkerJobPhase::ReceivingInput => {
                     debug!(
                         job_id = %job.assignment.job_id,
