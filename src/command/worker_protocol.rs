@@ -303,6 +303,21 @@ pub(crate) struct JobAssignedPayload {
     pub(crate) target_vmaf: f32,
     #[serde(default)]
     pub(crate) crf_search_args: Vec<String>,
+    #[serde(default)]
+    pub(crate) transfer: Option<TransferSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TransferSpec {
+    pub(crate) url: String,
+    pub(crate) auth: TransferAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TransferAuth {
+    pub(crate) scheme: String,
+    pub(crate) header: String,
+    pub(crate) value: String,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -684,6 +699,14 @@ mod tests {
                     "size_bytes": 1024,
                     "chunk_size_bytes": 256,
                     "target_vmaf": 96.5,
+                    "transfer": {
+                        "url": "http://10.0.0.10:4000/workers/files/123",
+                        "auth": {
+                            "scheme": "bearer",
+                            "header": "authorization",
+                            "value": "Bearer transfer-token"
+                        }
+                    },
                     "crf_search_args": [
                         "crf-search",
                         "--input",
@@ -708,6 +731,14 @@ mod tests {
                     size_bytes: 1024,
                     chunk_size_bytes: 256,
                     target_vmaf: 96.5,
+                    transfer: Some(super::TransferSpec {
+                        url: "http://10.0.0.10:4000/workers/files/123".into(),
+                        auth: super::TransferAuth {
+                            scheme: "bearer".into(),
+                            header: "authorization".into(),
+                            value: "Bearer transfer-token".into(),
+                        },
+                    }),
                     crf_search_args: vec![
                         "crf-search".into(),
                         "--input".into(),
@@ -760,6 +791,7 @@ mod tests {
                     size_bytes: 1024,
                     chunk_size_bytes: 0,
                     target_vmaf: 95.0,
+                    transfer: None,
                     crf_search_args: vec![
                         "crf-search".into(),
                         "--input".into(),

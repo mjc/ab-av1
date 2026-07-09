@@ -15,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -1302,6 +1302,48 @@ fn worker_source_file_name(
         })
 }
 
+async fn download_worker_input(job: &WorkerJob) -> Result<bool> {
+    let Some(transfer) = job.assignment.transfer.clone() else {
+        return Ok(false);
+    };
+
+    if job.input_path().exists() {
+        return Ok(true);
+    }
+
+    let input_path = job.input_path().to_path_buf();
+    let expected_size = job.assignment.size_bytes;
+    let job_id = job.assignment.job_id.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let parent = input_path
+            .parent()
+            .with_context(|| format!("worker input has no parent: {}", input_path.display()))?;
+        fs::create_dir_all(parent).context("create worker input dir")?;
+        let part_path = parent.join(".ab-av1-http.part");
+        let response = ureq::get(&transfer.url)
+            .set(&transfer.auth.header, &transfer.auth.value)
+            .call()
+            .map_err(|error| anyhow!("HTTP input download failed for job {job_id}: {error}"))?;
+
+        let mut reader = response.into_reader();
+        let mut output =
+            fs::File::create(&part_path).context("create HTTP worker input part file")?;
+        let bytes = io::copy(&mut reader, &mut output).context("write HTTP worker input")?;
+        if expected_size > 0 && bytes != expected_size {
+            bail!(
+                "HTTP input download for job {job_id} wrote {bytes} bytes, expected {expected_size}"
+            );
+        }
+        fs::rename(&part_path, &input_path).context("move HTTP worker input into place")?;
+        Ok(())
+    })
+    .await
+    .context("join HTTP worker input download task")??;
+
+    Ok(true)
+}
+
 pub async fn worker(config: WorkerConfig) -> Result<()> {
     if config.once {
         let session = run_worker_session(&config).await?;
@@ -1496,28 +1538,65 @@ async fn run_connected_worker(
                     );
                     run_worker_job_and_publish(config, &mut worker, &job).await?;
                 }
-                WorkerJobPhase::InputMissing => {
-                    let resend_job = request_input_resend(
-                        worker.as_mut().expect("connected worker"),
-                        &job,
-                        config.local_path.as_deref(),
-                    )
-                    .await?;
-                    debug!(
-                        job_id = %resend_job.assignment.job_id,
-                        input = %resend_job.input_path().display(),
-                        temp_dir = %resend_job.input_dir.display(),
-                        phase = ?WorkerJobPhase::ReceivingInput,
-                        receiver_ready = false,
-                        "waiting for worker input over websocket"
-                    );
-                    pending_job = Some(PendingJob::waiting(resend_job));
-                    debug!(
-                        job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                        pending_job = true,
-                        "stored pending job after input resend request"
-                    );
-                }
+                WorkerJobPhase::InputMissing => match download_worker_input(&job).await {
+                    Ok(true) => {
+                        debug!(
+                            job_id = %job.assignment.job_id,
+                            input = %job.input_path().display(),
+                            "downloaded worker input over HTTP, starting job"
+                        );
+                        run_worker_job_and_publish(config, &mut worker, &job).await?;
+                    }
+                    Ok(false) => {
+                        let resend_job = request_input_resend(
+                            worker.as_mut().expect("connected worker"),
+                            &job,
+                            config.local_path.as_deref(),
+                        )
+                        .await?;
+                        debug!(
+                            job_id = %resend_job.assignment.job_id,
+                            input = %resend_job.input_path().display(),
+                            temp_dir = %resend_job.input_dir.display(),
+                            phase = ?WorkerJobPhase::ReceivingInput,
+                            receiver_ready = false,
+                            "waiting for worker input over websocket"
+                        );
+                        pending_job = Some(PendingJob::waiting(resend_job));
+                        debug!(
+                            job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                            pending_job = true,
+                            "stored pending job after input resend request"
+                        );
+                    }
+                    Err(error) => {
+                        debug!(
+                            job_id = %job.assignment.job_id,
+                            error = %error,
+                            "HTTP worker input download failed, falling back to websocket transfer"
+                        );
+                        let resend_job = request_input_resend(
+                            worker.as_mut().expect("connected worker"),
+                            &job,
+                            config.local_path.as_deref(),
+                        )
+                        .await?;
+                        debug!(
+                            job_id = %resend_job.assignment.job_id,
+                            input = %resend_job.input_path().display(),
+                            temp_dir = %resend_job.input_dir.display(),
+                            phase = ?WorkerJobPhase::ReceivingInput,
+                            receiver_ready = false,
+                            "waiting for worker input over websocket"
+                        );
+                        pending_job = Some(PendingJob::waiting(resend_job));
+                        debug!(
+                            job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
+                            pending_job = true,
+                            "stored pending job after input resend request"
+                        );
+                    }
+                },
                 WorkerJobPhase::ReceivingInput => {
                     debug!(
                         job_id = %job.assignment.job_id,
@@ -2237,6 +2316,7 @@ mod tests {
             size_bytes: 1024,
             chunk_size_bytes: 256,
             target_vmaf: 96.5,
+            transfer: None,
             crf_search_args: vec![
                 "crf-search".into(),
                 "--input".into(),
@@ -2263,6 +2343,7 @@ mod tests {
                 size_bytes: 1024,
                 chunk_size_bytes: 256,
                 target_vmaf: 96.5,
+                transfer: None,
                 crf_search_args: vec![
                     "crf-search".into(),
                     "--input".into(),
@@ -2293,6 +2374,7 @@ mod tests {
             size_bytes: 1024,
             chunk_size_bytes: 256,
             target_vmaf: 96.5,
+            transfer: None,
             crf_search_args: vec![
                 "crf-search".into(),
                 "--input".into(),
@@ -2326,6 +2408,7 @@ mod tests {
                 size_bytes: 4,
                 chunk_size_bytes: 0,
                 target_vmaf: 96.5,
+                transfer: None,
                 crf_search_args: vec![
                     "crf-search".into(),
                     "--input".into(),
@@ -2364,6 +2447,7 @@ mod tests {
                 size_bytes: 1024,
                 chunk_size_bytes: 256,
                 target_vmaf: 96.5,
+                transfer: None,
                 crf_search_args: vec![
                     "crf-search".into(),
                     "--input".into(),
@@ -2724,6 +2808,7 @@ mod tests {
                         size_bytes: 1024,
                         chunk_size_bytes,
                         target_vmaf: 96.5,
+                        transfer: None,
                         crf_search_args: vec![
                             "crf-search".into(),
                             "--input".into(),
