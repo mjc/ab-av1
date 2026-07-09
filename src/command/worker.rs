@@ -1,9 +1,9 @@
 use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ChunkTransferPayload,
     ClientEvent, ClientFrame, CrfSearchProgressPayload, CrfSearchResultPayload, ErrorReplyPayload,
-    HeartbeatPayload, JobResultPayload, PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply,
-    TransferFailurePayload, TransferProgressPayload, TransferStage, TransferStartedPayload,
-    WorkStatus,
+    FailureReportPayload, HeartbeatPayload, JobResultPayload, PullWorkPayload, ReplyBody,
+    ServerPushFrame, ServerReply, TransferFailurePayload, TransferProgressPayload, TransferStage,
+    TransferStartedPayload, WorkStatus,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, sample_encode};
@@ -211,6 +211,23 @@ impl WorkerJob {
             params: json!({ "encoder": "libsvtav1", "preset": 8 }),
             target: self.assignment.target_vmaf,
             chosen,
+        }
+    }
+
+    fn failure_payload(&self, error: &anyhow::Error) -> FailureReportPayload {
+        FailureReportPayload {
+            video_id: self.assignment.video_id,
+            stage: "crf_search".into(),
+            category: "process_failure".into(),
+            message: error.to_string(),
+            code: "worker_crf_search_failed".into(),
+            context: json!({
+                "job_id": self.assignment.job_id,
+                "source_name": self.assignment.source_name,
+                "error_chain": format!("{error:#}"),
+            }),
+            retriable: false,
+            stderr_excerpt: Some(format!("{error:#}")),
         }
     }
 }
@@ -1146,7 +1163,13 @@ async fn run_worker_job_and_publish(
     );
     let probe = Arc::new(crate::ffprobe::probe(job.input_path()));
     debug!(job_id = %job.assignment.job_id, "probe complete, running crf search");
-    let best = run_worker_job_with_reporting(config, job.clone(), probe, worker).await?;
+    let best = match run_worker_job_with_reporting(config, job.clone(), probe, worker).await {
+        Ok(best) => best,
+        Err(error) => {
+            publish_worker_failure(worker, job, &error).await;
+            return Err(error);
+        }
+    };
 
     debug!(job_id = %job.assignment.job_id, "publishing worker result");
     println!(
@@ -1154,6 +1177,25 @@ async fn run_worker_job_and_publish(
         serde_json::to_string(&job.result_payload(&best)).context("serialize worker job result")?
     );
     Ok(())
+}
+
+async fn publish_worker_failure(
+    worker: &mut Option<ConnectedWorker>,
+    job: &WorkerJob,
+    error: &anyhow::Error,
+) {
+    let Some(worker) = worker else {
+        return;
+    };
+
+    let payload = job.failure_payload(error);
+    let _ = send_worker_event(
+        worker,
+        ClientEvent::VideoFailed(payload),
+        &job.assignment.job_id,
+        "video_failed",
+    )
+    .await;
 }
 
 fn build_worker_job(

@@ -28,6 +28,7 @@ pub(crate) enum ClientEvent {
     TransferFailure(TransferFailurePayload),
     CrfSearchProgress(CrfSearchProgressPayload),
     CrfSearchResult(CrfSearchResultPayload),
+    VideoFailed(FailureReportPayload),
 }
 
 impl ClientEvent {
@@ -48,6 +49,7 @@ impl ClientEvent {
                 ("crf_search_progress", ClientPayload::Progress(payload))
             }
             Self::CrfSearchResult(payload) => ("crf_search_result", ClientPayload::Result(payload)),
+            Self::VideoFailed(payload) => ("video_failed", ClientPayload::Failure(payload)),
         }
     }
 }
@@ -63,6 +65,7 @@ enum ClientPayload {
     TransferFailure(TransferFailurePayload),
     Progress(CrfSearchProgressPayload),
     Result(CrfSearchResultPayload),
+    Failure(FailureReportPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -143,6 +146,18 @@ pub(crate) struct CrfSearchResultPayload {
     pub(crate) params: serde_json::Value,
     pub(crate) target: f32,
     pub(crate) chosen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FailureReportPayload {
+    pub(crate) video_id: u64,
+    pub(crate) stage: String,
+    pub(crate) category: String,
+    pub(crate) message: String,
+    pub(crate) code: String,
+    pub(crate) context: serde_json::Value,
+    pub(crate) retriable: bool,
+    pub(crate) stderr_excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
