@@ -465,6 +465,7 @@ async fn run_worker_job_with_reporting(
     };
     let mut reconnect = tokio::time::interval(Duration::from_secs(5));
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut completed_best = None;
 
     loop {
         match worker.as_mut() {
@@ -551,7 +552,11 @@ async fn run_worker_job_with_reporting(
                             *worker = None;
                         }
                         if let Some(best) = best {
-                            return Ok(best);
+                            if disconnected || worker.is_none() {
+                                completed_best = Some(best);
+                            } else {
+                                return Ok(best);
+                            }
                         }
                     }
                 }
@@ -565,9 +570,13 @@ async fn run_worker_job_with_reporting(
                     _ = reconnect.tick() => {
                         match ConnectedWorker::connect(config).await {
                             Ok(mut reconnected) => {
-                                replay_worker_state(&mut reconnected, &state).await;
-                                state.connected = true;
-                                *worker = Some(reconnected);
+                                if replay_worker_state(&mut reconnected, &state).await {
+                                    state.connected = true;
+                                    *worker = Some(reconnected);
+                                    if let Some(best) = completed_best.take() {
+                                        return Ok(best);
+                                    }
+                                }
                             }
                             Err(error) => {
                                 trace!(job_id = %job.assignment.job_id, error = %error, "worker reconnect attempt failed");
@@ -582,7 +591,7 @@ async fn run_worker_job_with_reporting(
                             update,
                         ).await?;
                         if let Some(best) = best {
-                            return Ok(best);
+                            completed_best = Some(best);
                         }
                     }
                 }
@@ -665,9 +674,11 @@ async fn handle_crf_update(
     }
 }
 
-async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobReportState) {
+async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobReportState) -> bool {
+    let mut delivered = true;
+
     if let Some(heartbeat) = &state.heartbeat {
-        send_worker_event(
+        delivered &= send_worker_event(
             worker,
             ClientEvent::Heartbeat(heartbeat.clone()),
             "state",
@@ -676,7 +687,7 @@ async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobRepo
         .await;
     }
     if let Some(progress) = &state.transfer_progress {
-        send_worker_event(
+        delivered &= send_worker_event(
             worker,
             ClientEvent::TransferProgress(progress.clone()),
             "state",
@@ -685,7 +696,7 @@ async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobRepo
         .await;
     }
     if let Some(progress) = &state.crf_progress {
-        send_worker_event(
+        delivered &= send_worker_event(
             worker,
             ClientEvent::CrfSearchProgress(progress.clone()),
             "state",
@@ -694,7 +705,7 @@ async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobRepo
         .await;
     }
     for result in &state.crf_results {
-        send_worker_event(
+        delivered &= send_worker_event(
             worker,
             ClientEvent::CrfSearchResult(result.clone()),
             "state",
@@ -702,6 +713,8 @@ async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobRepo
         )
         .await;
     }
+
+    delivered
 }
 
 async fn send_worker_event(
@@ -818,10 +831,16 @@ impl ReconnectBackoff {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerJobPhase {
-    ReceivingInput,
-    InputMissing,
+    AwaitingInput(InputDelivery),
     InputReady,
     CrfSearching,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputDelivery {
+    Http,
+    Resend,
+    Websocket,
 }
 
 fn worker_job_phase(job: &WorkerJob, local_path: Option<&Path>) -> Result<WorkerJobPhase> {
@@ -843,9 +862,13 @@ fn worker_job_phase(job: &WorkerJob, local_path: Option<&Path>) -> Result<Worker
         );
     }
 
+    if job.assignment.transfer.is_some() {
+        return Ok(WorkerJobPhase::AwaitingInput(InputDelivery::Http));
+    }
+
     match job.assignment.status {
-        WorkStatus::JobAssigned => Ok(WorkerJobPhase::ReceivingInput),
-        WorkStatus::JobInProgress => Ok(WorkerJobPhase::InputMissing),
+        WorkStatus::JobAssigned => Ok(WorkerJobPhase::AwaitingInput(InputDelivery::Websocket)),
+        WorkStatus::JobInProgress => Ok(WorkerJobPhase::AwaitingInput(InputDelivery::Resend)),
         WorkStatus::NoWork => bail!(
             "assigned job {} has invalid no_work status",
             job.assignment.job_id
@@ -1531,6 +1554,33 @@ async fn request_input_resend(
     build_worker_job(assignment, local_path)
 }
 
+async fn request_pending_input(
+    worker: &mut ConnectedWorker,
+    job: &WorkerJob,
+    local_path: Option<&Path>,
+) -> Result<PendingJob> {
+    let resend_job = request_input_resend(worker, job, local_path).await?;
+    Ok(PendingJob::waiting(resend_job))
+}
+
+async fn download_or_wait_for_input(
+    worker: &mut ConnectedWorker,
+    job: &WorkerJob,
+    local_path: Option<&Path>,
+) -> Result<Option<PendingJob>> {
+    match download_worker_input(worker, job).await {
+        Ok(true) => return Ok(None),
+        Ok(false) => {}
+        Err(error) => debug!(
+            job_id = %job.assignment.job_id,
+            error = %error,
+            "HTTP worker input download failed, falling back to websocket transfer"
+        ),
+    }
+
+    Ok(Some(request_pending_input(worker, job, local_path).await?))
+}
+
 async fn run_connected_worker(
     config: &WorkerConfig,
     runtime: WorkerRuntime,
@@ -1635,84 +1685,51 @@ async fn run_connected_worker(
                     );
                     run_worker_job_and_publish(config, &mut worker, &job).await?;
                 }
-                WorkerJobPhase::InputMissing => {
-                    match download_worker_input(worker.as_mut().expect("connected worker"), &job)
-                        .await
-                    {
-                        Ok(true) => {
-                            debug!(
-                                job_id = %job.assignment.job_id,
-                                input = %job.input_path().display(),
-                                "downloaded worker input over HTTP, starting job"
-                            );
-                            run_worker_job_and_publish(config, &mut worker, &job).await?;
-                        }
-                        Ok(false) => {
-                            let resend_job = request_input_resend(
+                WorkerJobPhase::AwaitingInput(delivery) => {
+                    let pending = match delivery {
+                        InputDelivery::Http => {
+                            match download_or_wait_for_input(
                                 worker.as_mut().expect("connected worker"),
                                 &job,
                                 config.local_path.as_deref(),
                             )
-                            .await?;
-                            debug!(
-                                job_id = %resend_job.assignment.job_id,
-                                input = %resend_job.input_path().display(),
-                                temp_dir = %resend_job.input_dir.display(),
-                                phase = ?WorkerJobPhase::ReceivingInput,
-                                receiver_ready = false,
-                                "waiting for worker input over websocket"
-                            );
-                            pending_job = Some(PendingJob::waiting(resend_job));
-                            debug!(
-                                job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                                pending_job = true,
-                                "stored pending job after input resend request"
-                            );
+                            .await?
+                            {
+                                None => {
+                                    debug!(
+                                        job_id = %job.assignment.job_id,
+                                        input = %job.input_path().display(),
+                                        "downloaded worker input over HTTP, starting job"
+                                    );
+                                    run_worker_job_and_publish(config, &mut worker, &job).await?;
+                                    None
+                                }
+                                Some(pending) => Some(pending),
+                            }
                         }
-                        Err(error) => {
-                            debug!(
-                                job_id = %job.assignment.job_id,
-                                error = %error,
-                                "HTTP worker input download failed, falling back to websocket transfer"
-                            );
-                            let resend_job = request_input_resend(
+                        InputDelivery::Resend => Some(
+                            request_pending_input(
                                 worker.as_mut().expect("connected worker"),
                                 &job,
                                 config.local_path.as_deref(),
                             )
-                            .await?;
-                            debug!(
-                                job_id = %resend_job.assignment.job_id,
-                                input = %resend_job.input_path().display(),
-                                temp_dir = %resend_job.input_dir.display(),
-                                phase = ?WorkerJobPhase::ReceivingInput,
-                                receiver_ready = false,
-                                "waiting for worker input over websocket"
-                            );
-                            pending_job = Some(PendingJob::waiting(resend_job));
-                            debug!(
-                                job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                                pending_job = true,
-                                "stored pending job after input resend request"
-                            );
-                        }
+                            .await?,
+                        ),
+                        InputDelivery::Websocket => Some(PendingJob::waiting(job)),
+                    };
+
+                    if let Some(pending) = pending {
+                        debug!(
+                            job_id = %pending.job.assignment.job_id,
+                            input = %pending.input_path().display(),
+                            temp_dir = %pending.job.input_dir.display(),
+                            phase = ?phase,
+                            receiver_ready = false,
+                            pending_job = true,
+                            "waiting for worker input"
+                        );
+                        pending_job = Some(pending);
                     }
-                }
-                WorkerJobPhase::ReceivingInput => {
-                    debug!(
-                        job_id = %job.assignment.job_id,
-                        input = %job.input_path().display(),
-                        temp_dir = %job.input_dir.display(),
-                        phase = ?phase,
-                        receiver_ready = false,
-                        "waiting for worker input over websocket"
-                    );
-                    pending_job = Some(PendingJob::waiting(job));
-                    debug!(
-                        job_id = %pending_job.as_ref().unwrap().job.assignment.job_id,
-                        pending_job = true,
-                        "stored pending job"
-                    );
                 }
             }
             continue;
