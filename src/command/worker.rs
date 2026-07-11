@@ -183,13 +183,20 @@ impl WorkerJob {
         }
     }
 
-    fn progress_payload(&self, status: &sample_encode::Status) -> CrfSearchProgressPayload {
+    fn progress_payload(
+        &self,
+        crf: f32,
+        status: &sample_encode::Status,
+    ) -> CrfSearchProgressPayload {
         CrfSearchProgressPayload {
             video_id: self.assignment.video_id,
             percent: (status.progress.clamp(0.0, 1.0) * 100.0),
             filename: self.assignment.source_name.clone(),
             eta: None,
             fps: status.fps,
+            crf,
+            sample_num: status.sample,
+            total_samples: status.samples,
         }
     }
 
@@ -626,8 +633,8 @@ async fn handle_crf_update(
             }
             Ok((Some(best), disconnected))
         }
-        Ok(crf_search::Update::Status { sample, .. }) => {
-            let payload = job.progress_payload(&sample);
+        Ok(crf_search::Update::Status { crf, sample, .. }) => {
+            let payload = job.progress_payload(crf, &sample);
             state.crf_progress = Some(payload.clone());
             let mut disconnected = false;
             if let Some(worker) = worker {
@@ -2660,7 +2667,13 @@ mod tests {
                 chunk_size_bytes: 4,
                 target_vmaf: 95.0,
                 transfer: None,
-                crf_search_args: vec![],
+                crf_search_args: vec![
+                    "crf-search".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--min-vmaf".into(),
+                    "95".into(),
+                ],
             },
             input_dir.clone(),
             input_path.clone(),
@@ -2707,7 +2720,13 @@ mod tests {
                 chunk_size_bytes: 4,
                 target_vmaf: 95.0,
                 transfer: None,
-                crf_search_args: vec![],
+                crf_search_args: vec![
+                    "crf-search".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--min-vmaf".into(),
+                    "95".into(),
+                ],
             },
             root.clone(),
             input_path.clone(),
@@ -2799,6 +2818,94 @@ mod tests {
             worker_job_phase(&make_job(WorkStatus::JobAssigned, None), Some(&input_path)).is_err()
         );
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn crf_updates_are_retained_for_reconnect_reporting() -> Result<()> {
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_id: "reporting-job".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                crf_search_args: vec![
+                    "crf-search".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--min-vmaf".into(),
+                    "95".into(),
+                ],
+            },
+            std::env::temp_dir(),
+            std::env::temp_dir().join("movie.mkv"),
+        );
+        let mut state = WorkerJobReportState::default();
+        let status = sample_encode::Status {
+            work: sample_encode::Work::Encode,
+            fps: 24.0,
+            progress: 0.5,
+            sample: 2,
+            samples: 4,
+            full_pass: false,
+        };
+        let (_, disconnected) = handle_crf_update(
+            &job,
+            &mut state,
+            None,
+            Some(Ok(crf_search::Update::Status {
+                crf_run: 1,
+                crf: 31.0,
+                sample: status,
+            })),
+        )
+        .await?;
+        assert!(!disconnected);
+        let progress = state.crf_progress.as_ref().expect("stored progress");
+        assert_eq!(progress.video_id, 123);
+        assert_eq!(progress.percent, 50.0);
+        assert_eq!(progress.fps, 24.0);
+        assert_eq!(progress.crf, 31.0);
+        assert_eq!(progress.sample_num, 2);
+        assert_eq!(progress.total_samples, 4);
+
+        crf_test_hooks::set(|_crf| sample_encode::Output {
+            vmaf_score: Some(96.0),
+            xpsnr_score: None,
+            predicted_encode_size: 100,
+            encode_percent: 50.0,
+            predicted_encode_time: Duration::from_secs(1),
+            from_cache: false,
+        });
+        let sample = run_worker_job(
+            job.clone(),
+            Arc::new(Ffprobe {
+                duration: Ok(Duration::from_secs(600)),
+                has_audio: false,
+                max_audio_channels: None,
+                fps: Ok(24.0),
+                resolution: Some((1280, 720)),
+                is_image: false,
+                pix_fmt: Some("yuv420p10le".into()),
+            }),
+        )
+        .await?;
+        crf_test_hooks::clear();
+        let (best, disconnected) = handle_crf_update(
+            &job,
+            &mut state,
+            None,
+            Some(Ok(crf_search::Update::Done(sample))),
+        )
+        .await?;
+        assert!(!disconnected);
+        assert!(best.is_some());
+        assert_eq!(state.crf_results.len(), 1);
+        assert!(state.crf_results[0].chosen);
         Ok(())
     }
 

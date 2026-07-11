@@ -125,6 +125,9 @@ pub(crate) struct CrfSearchProgressPayload {
     pub(crate) filename: String,
     pub(crate) eta: Option<u64>,
     pub(crate) fps: f32,
+    pub(crate) crf: f32,
+    pub(crate) sample_num: u64,
+    pub(crate) total_samples: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -556,6 +559,9 @@ mod tests {
                 filename: "movie.mkv".into(),
                 eta: None,
                 fps: 27.25,
+                crf: 31.0,
+                sample_num: 2,
+                total_samples: 4,
             }),
         );
 
@@ -572,6 +578,9 @@ mod tests {
                     "filename": "movie.mkv",
                     "eta": null,
                     "fps": 27.25,
+                    "crf": 31.0,
+                    "sample_num": 2,
+                    "total_samples": 4,
                 }
             ])
         );
