@@ -323,21 +323,6 @@ pub(crate) struct TransferAuth {
     pub(crate) value: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct JobResultPayload {
-    pub(crate) job_id: String,
-    pub(crate) video_id: u64,
-    pub(crate) source_name: String,
-    pub(crate) crf: f32,
-    pub(crate) vmaf_score: Option<f32>,
-    pub(crate) xpsnr_score: Option<f32>,
-    pub(crate) predicted_encode_size: u64,
-    pub(crate) encode_percent: f64,
-    pub(crate) predicted_encode_time_secs: f64,
-    pub(crate) from_cache: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ErrorReplyPayload {
     pub(crate) reason: String,
@@ -366,20 +351,6 @@ pub(crate) struct TransferStartedPayload {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ChunkTransferPayload {
-    pub(crate) bytes_sent: u64,
-    pub(crate) chunk_index: u64,
-    pub(crate) crc32: u64,
-    pub(crate) data: String,
-    pub(crate) status: String,
-    pub(crate) total_bytes: u64,
-    pub(crate) total_chunks: u64,
-    pub(crate) transfer_id: String,
-    pub(crate) video_id: u64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TransferProgressPayload {
     pub(crate) job_id: String,
@@ -393,15 +364,6 @@ pub(crate) struct TransferProgressPayload {
     pub(crate) eta: Option<u64>,
     pub(crate) chunk_index: u64,
     pub(crate) total_chunks: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TransferCompletePayload {
-    pub(crate) job_id: String,
-    pub(crate) final_path: String,
-    pub(crate) final_size_bytes: u64,
-    pub(crate) final_digest: String,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -814,38 +776,6 @@ mod tests {
     }
 
     #[test]
-    fn job_result_payload_serializes_structured_result_summary() {
-        let payload = JobResultPayload {
-            job_id: "job-123".into(),
-            video_id: 123,
-            source_name: "movie.mkv".into(),
-            crf: 31.5,
-            vmaf_score: Some(96.2),
-            xpsnr_score: None,
-            predicted_encode_size: 123_456,
-            encode_percent: 42.5,
-            predicted_encode_time_secs: 87.5,
-            from_cache: false,
-        };
-
-        assert_eq!(
-            serde_json::to_value(payload).expect("serialize job result"),
-            json!({
-                "job_id": "job-123",
-                "video_id": 123,
-                "source_name": "movie.mkv",
-                "crf": 31.5,
-                "vmaf_score": 96.19999694824219,
-                "xpsnr_score": null,
-                "predicted_encode_size": 123456,
-                "encode_percent": 42.5,
-                "predicted_encode_time_secs": 87.5,
-                "from_cache": false,
-            })
-        );
-    }
-
-    #[test]
     fn server_error_reply_parses_protocol_mismatch_payload() {
         let reply: ServerFrame<ErrorReplyPayload> = serde_json::from_value(json!([
             null,
@@ -920,36 +850,6 @@ mod tests {
                 "size_bytes": 9_560_739_312u64,
                 "source_name": "movie.mkv",
                 "status": "transfer_started",
-                "total_bytes": 9_560_739_312u64,
-                "total_chunks": 9_118,
-                "transfer_id": "job-123",
-                "video_id": 123,
-            })
-        );
-    }
-
-    #[test]
-    fn chunk_transfer_payload_serializes_metadata_side_channel() {
-        let payload = ChunkTransferPayload {
-            bytes_sent: 4096,
-            chunk_index: 7,
-            crc32: 0xdead_beef,
-            data: "deadbeef".into(),
-            status: "transfer_chunk".into(),
-            total_bytes: 9_560_739_312,
-            total_chunks: 9_118,
-            transfer_id: "job-123".into(),
-            video_id: 123,
-        };
-
-        assert_eq!(
-            serde_json::to_value(payload).expect("serialize chunk transfer"),
-            json!({
-                "bytes_sent": 4096,
-                "chunk_index": 7,
-                "crc32": 3735928559u64,
-                "data": "deadbeef",
-                "status": "transfer_chunk",
                 "total_bytes": 9_560_739_312u64,
                 "total_chunks": 9_118,
                 "transfer_id": "job-123",

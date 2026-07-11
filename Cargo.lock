@@ -9,7 +9,6 @@ dependencies = [
  "allocation-counter",
  "anyhow",
  "async-stream",
- "base64",
  "blake3",
  "clap",
  "clap-verbosity-flag",
