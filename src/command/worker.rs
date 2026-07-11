@@ -1204,19 +1204,26 @@ async fn run_worker_job_and_publish(
         "{}",
         serde_json::to_string(&job.result_payload(&best)).context("serialize worker job result")?
     );
-    if config.local_path.is_none() {
-        debug!(
-            job_id = %job.assignment.job_id,
-            input = %job.input_path().display(),
-            "removing completed worker input"
-        );
-        fs::remove_file(job.input_path()).with_context(|| {
-            format!(
-                "remove completed worker input {}",
-                job.input_path().display()
-            )
-        })?;
+    remove_completed_worker_input(config, job)?;
+    Ok(())
+}
+
+fn remove_completed_worker_input(config: &WorkerConfig, job: &WorkerJob) -> Result<()> {
+    if config.local_path.is_some() {
+        return Ok(());
     }
+
+    debug!(
+        job_id = %job.assignment.job_id,
+        input = %job.input_path().display(),
+        "removing completed worker input"
+    );
+    fs::remove_file(job.input_path()).with_context(|| {
+        format!(
+            "remove completed worker input {}",
+            job.input_path().display()
+        )
+    })?;
     Ok(())
 }
 
@@ -2634,6 +2641,96 @@ mod tests {
         assert_eq!(result.predicted_encode_time_secs, 1.0);
         assert!(!result.from_cache);
         assert!(result.chosen);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_job_finalizes_chunk_to_worker_input_and_reports_progress() -> Result<()> {
+        let job_id = format!("worker-flow-chunk-{}", std::process::id());
+        let input_dir = worker_job_input_dir(&job_id);
+        let input_path = input_dir.join("movie.mkv");
+        let _ = fs::remove_dir_all(&input_dir);
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_id: job_id.clone(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                crf_search_args: vec![],
+            },
+            input_dir.clone(),
+            input_path.clone(),
+        );
+        let mut pending = PendingJob::waiting(job);
+        pending.apply_raw_chunk(TransferChunk {
+            transfer_id: job_id,
+            video_id: 123,
+            chunk_index: 0,
+            total_chunks: 1,
+            bytes_sent: 4,
+            total_bytes: 4,
+            crc32: crc32fast::hash(b"data") as u64,
+            bytes: b"data".to_vec(),
+        })?;
+
+        let progress = pending.transfer_progress_payload(0, 1);
+        assert_eq!(progress.received_bytes, 4);
+        assert_eq!(progress.expected_bytes, Some(4));
+        assert_eq!(progress.percent, 100.0);
+        assert_eq!(progress.chunk_index, 0);
+        assert_eq!(progress.total_chunks, 1);
+
+        pending.finish()?;
+        assert_eq!(fs::read(&input_path)?, b"data");
+        fs::remove_dir_all(input_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_worker_input_cleanup_respects_local_path() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("ab-av1-worker-cleanup-{}", std::process::id()));
+        let input_path = root.join("movie.mkv");
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"data")?;
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_id: "cleanup-job".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                crf_search_args: vec![],
+            },
+            root.clone(),
+            input_path.clone(),
+        );
+        let config = WorkerConfig {
+            connect: String::new(),
+            token: String::new(),
+            worker_id: String::new(),
+            version: String::new(),
+            protocol_version: 1,
+            once: false,
+            local_path: Some(input_path.clone()),
+        };
+
+        remove_completed_worker_input(&config, &job)?;
+        assert!(input_path.exists());
+        let config = WorkerConfig {
+            local_path: None,
+            ..config
+        };
+        remove_completed_worker_input(&config, &job)?;
+        assert!(!input_path.exists());
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
