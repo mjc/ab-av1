@@ -1204,6 +1204,19 @@ async fn run_worker_job_and_publish(
         "{}",
         serde_json::to_string(&job.result_payload(&best)).context("serialize worker job result")?
     );
+    if config.local_path.is_none() {
+        debug!(
+            job_id = %job.assignment.job_id,
+            input = %job.input_path().display(),
+            "removing completed worker input"
+        );
+        fs::remove_file(job.input_path()).with_context(|| {
+            format!(
+                "remove completed worker input {}",
+                job.input_path().display()
+            )
+        })?;
+    }
     Ok(())
 }
 
