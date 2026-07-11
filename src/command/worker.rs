@@ -2095,7 +2095,7 @@ mod tests {
     use super::*;
     use crate::command::worker_protocol::{
         CancelPayload, ErrorReplyPayload, JobAssignedPayload, ReplyBody, ServerFrame,
-        ServerPushFrame, WorkStatus,
+        ServerPushFrame, TransferAuth, TransferSpec, WorkStatus,
     };
     use crate::{command::crf_search::test_hooks as crf_test_hooks, ffprobe::Ffprobe};
     use anyhow::Result;
@@ -2730,6 +2730,74 @@ mod tests {
         };
         remove_completed_worker_input(&config, &job)?;
         assert!(!input_path.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn worker_job_phase_selects_input_delivery_and_resume_behavior() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ab-av1-worker-phase-{}", std::process::id()));
+        let input_path = root.join("movie.mkv");
+        let make_job = |status, transfer| {
+            WorkerJob::new(
+                JobAssignedPayload {
+                    status,
+                    job_id: "phase-job".into(),
+                    video_id: 123,
+                    source_name: "movie.mkv".into(),
+                    size_bytes: 4,
+                    chunk_size_bytes: 4,
+                    target_vmaf: 95.0,
+                    transfer,
+                    crf_search_args: vec![],
+                },
+                root.clone(),
+                input_path.clone(),
+            )
+        };
+
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            worker_job_phase(&make_job(WorkStatus::JobAssigned, None), None)?,
+            WorkerJobPhase::AwaitingInput(InputDelivery::Websocket)
+        );
+        assert_eq!(
+            worker_job_phase(
+                &make_job(
+                    WorkStatus::JobAssigned,
+                    Some(TransferSpec {
+                        url: "http://server/input".into(),
+                        auth: TransferAuth {
+                            scheme: "Bearer".into(),
+                            header: "authorization".into(),
+                            value: "token".into(),
+                        },
+                    })
+                ),
+                None
+            )?,
+            WorkerJobPhase::AwaitingInput(InputDelivery::Http)
+        );
+        assert_eq!(
+            worker_job_phase(&make_job(WorkStatus::JobInProgress, None), None)?,
+            WorkerJobPhase::AwaitingInput(InputDelivery::Resend)
+        );
+
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"data")?;
+        assert_eq!(
+            worker_job_phase(&make_job(WorkStatus::JobAssigned, None), None)?,
+            WorkerJobPhase::InputReady
+        );
+        assert_eq!(
+            worker_job_phase(&make_job(WorkStatus::JobInProgress, None), None)?,
+            WorkerJobPhase::CrfSearching
+        );
+
+        fs::remove_file(&input_path)?;
+        assert!(
+            worker_job_phase(&make_job(WorkStatus::JobAssigned, None), Some(&input_path)).is_err()
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
