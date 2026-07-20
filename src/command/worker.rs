@@ -1273,36 +1273,38 @@ async fn run_worker_job_and_publish(
     );
     let probe = Arc::new(crate::ffprobe::probe(job.input_path()));
     debug!(job_id = %job.assignment.job_id, "probe complete, running crf search");
-    let outcome = match run_worker_job_with_reporting(config, job.clone(), probe, worker).await {
+    let result = run_worker_job_with_reporting(config, job.clone(), probe, worker).await;
+    crate::temporary::clean_all().await;
+    remove_worker_input(job)?;
+    let outcome = match result {
         Ok(outcome) => outcome,
         Err(error) => {
             publish_worker_failure(worker, job, &error).await;
             return Err(error);
         }
     };
-    if outcome == WorkerJobOutcome::Completed {
-        remove_completed_worker_input(config, job)?;
-    }
     Ok(outcome)
 }
 
-fn remove_completed_worker_input(config: &WorkerConfig, job: &WorkerJob) -> Result<()> {
-    if config.local_path.is_some() {
+fn remove_worker_input(job: &WorkerJob) -> Result<()> {
+    if job.input_dir != worker_job_input_dir(&job.assignment.job_id) {
         return Ok(());
     }
 
     debug!(
         job_id = %job.assignment.job_id,
         input = %job.input_path().display(),
-        "removing completed worker input"
+        "removing worker input"
     );
-    fs::remove_file(job.input_path()).with_context(|| {
-        format!(
-            "remove completed worker input {}",
-            job.input_path().display()
-        )
-    })?;
+    fs::remove_dir_all(&job.input_dir)
+        .with_context(|| format!("remove worker input directory {}", job.input_dir.display()))?;
     Ok(())
+}
+
+fn remove_pending_worker_input(pending_job: &mut Option<PendingJob>) -> Result<()> {
+    pending_job
+        .take()
+        .map_or(Ok(()), |pending| remove_worker_input(&pending.job))
 }
 
 async fn publish_worker_failure(
@@ -1328,6 +1330,16 @@ fn build_worker_job(
     assignment: crate::command::worker_protocol::JobAssignedPayload,
     local_path: Option<&Path>,
 ) -> Result<WorkerJob> {
+    if local_path.is_none()
+        && let Some(input_path) = offered_local_input(&assignment)
+    {
+        return Ok(WorkerJob::new(
+            assignment,
+            std::env::current_dir().context("current working directory")?,
+            input_path,
+        ));
+    }
+
     let input_dir = worker_job_input_dir(&assignment.job_id);
     fs::create_dir_all(&input_dir).context("create worker job dir")?;
     let input_path = local_path
@@ -1335,6 +1347,17 @@ fn build_worker_job(
         .map(Ok)
         .unwrap_or_else(|| worker_job_input_path(&input_dir, &assignment))?;
     Ok(WorkerJob::new(assignment, input_dir, input_path))
+}
+
+fn offered_local_input(
+    assignment: &crate::command::worker_protocol::JobAssignedPayload,
+) -> Option<PathBuf> {
+    let path = assignment
+        .crf_search_args
+        .windows(2)
+        .find_map(|args| (args[0] == "--input").then(|| PathBuf::from(&args[1])))?;
+    let metadata = path.metadata().ok()?;
+    (metadata.is_file() && metadata.len() == assignment.size_bytes).then_some(path)
 }
 
 fn worker_job_input_path(
@@ -1718,7 +1741,7 @@ async fn run_connected_worker(
                 .wait_until_running(control_state, runtime.idle_delay)
                 .await?;
             if stopped {
-                pending_job = None;
+                remove_pending_worker_input(&mut pending_job)?;
             }
         }
 
@@ -1753,7 +1776,7 @@ async fn run_connected_worker(
                     if let Some(job) = pending_job.as_ref() {
                         debug!(job_id = %job.job.assignment.job_id, "pending job canceled");
                     }
-                    pending_job = None;
+                    remove_pending_worker_input(&mut pending_job)?;
                     continue;
                 }
                 PendingJobOutcome::Paused => {
@@ -1761,7 +1784,7 @@ async fn run_connected_worker(
                     continue;
                 }
                 PendingJobOutcome::Stopped => {
-                    pending_job = None;
+                    remove_pending_worker_input(&mut pending_job)?;
                     *control_state = WorkerControlState::Stopped;
                     continue;
                 }
@@ -2778,6 +2801,36 @@ mod tests {
     }
 
     #[test]
+    fn build_worker_job_uses_offered_local_file_when_size_matches() -> Result<()> {
+        let worker_dir = worker_job_input_dir("offered-local");
+        let _ = fs::remove_dir_all(&worker_dir);
+        let root = std::env::temp_dir().join(format!(
+            "ab-av1-worker-offered-local-{}",
+            std::process::id()
+        ));
+        let local_path = root.join("movie.mkv");
+        fs::create_dir_all(&root)?;
+        fs::write(&local_path, b"data")?;
+        let assignment = serde_json::from_value(json!({
+            "status": "job_assigned",
+            "job_id": "offered-local",
+            "video_id": 123,
+            "source_name": "movie.mkv",
+            "local_path": local_path,
+            "size_bytes": 4,
+            "target_vmaf": 96.5,
+            "crf_search_args": ["crf-search", "--input", local_path]
+        }))?;
+
+        let job = build_worker_job(assignment, None)?;
+
+        assert_eq!(job.input_path(), local_path.as_path());
+        assert!(!worker_dir.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn build_worker_job_uses_source_basename_for_worker_file_lookup() -> Result<()> {
         let job_dir = worker_job_input_dir("job-path-source");
         fs::create_dir_all(&job_dir)?;
@@ -2929,9 +2982,9 @@ mod tests {
     }
 
     #[test]
-    fn completed_worker_input_cleanup_respects_local_path() -> Result<()> {
-        let root =
-            std::env::temp_dir().join(format!("ab-av1-worker-cleanup-{}", std::process::id()));
+    fn worker_input_cleanup_removes_owned_directory_only() -> Result<()> {
+        let root = worker_job_input_dir("cleanup-job");
+        let _ = fs::remove_dir_all(&root);
         let input_path = root.join("movie.mkv");
         fs::create_dir_all(&root)?;
         fs::write(&input_path, b"data")?;
@@ -2956,25 +3009,8 @@ mod tests {
             root.clone(),
             input_path.clone(),
         );
-        let config = WorkerConfig {
-            connect: String::new(),
-            token: String::new(),
-            worker_id: String::new(),
-            version: String::new(),
-            protocol_version: 1,
-            once: false,
-            local_path: Some(input_path.clone()),
-        };
-
-        remove_completed_worker_input(&config, &job)?;
-        assert!(input_path.exists());
-        let config = WorkerConfig {
-            local_path: None,
-            ..config
-        };
-        remove_completed_worker_input(&config, &job)?;
-        assert!(!input_path.exists());
-        fs::remove_dir_all(root)?;
+        remove_worker_input(&job)?;
+        assert!(!root.exists());
         Ok(())
     }
 
