@@ -280,14 +280,22 @@ impl WorkerJob {
         } else {
             argv.extend(["--input".into(), input]);
         }
+        let shared_output = self.assignment.output_shared_path.clone();
         if let Some(index) = argv.iter().position(|arg| arg == "--output" || arg == "-o") {
             let value = argv
                 .get_mut(index + 1)
                 .context("encode_args output flag has no value")?;
-            let output_name = Path::new(value)
-                .file_name()
-                .context("encode_args output path has no filename")?;
-            *value = self.input_dir.join(output_name).display().to_string();
+            let output_path = if let Some(shared_output) = shared_output.as_deref() {
+                PathBuf::from(shared_output)
+            } else {
+                let output_name = Path::new(value)
+                    .file_name()
+                    .context("encode_args output path has no filename")?;
+                self.input_dir.join(output_name)
+            };
+            *value = output_path.display().to_string();
+        } else if let Some(shared_output) = shared_output {
+            argv.extend(["--output".into(), shared_output]);
         }
 
         Ok(encode::EncodeConfig::from(encode::Args::try_parse_from(
@@ -3777,6 +3785,7 @@ mod tests {
                 target_vmaf: 0.0,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: None,
                 encode_args: vec![
                     "ab-av1".into(),
                     "encode".into(),
@@ -3795,6 +3804,15 @@ mod tests {
 
         let config = job.encode_config().expect("encode config");
         assert_eq!(config.input(), input.as_path());
+
+        let mut shared_assignment = job.assignment.clone();
+        shared_assignment.output_shared_path = Some("/shared/movie.av1.mkv".into());
+        let shared_job = WorkerJob::new(shared_assignment, std::env::temp_dir(), input);
+        let shared_config = shared_job.encode_config().expect("shared encode config");
+        assert_eq!(
+            shared_config.output(),
+            Some(Path::new("/shared/movie.av1.mkv"))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3859,6 +3877,7 @@ mod tests {
                         value: "token".into(),
                     },
                 }),
+                output_shared_path: None,
                 encode_args: vec![
                     "ab-av1".into(),
                     "encode".into(),
@@ -3919,7 +3938,12 @@ mod tests {
             "ab-av1-multiplex-client-input-{}.mkv",
             std::process::id()
         ));
+        let output = std::env::temp_dir().join(format!(
+            "ab-av1-multiplex-client-output-{}.mkv",
+            std::process::id()
+        ));
         fs::write(&input, b"input-bytes")?;
+        let expected_output = output.display().to_string();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept connection");
             let socket = accept_async(stream).await.expect("accept websocket");
@@ -3948,6 +3972,7 @@ mod tests {
                 target_vmaf: 0.0,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: Some(expected_output.clone()),
                 encode_args: vec![
                     "ab-av1".into(),
                     "encode".into(),
@@ -3976,6 +4001,7 @@ mod tests {
                 };
                 let frame: Value = serde_json::from_str(&text).expect("worker event json");
                 if frame[3] == "encode_completed" {
+                    assert_eq!(frame[4]["output_path"], expected_output);
                     break;
                 }
             }
@@ -4007,6 +4033,7 @@ mod tests {
         result?;
         server.await.expect("encode coordinator");
         let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
         Ok(())
     }
 
@@ -4381,6 +4408,7 @@ mod tests {
             target_vmaf: 96.5,
             transfer: None,
             output_transfer: None,
+            output_shared_path: None,
             encode_args: Vec::new(),
             crf_search_args: vec![
                 "crf-search".into(),
@@ -4411,6 +4439,7 @@ mod tests {
                 target_vmaf: 96.5,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: None,
                 encode_args: Vec::new(),
                 crf_search_args: vec![
                     "crf-search".into(),
@@ -4445,6 +4474,7 @@ mod tests {
             target_vmaf: 96.5,
             transfer: None,
             output_transfer: None,
+            output_shared_path: None,
             encode_args: Vec::new(),
             crf_search_args: vec![
                 "crf-search".into(),
@@ -4512,6 +4542,7 @@ mod tests {
                 target_vmaf: 96.5,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: None,
                 encode_args: Vec::new(),
                 crf_search_args: vec![
                     "crf-search".into(),
@@ -4554,6 +4585,7 @@ mod tests {
                 target_vmaf: 96.5,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: None,
                 encode_args: Vec::new(),
                 crf_search_args: vec![
                     "crf-search".into(),
@@ -4616,6 +4648,7 @@ mod tests {
                 target_vmaf: 95.0,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: None,
                 encode_args: Vec::new(),
                 crf_search_args: vec![
                     "crf-search".into(),
@@ -4672,6 +4705,7 @@ mod tests {
                 target_vmaf: 95.0,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: None,
                 encode_args: Vec::new(),
                 crf_search_args: vec![
                     "crf-search".into(),
@@ -4706,6 +4740,7 @@ mod tests {
                     target_vmaf: 95.0,
                     transfer,
                     output_transfer: None,
+                    output_shared_path: None,
                     encode_args: Vec::new(),
                     crf_search_args: vec![],
                 },
@@ -4774,6 +4809,7 @@ mod tests {
                 target_vmaf: 95.0,
                 transfer: None,
                 output_transfer: None,
+                output_shared_path: None,
                 encode_args: Vec::new(),
                 crf_search_args: vec![
                     "crf-search".into(),
@@ -5184,6 +5220,7 @@ mod tests {
                         target_vmaf: 96.5,
                         transfer: None,
                         output_transfer: None,
+                        output_shared_path: None,
                         encode_args: Vec::new(),
                         crf_search_args: vec![
                             "crf-search".into(),

@@ -386,6 +386,9 @@ pub(crate) struct JobAssignedPayload {
     pub(crate) transfer: Option<TransferSpec>,
     #[serde(default)]
     pub(crate) output_transfer: Option<TransferSpec>,
+    /// A server-visible path for workers sharing the server's filesystem.
+    #[serde(default)]
+    pub(crate) output_shared_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -998,6 +1001,7 @@ mod tests {
                         },
                     }),
                     output_transfer: None,
+                    output_shared_path: None,
                     encode_args: Vec::new(),
                     crf_search_args: vec![
                         "crf-search".into(),
@@ -1054,6 +1058,7 @@ mod tests {
                     target_vmaf: 95.0,
                     transfer: None,
                     output_transfer: None,
+                    output_shared_path: None,
                     encode_args: Vec::new(),
                     crf_search_args: vec![
                         "crf-search".into(),
@@ -1241,13 +1246,18 @@ mod tests {
                     "header": "Authorization",
                     "value": "token"
                 }
-            }
+            },
+            "output_shared_path": "/shared/movie.av1.mkv"
         }))?;
 
         assert_eq!(assignment.job_type, JobKind::Encode);
         assert_eq!(
             assignment.output_transfer.expect("output transfer").url,
             "http://worker-output/upload"
+        );
+        assert_eq!(
+            assignment.output_shared_path.as_deref(),
+            Some("/shared/movie.av1.mkv")
         );
         Ok(())
     }

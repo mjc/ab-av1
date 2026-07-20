@@ -48,6 +48,11 @@ impl EncodeConfig {
     pub(crate) fn input(&self) -> &Path {
         &self.encode.input
     }
+
+    #[cfg(test)]
+    pub(crate) fn output(&self) -> Option<&Path> {
+        self.encode_to.output.as_deref()
+    }
 }
 
 /// Preflight encode configuration: validation and ffmpeg args before any spawn or cleanup.
