@@ -24,6 +24,7 @@ pub(crate) enum ClientEvent {
     Announce(AnnouncePayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
+    ControlState(ControlStatePayload),
     TransferProgress(TransferProgressPayload),
     TransferFailure(TransferFailurePayload),
     CrfSearchProgress(CrfSearchProgressPayload),
@@ -38,6 +39,7 @@ impl ClientEvent {
             Self::Announce(payload) => ("announce", ClientPayload::Announce(payload)),
             Self::PullWork(payload) => ("pull_work", ClientPayload::PullWork(payload)),
             Self::Heartbeat(payload) => ("heartbeat", ClientPayload::Heartbeat(payload)),
+            Self::ControlState(payload) => ("control_state", ClientPayload::ControlState(payload)),
             Self::TransferProgress(payload) => (
                 "transfer_progress",
                 ClientPayload::TransferProgress(payload),
@@ -61,6 +63,7 @@ enum ClientPayload {
     Announce(AnnouncePayload),
     PullWork(PullWorkPayload),
     Heartbeat(HeartbeatPayload),
+    ControlState(ControlStatePayload),
     TransferProgress(TransferProgressPayload),
     TransferFailure(TransferFailurePayload),
     Progress(CrfSearchProgressPayload),
@@ -350,6 +353,37 @@ pub(crate) struct CancelPayload {
     pub(crate) reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControlAction {
+    Pause,
+    Resume,
+    Start,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ControlPayload {
+    pub(crate) action: ControlAction,
+    #[serde(default)]
+    pub(crate) video_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ControlStatePayload {
+    pub(crate) state: ControlState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_video_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControlState {
+    Running,
+    Paused,
+    Stopped,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TransferStartedPayload {
@@ -505,6 +539,28 @@ mod tests {
                     "disk_total_bytes": 16_384,
                     "active_video_id": 123,
                 }
+            ])
+        );
+    }
+
+    #[test]
+    fn control_state_serializes_worker_acknowledgement() {
+        let frame = ClientFrame::new(
+            5,
+            ClientEvent::ControlState(ControlStatePayload {
+                state: ControlState::Paused,
+                active_video_id: Some(123),
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize control state"),
+            json!([
+                "1",
+                "5",
+                "workers:crf_search",
+                "control_state",
+                {"state": "paused", "active_video_id": 123}
             ])
         );
     }
@@ -978,6 +1034,32 @@ mod tests {
                 CancelPayload {
                     job_id: "job-123".into(),
                     reason: "shutdown".into(),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn server_push_parses_worker_control_payload() {
+        let push: ServerPushFrame<ControlPayload> = serde_json::from_value(json!([
+            null,
+            null,
+            "workers:crf_search",
+            "control",
+            {
+                "action": "pause",
+                "video_id": 123
+            }
+        ]))
+        .expect("parse worker control push");
+
+        assert_eq!(
+            push,
+            ServerPushFrame::new(
+                "control",
+                ControlPayload {
+                    action: ControlAction::Pause,
+                    video_id: Some(123),
                 },
             )
         );
