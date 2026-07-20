@@ -2,6 +2,14 @@ use serde::{Deserialize, Serialize, Serializer};
 
 pub(crate) const CRF_SEARCH_TOPIC: &str = "workers:crf_search";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JobKind {
+    #[default]
+    CrfSearch,
+    Encode,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ClientFrame(String, String, String, String, ClientPayload);
 
@@ -18,6 +26,7 @@ impl ClientFrame {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ClientEvent {
     Join,
@@ -29,6 +38,9 @@ pub(crate) enum ClientEvent {
     TransferFailure(TransferFailurePayload),
     CrfSearchProgress(CrfSearchProgressPayload),
     CrfSearchResult(CrfSearchResultPayload),
+    #[cfg_attr(not(test), allow(dead_code))]
+    EncodeProgress(EncodeProgressPayload),
+    EncodeCompleted(EncodeCompletedPayload),
     VideoFailed(FailureReportPayload),
 }
 
@@ -51,6 +63,12 @@ impl ClientEvent {
                 ("crf_search_progress", ClientPayload::Progress(payload))
             }
             Self::CrfSearchResult(payload) => ("crf_search_result", ClientPayload::Result(payload)),
+            Self::EncodeProgress(payload) => {
+                ("encode_progress", ClientPayload::EncodeProgress(payload))
+            }
+            Self::EncodeCompleted(payload) => {
+                ("encode_completed", ClientPayload::EncodeCompleted(payload))
+            }
             Self::VideoFailed(payload) => ("video_failed", ClientPayload::Failure(payload)),
         }
     }
@@ -68,6 +86,8 @@ enum ClientPayload {
     TransferFailure(TransferFailurePayload),
     Progress(CrfSearchProgressPayload),
     Result(CrfSearchResultPayload),
+    EncodeProgress(EncodeProgressPayload),
+    EncodeCompleted(EncodeCompletedPayload),
     Failure(FailureReportPayload),
 }
 
@@ -78,12 +98,15 @@ struct EmptyPayload {}
 pub(crate) struct PullWorkPayload {
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) input_missing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) job_type: Option<JobKind>,
 }
 
 impl PullWorkPayload {
     pub(crate) fn input_missing() -> Self {
         Self {
             input_missing: true,
+            job_type: None,
         }
     }
 }
@@ -105,6 +128,10 @@ pub(crate) struct AnnouncePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Capabilities {
     pub(crate) crf_search: bool,
+    pub(crate) encode: bool,
+    pub(crate) mode: String,
+    pub(crate) logical_cpus: usize,
+    pub(crate) max_active_jobs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -167,6 +194,32 @@ pub(crate) struct CrfSearchResultPayload {
     #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) target: f32,
     pub(crate) chosen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EncodeProgressPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    #[serde(serialize_with = "serialize_rounded_f64")]
+    pub(crate) percent: f64,
+    #[serde(serialize_with = "serialize_rounded_f32")]
+    pub(crate) fps: f32,
+    pub(crate) eta: Option<u64>,
+    pub(crate) output_bytes: u64,
+    #[serde(serialize_with = "serialize_rounded_f64")]
+    pub(crate) output_percent: f64,
+    pub(crate) throughput: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EncodeCompletedPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) source_name: String,
+    pub(crate) output_path: String,
+    pub(crate) output_bytes: u64,
+    #[serde(serialize_with = "serialize_rounded_f64")]
+    pub(crate) output_percent: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +296,7 @@ impl<T> ReplyBody<T> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum ServerReply {
@@ -315,6 +369,8 @@ impl<'de> Deserialize<'de> for NoWorkPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct JobAssignedPayload {
     pub(crate) status: WorkStatus,
+    #[serde(default)]
+    pub(crate) job_type: JobKind,
     pub(crate) job_id: String,
     pub(crate) video_id: u64,
     pub(crate) source_name: String,
@@ -325,7 +381,11 @@ pub(crate) struct JobAssignedPayload {
     #[serde(default)]
     pub(crate) crf_search_args: Vec<String>,
     #[serde(default)]
+    pub(crate) encode_args: Vec<String>,
+    #[serde(default)]
     pub(crate) transfer: Option<TransferSpec>,
+    #[serde(default)]
+    pub(crate) output_transfer: Option<TransferSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +429,8 @@ pub(crate) struct ControlPayload {
     pub(crate) action: ControlAction,
     #[serde(default)]
     pub(crate) video_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,7 +554,13 @@ mod tests {
                 hostname: None,
                 protocol_version: 1,
                 version: "0.11.4".into(),
-                capabilities: Capabilities { crf_search: true },
+                capabilities: Capabilities {
+                    crf_search: true,
+                    encode: false,
+                    mode: "crf-search".into(),
+                    logical_cpus: 8,
+                    max_active_jobs: 1,
+                },
             }),
         );
 
@@ -507,7 +575,13 @@ mod tests {
                     "worker_id": "abav1-dev",
                     "protocol_version": 1,
                     "version": "0.11.4",
-                    "capabilities": { "crf_search": true }
+                    "capabilities": {
+                        "crf_search": true,
+                        "encode": false,
+                        "mode": "crf-search",
+                        "logical_cpus": 8,
+                        "max_active_jobs": 1
+                    }
                 }
             ])
         );
@@ -908,6 +982,7 @@ mod tests {
                 4,
                 ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
                     status: WorkStatus::JobAssigned,
+                    job_type: JobKind::CrfSearch,
                     job_id: "job-123".into(),
                     video_id: 123,
                     source_name: "movie.mkv".into(),
@@ -922,6 +997,8 @@ mod tests {
                             value: "Bearer transfer-token".into(),
                         },
                     }),
+                    output_transfer: None,
+                    encode_args: Vec::new(),
                     crf_search_args: vec![
                         "crf-search".into(),
                         "--input".into(),
@@ -968,6 +1045,7 @@ mod tests {
                 3,
                 ReplyBody::ok(ServerReply::JobAssigned(JobAssignedPayload {
                     status: WorkStatus::JobInProgress,
+                    job_type: JobKind::CrfSearch,
                     job_id: "job-123".into(),
                     video_id: 123,
                     source_name: "movie.mkv".into(),
@@ -975,6 +1053,8 @@ mod tests {
                     chunk_size_bytes: 0,
                     target_vmaf: 95.0,
                     transfer: None,
+                    output_transfer: None,
+                    encode_args: Vec::new(),
                     crf_search_args: vec![
                         "crf-search".into(),
                         "--input".into(),
@@ -1063,6 +1143,7 @@ mod tests {
                 ControlPayload {
                     action: ControlAction::Pause,
                     video_id: Some(123),
+                    job_id: None,
                 },
             )
         );
@@ -1105,6 +1186,39 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PullWorkPayload::input_missing()).expect("serialize pull_work"),
             json!({"input_missing": true})
+        );
+    }
+
+    #[test]
+    fn encode_completion_serializes_job_identity_and_output_metrics() {
+        let frame = ClientFrame::new(
+            7,
+            ClientEvent::EncodeCompleted(EncodeCompletedPayload {
+                job_id: "encode-7".into(),
+                video_id: 42,
+                source_name: "movie.mkv".into(),
+                output_path: "/worker/movie.av1.mkv".into(),
+                output_bytes: 800,
+                output_percent: 40.25,
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize encode completion"),
+            json!([
+                "1",
+                "7",
+                "workers:crf_search",
+                "encode_completed",
+                {
+                    "job_id": "encode-7",
+                    "video_id": 42,
+                    "source_name": "movie.mkv",
+                    "output_path": "/worker/movie.av1.mkv",
+                    "output_bytes": 800,
+                    "output_percent": 40.25
+                }
+            ])
         );
     }
 
