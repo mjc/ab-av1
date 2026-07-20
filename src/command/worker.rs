@@ -134,7 +134,7 @@ pub struct Args {
     local_path: Option<PathBuf>,
 
     /// Job kinds this worker accepts.
-    #[arg(long = "worker-mode", alias = "mode", default_value = "crf-search")]
+    #[arg(long = "worker-mode", alias = "mode", default_value = "both")]
     worker_mode: WorkerMode,
 }
 
@@ -3688,6 +3688,22 @@ mod tests {
             "both",
         ])
         .expect("parse worker mode");
+
+        assert_eq!(args.worker_mode, WorkerMode::Both);
+    }
+
+    #[test]
+    fn args_defaults_to_both_worker_mode() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+        ])
+        .expect("parse default worker mode");
 
         assert_eq!(args.worker_mode, WorkerMode::Both);
     }
