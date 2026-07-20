@@ -1674,6 +1674,14 @@ async fn run_connected_worker(
     let mut worker = Some(ConnectedWorker::connect(config).await?);
     let mut pending_job: Option<PendingJob> = None;
 
+    if *control_state == WorkerControlState::Stopped {
+        worker
+            .as_mut()
+            .expect("connected worker")
+            .send_control_state(ControlState::Stopped, None)
+            .await?;
+    }
+
     loop {
         if *control_state == WorkerControlState::Stopped {
             worker
