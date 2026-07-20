@@ -1223,6 +1223,36 @@ mod tests {
     }
 
     #[test]
+    fn encode_assignment_deserializes_output_delivery_metadata() -> anyhow::Result<()> {
+        let assignment: JobAssignedPayload = serde_json::from_value(json!({
+            "status": "job_assigned",
+            "job_type": "encode",
+            "job_id": "encode-7",
+            "video_id": 42,
+            "source_name": "movie.mkv",
+            "size_bytes": 800,
+            "chunk_size_bytes": 256,
+            "target_vmaf": 0,
+            "encode_args": ["ab-av1", "encode", "--crf", "30"],
+            "output_transfer": {
+                "url": "http://worker-output/upload",
+                "auth": {
+                    "scheme": "Bearer",
+                    "header": "Authorization",
+                    "value": "token"
+                }
+            }
+        }))?;
+
+        assert_eq!(assignment.job_type, JobKind::Encode);
+        assert_eq!(
+            assignment.output_transfer.expect("output transfer").url,
+            "http://worker-output/upload"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn transfer_failure_payload_serializes_stage_and_retry_hint() {
         let payload = TransferFailurePayload {
             job_id: "job-123".into(),

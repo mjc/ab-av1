@@ -21,6 +21,18 @@ pub async fn run_encode(
     sink: &impl ProgressSink,
     spawner: &impl EncodeSpawner,
 ) -> anyhow::Result<EncodeRun> {
+    run_encode_with_progress(plan, sink, spawner, |_fps, _time, _output| {}).await
+}
+
+pub async fn run_encode_with_progress<F>(
+    plan: EncodePlan,
+    sink: &impl ProgressSink,
+    spawner: &impl EncodeSpawner,
+    mut on_progress: F,
+) -> anyhow::Result<EncodeRun>
+where
+    F: FnMut(f32, std::time::Duration, &std::path::Path),
+{
     let (partial, session) = plan.begin();
     let input = session.input.clone();
     let output = partial.path().to_path_buf();
@@ -43,6 +55,7 @@ pub async fn run_encode(
                 sink.set_position(time.as_micros_u64());
                 logger.update(*d, time, fps);
             }
+            on_progress(fps, time, &output);
         }
     }
     enc.wait().await?;

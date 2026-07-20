@@ -280,6 +280,15 @@ impl WorkerJob {
         } else {
             argv.extend(["--input".into(), input]);
         }
+        if let Some(index) = argv.iter().position(|arg| arg == "--output" || arg == "-o") {
+            let value = argv
+                .get_mut(index + 1)
+                .context("encode_args output flag has no value")?;
+            let output_name = Path::new(value)
+                .file_name()
+                .context("encode_args output path has no filename")?;
+            *value = self.input_dir.join(output_name).display().to_string();
+        }
 
         Ok(encode::EncodeConfig::from(encode::Args::try_parse_from(
             argv,
@@ -1181,6 +1190,16 @@ async fn run_multiplex_job(
 ) {
     let job_id = job.assignment.job_id.clone();
     let result = run_multiplex_job_inner(&job, &mut commands, &output).await;
+    if result.is_err()
+        && job.input_dir == worker_job_input_dir(&job.assignment.job_id)
+        && let Err(error) = fs::remove_dir_all(&job.input_dir)
+    {
+        debug!(
+            job_id = %job.assignment.job_id,
+            error = %error,
+            "failed to remove incomplete multiplexed worker job directory"
+        );
+    }
     let outcome = result.map_err(|error| format!("{error:#}"));
     let _ = output.send(MultiplexOutput::Done {
         job_id,
@@ -1476,7 +1495,41 @@ async fn run_multiplex_encode(
         "encode_progress",
     );
 
-    let run = encode::run_worker(config, probe);
+    let duration = probe.duration.as_ref().ok().copied();
+    let input_bytes = fs::metadata(job.input_path())
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    let progress_output = output.clone();
+    let progress_job_id = job.assignment.job_id.clone();
+    let progress_video_id = job.assignment.video_id;
+    let run = encode::run_worker_with_progress(config, probe, move |fps, time, output_path| {
+        let output_bytes = fs::metadata(output_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        let percent = duration.map_or(0.0, |duration| {
+            (100.0 * time.as_secs_f64() / duration.as_secs_f64().max(0.001)).min(100.0)
+        });
+        let output_percent = if input_bytes == 0 {
+            0.0
+        } else {
+            100.0 * output_bytes as f64 / input_bytes as f64
+        };
+        let _ = multiplex_event(
+            &progress_output,
+            &progress_job_id,
+            ClientEvent::EncodeProgress(EncodeProgressPayload {
+                job_id: progress_job_id.clone(),
+                video_id: progress_video_id,
+                percent,
+                fps,
+                eta: None,
+                output_bytes,
+                output_percent,
+                throughput: Some(format!("{fps:.2} fps")),
+            }),
+            "encode_progress",
+        );
+    });
     tokio::pin!(run);
     loop {
         tokio::select! {
@@ -1494,6 +1547,10 @@ async fn run_multiplex_encode(
                     output_percent,
                     throughput: None,
                 };
+                if let Some(transfer) = &job.assignment.output_transfer {
+                    upload_multiplex_output(&output_path, transfer, output_bytes, &job.assignment.job_id)
+                        .await?;
+                }
                 let _ = multiplex_event(
                     output,
                     &job.assignment.job_id,
@@ -1532,6 +1589,34 @@ async fn run_multiplex_encode(
             }
         }
     }
+}
+
+async fn upload_multiplex_output(
+    output_path: &Path,
+    transfer: &crate::command::worker_protocol::TransferSpec,
+    output_bytes: u64,
+    job_id: &str,
+) -> Result<()> {
+    let output_path = output_path.to_path_buf();
+    let transfer = transfer.clone();
+    let job_id = job_id.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = fs::File::open(&output_path).with_context(|| {
+            format!(
+                "open encoded output for upload for job {job_id}: {}",
+                output_path.display()
+            )
+        })?;
+        ureq::put(&transfer.url)
+            .set(&transfer.auth.header, &transfer.auth.value)
+            .set("Content-Length", &output_bytes.to_string())
+            .send(file)
+            .map_err(|error| anyhow!("HTTP output upload failed for job {job_id}: {error}"))?;
+        Ok(())
+    })
+    .await
+    .context("join HTTP output upload task")??;
+    Ok(())
 }
 
 type WorkerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -2680,6 +2765,7 @@ async fn run_multiplexed_worker(
                         &mut no_work,
                         &output,
                         completed_pulls,
+                        config.local_path.as_deref(),
                     ).await?;
                 }
                 _ = reconnect.tick() => {
@@ -2700,6 +2786,7 @@ async fn run_multiplexed_worker(
                             let mut candidate = MultiplexedWorker::from_connected(candidate);
                             if replay_multiplex_jobs(&mut candidate, &jobs).await {
                                 connection = Some(candidate);
+                                jobs.retain(|_, job| !job.finished);
                                 reconnect = tokio::time::interval(runtime.reconnect_base_delay);
                                 reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             }
@@ -2906,6 +2993,7 @@ fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_multiplex_frame(
     worker: &mut MultiplexedWorker,
     frame: Option<std::result::Result<Message, WsError>>,
@@ -2914,6 +3002,7 @@ async fn handle_multiplex_frame(
     no_work: &mut HashMap<JobKind, bool>,
     output: &UnboundedSender<MultiplexOutput>,
     completed_pulls: &mut usize,
+    local_path: Option<&Path>,
 ) -> Result<bool> {
     let Some(frame) = frame else {
         return Ok(false);
@@ -2983,7 +3072,7 @@ async fn handle_multiplex_frame(
                                     .map_err(|_| anyhow!("worker input command channel closed"))?;
                             }
                         } else {
-                            let job = build_worker_job(assignment, None)?;
+                            let job = build_worker_job(assignment, local_path)?;
                             let job_id = job.assignment.job_id.clone();
                             let (command, commands) = mpsc::unbounded_channel();
                             let _ = multiplex_event(
@@ -3475,7 +3564,10 @@ mod tests {
     use crate::{command::crf_search::test_hooks as crf_test_hooks, ffprobe::Ffprobe};
     use anyhow::Result;
     use serde_json::{Value, json};
-    use std::sync::Arc;
+    use std::{
+        io::{Read, Write},
+        sync::Arc,
+    };
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -3629,6 +3721,32 @@ mod tests {
     }
 
     #[test]
+    fn both_scheduler_prefers_crf_then_uses_encode_slot() {
+        let jobs = HashMap::new();
+        let pending = HashMap::new();
+        let no_work = HashMap::new();
+        assert_eq!(
+            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            Some(JobKind::CrfSearch)
+        );
+
+        let mut no_work = HashMap::new();
+        no_work.insert(JobKind::CrfSearch, true);
+        assert_eq!(
+            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            Some(JobKind::Encode)
+        );
+
+        let mut pending = HashMap::new();
+        pending.insert("crf-pull".into(), (JobKind::CrfSearch, None));
+        let no_work = HashMap::new();
+        assert_eq!(
+            next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
+            Some(JobKind::Encode)
+        );
+    }
+
+    #[test]
     fn encode_assignment_replaces_server_input_with_worker_path() {
         let input = std::env::temp_dir().join("worker-local-input.mkv");
         let job = WorkerJob::new(
@@ -3661,6 +3779,219 @@ mod tests {
 
         let config = job.encode_config().expect("encode config");
         assert_eq!(config.input(), input.as_path());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn encode_uploads_output_before_reporting_completion() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<Vec<u8>> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .context("missing HTTP request header terminator")?
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .context("missing output content length")?
+                .parse::<usize>()?;
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+            Ok(request[header_end..header_end + content_length].to_vec())
+        });
+
+        let input_dir =
+            std::env::temp_dir().join(format!("ab-av1-multiplex-encode-{}", std::process::id()));
+        fs::create_dir_all(&input_dir)?;
+        let input = input_dir.join("movie.mkv");
+        fs::write(&input, b"input-bytes")?;
+        crate::command::encode::test_hooks::set_fixture("stderr-ffmpeg-progress");
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id: "upload-job".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 11,
+                chunk_size_bytes: 1,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: Some(TransferSpec {
+                    url: format!("http://{address}"),
+                    auth: TransferAuth {
+                        scheme: "Bearer".into(),
+                        header: "Authorization".into(),
+                        value: "token".into(),
+                    },
+                }),
+                encode_args: vec![
+                    "ab-av1".into(),
+                    "encode".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--output".into(),
+                    "/server/movie.av1.mkv".into(),
+                    "--crf".into(),
+                    "30".into(),
+                ],
+                crf_search_args: Vec::new(),
+            },
+            input_dir.clone(),
+            input,
+        );
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        let (_commands, mut commands) = mpsc::unbounded_channel();
+        let result = run_multiplex_encode(
+            &job,
+            Arc::new(Ffprobe {
+                duration: Ok(Duration::from_secs(120)),
+                has_audio: false,
+                max_audio_channels: None,
+                fps: Ok(24.0),
+                resolution: Some((1920, 1080)),
+                is_image: false,
+                pix_fmt: Some("yuv420p".into()),
+            }),
+            &mut commands,
+            &output,
+        )
+        .await;
+        crate::command::encode::test_hooks::clear();
+        result?;
+        let uploaded = server.join().expect("upload server thread")?;
+        assert!(!uploaded.is_empty());
+        let mut completed = false;
+        while let Ok(item) = outputs.try_recv() {
+            if matches!(
+                item,
+                MultiplexOutput::Event {
+                    event: ClientEvent::EncodeCompleted(_),
+                    ..
+                }
+            ) {
+                completed = true;
+            }
+        }
+        assert!(completed, "completion must follow successful upload");
+        let _ = fs::remove_dir_all(input_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_accepts_and_completes_encode_assignment() -> Result<()> {
+        let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
+        let input = std::env::temp_dir().join(format!(
+            "ab-av1-multiplex-client-input-{}.mkv",
+            std::process::id()
+        ));
+        fs::write(&input, b"input-bytes")?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let socket = accept_async(stream).await.expect("accept websocket");
+            let (mut writer, mut reader) = socket.split();
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce_for_mode(&mut reader, 1, WorkerMode::Encode).await;
+            send_announce_reply(&mut writer).await;
+            expect_pull_work_payload(
+                &mut reader,
+                3,
+                PullWorkPayload {
+                    input_missing: false,
+                    job_type: Some(JobKind::Encode),
+                },
+            )
+            .await;
+            let assignment = JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id: "e2e-encode-job".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 11,
+                chunk_size_bytes: 1,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: None,
+                encode_args: vec![
+                    "ab-av1".into(),
+                    "encode".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--output".into(),
+                    "/server/movie.av1.mkv".into(),
+                    "--crf".into(),
+                    "30".into(),
+                ],
+                crf_search_args: Vec::new(),
+            };
+            writer
+                .send(Message::Text(
+                    serde_json::to_string(&ServerFrame::reply(
+                        3,
+                        ReplyBody::ok(ServerReply::JobAssigned(assignment)),
+                    ))
+                    .expect("encode assignment json"),
+                ))
+                .await
+                .expect("send encode assignment");
+            loop {
+                let Some(Ok(Message::Text(text))) = reader.next().await else {
+                    break;
+                };
+                let frame: Value = serde_json::from_str(&text).expect("worker event json");
+                if frame[3] == "encode_completed" {
+                    break;
+                }
+            }
+        });
+        crate::command::encode::test_hooks::set_fixture("stderr-ffmpeg-progress");
+        let config = WorkerConfig {
+            connect: format!("http://{address}"),
+            token: "test-worker-token".into(),
+            worker_id: "abav1-dev".into(),
+            version: "0.11.4".into(),
+            protocol_version: 1,
+            once: false,
+            local_path: Some(input.clone()),
+            worker_mode: WorkerMode::Encode,
+        };
+        let local = tokio::task::LocalSet::new();
+        let result = local
+            .run_until(run_worker_until(
+                &config,
+                WorkerRuntime {
+                    idle_delay: Duration::from_millis(10),
+                    reconnect_base_delay: Duration::from_millis(10),
+                    reconnect_max_delay: Duration::from_millis(10),
+                    max_pulls: Some(1),
+                },
+            ))
+            .await;
+        crate::command::encode::test_hooks::clear();
+        result?;
+        server.await.expect("encode coordinator");
+        let _ = fs::remove_file(input);
+        Ok(())
     }
 
     #[test]
@@ -4655,6 +4986,14 @@ mod tests {
         R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
             + Unpin,
     {
+        expect_announce_for_mode(reader, protocol_version, WorkerMode::CrfSearch).await;
+    }
+
+    async fn expect_announce_for_mode<R>(reader: &mut R, protocol_version: u64, mode: WorkerMode)
+    where
+        R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
         let message = reader
             .next()
             .await
@@ -4670,9 +5009,15 @@ mod tests {
         assert_eq!(frame[4]["worker_id"], "abav1-dev");
         assert_eq!(frame[4]["protocol_version"], protocol_version);
         assert_eq!(frame[4]["version"], "0.11.4");
-        assert_eq!(frame[4]["capabilities"]["crf_search"], true);
-        assert_eq!(frame[4]["capabilities"]["encode"], false);
-        assert_eq!(frame[4]["capabilities"]["mode"], "crf-search");
+        assert_eq!(
+            frame[4]["capabilities"]["crf_search"],
+            matches!(mode, WorkerMode::CrfSearch | WorkerMode::Both)
+        );
+        assert_eq!(
+            frame[4]["capabilities"]["encode"],
+            matches!(mode, WorkerMode::Encode | WorkerMode::Both)
+        );
+        assert_eq!(frame[4]["capabilities"]["mode"], mode.as_str());
         assert_eq!(
             frame[4]["capabilities"]["logical_cpus"],
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
