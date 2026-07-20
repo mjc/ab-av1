@@ -248,6 +248,7 @@ enum WorkerJobOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerControlState {
     Running,
+    Paused,
     Stopped,
 }
 
@@ -449,6 +450,7 @@ async fn run_worker_job_with_reporting(
     let mut reconnect = tokio::time::interval(Duration::from_secs(5));
     reconnect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut completed_best = None;
+    let mut paused = false;
 
     loop {
         match worker.as_mut() {
@@ -507,6 +509,7 @@ async fn run_worker_job_with_reporting(
                                         match control.action {
                                             ControlAction::Pause => {
                                                 crate::process::managed::pause_active_processes()?;
+                                                paused = true;
                                                 current_worker.send_control_state(
                                                     ControlState::Paused,
                                                     Some(job.assignment.video_id),
@@ -514,6 +517,7 @@ async fn run_worker_job_with_reporting(
                                             }
                                             ControlAction::Resume | ControlAction::Start => {
                                                 crate::process::managed::resume_active_processes()?;
+                                                paused = false;
                                                 current_worker.send_control_state(
                                                     ControlState::Running,
                                                     Some(job.assignment.video_id),
@@ -547,7 +551,7 @@ async fn run_worker_job_with_reporting(
                             }
                         }
                     }
-                    update = run.next() => {
+                    update = run.next(), if !paused => {
                         let (best, disconnected) = handle_crf_update(
                             &job,
                             &mut state,
@@ -576,6 +580,12 @@ async fn run_worker_job_with_reporting(
                         match ConnectedWorker::connect(config).await {
                             Ok(mut reconnected) => {
                                 if replay_worker_state(&mut reconnected, &state).await {
+                                    if paused {
+                                        reconnected.send_control_state(
+                                            ControlState::Paused,
+                                            Some(job.assignment.video_id),
+                                        ).await?;
+                                    }
                                     *worker = Some(reconnected);
                                     if completed_best.take().is_some() {
                                         return Ok(WorkerJobOutcome::Completed);
@@ -587,7 +597,7 @@ async fn run_worker_job_with_reporting(
                             }
                         }
                     }
-                    update = run.next() => {
+                    update = run.next(), if !paused => {
                         let (best, _) = handle_crf_update(
                             &job,
                             &mut state,
@@ -885,6 +895,7 @@ enum PendingJobOutcome {
     Waiting,
     Ready,
     Canceled,
+    Paused,
     Stopped,
 }
 
@@ -1109,7 +1120,7 @@ impl ConnectedWorker {
                                         ControlState::Paused,
                                         Some(pending_job.job.assignment.video_id),
                                     ).await?;
-                                    Ok(PendingJobOutcome::Waiting)
+                                    Ok(PendingJobOutcome::Paused)
                                 }
                                 ControlAction::Resume | ControlAction::Start => {
                                     self.send_control_state(
@@ -1198,7 +1209,12 @@ impl ConnectedWorker {
         }
     }
 
-    async fn wait_until_started(&mut self, idle_delay: Duration) -> Result<()> {
+    async fn wait_until_running(
+        &mut self,
+        control_state: &mut WorkerControlState,
+        idle_delay: Duration,
+    ) -> Result<bool> {
+        let mut stopped = *control_state == WorkerControlState::Stopped;
         loop {
             tokio::select! {
                 frame = self.socket.next() => match frame {
@@ -1213,10 +1229,17 @@ impl ConnectedWorker {
                             match control.action {
                                 ControlAction::Start | ControlAction::Resume => {
                                     self.send_control_state(ControlState::Running, None).await?;
-                                    return Ok(());
+                                    *control_state = WorkerControlState::Running;
+                                    return Ok(stopped);
+                                }
+                                ControlAction::Pause if !stopped => {
+                                    self.send_control_state(ControlState::Paused, None).await?;
+                                    *control_state = WorkerControlState::Paused;
                                 }
                                 ControlAction::Pause | ControlAction::Stop => {
                                     self.send_control_state(ControlState::Stopped, None).await?;
+                                    *control_state = WorkerControlState::Stopped;
+                                    stopped = true;
                                 }
                             }
                         }
@@ -1674,22 +1697,29 @@ async fn run_connected_worker(
     let mut worker = Some(ConnectedWorker::connect(config).await?);
     let mut pending_job: Option<PendingJob> = None;
 
-    if *control_state == WorkerControlState::Stopped {
+    if *control_state != WorkerControlState::Running {
+        let reported_state = match control_state {
+            WorkerControlState::Paused => ControlState::Paused,
+            WorkerControlState::Stopped => ControlState::Stopped,
+            WorkerControlState::Running => unreachable!(),
+        };
         worker
             .as_mut()
             .expect("connected worker")
-            .send_control_state(ControlState::Stopped, None)
+            .send_control_state(reported_state, None)
             .await?;
     }
 
     loop {
-        if *control_state == WorkerControlState::Stopped {
-            worker
+        if *control_state != WorkerControlState::Running {
+            let stopped = worker
                 .as_mut()
                 .expect("connected worker")
-                .wait_until_started(runtime.idle_delay)
+                .wait_until_running(control_state, runtime.idle_delay)
                 .await?;
-            *control_state = WorkerControlState::Running;
+            if stopped {
+                pending_job = None;
+            }
         }
 
         if pending_job.is_some() {
@@ -1724,6 +1754,10 @@ async fn run_connected_worker(
                         debug!(job_id = %job.job.assignment.job_id, "pending job canceled");
                     }
                     pending_job = None;
+                    continue;
+                }
+                PendingJobOutcome::Paused => {
+                    *control_state = WorkerControlState::Paused;
                     continue;
                 }
                 PendingJobOutcome::Stopped => {
@@ -1764,6 +1798,8 @@ async fn run_connected_worker(
                     worker_ref
                         .send_control_state(ControlState::Paused, None)
                         .await?;
+                    *control_state = WorkerControlState::Paused;
+                    continue;
                 }
                 ControlAction::Resume | ControlAction::Start => {
                     worker_ref
@@ -2391,6 +2427,52 @@ mod tests {
                 json!({"state": "stopped"})
             );
             send_control_push(&mut writer, ControlAction::Start, None).await;
+            assert_eq!(
+                expect_client_event(&mut reader, 5, "control_state").await,
+                json!({"state": "running"})
+            );
+            expect_pull_work(&mut reader, 6).await;
+            send_no_work_reply(&mut writer, 6).await;
+        });
+
+        run_worker_until(
+            &FakeCoordinator {
+                address,
+                server: tokio::spawn(async {}),
+            }
+            .worker_config(WorkerTestConfig::continuous()),
+            WorkerRuntime {
+                idle_delay: Duration::from_secs(30),
+                reconnect_base_delay: Duration::from_millis(1),
+                reconnect_max_delay: Duration::from_millis(1),
+                max_pulls: Some(1),
+            },
+        )
+        .await?;
+        server.await.expect("server task");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn paused_worker_waits_for_resume_before_pulling_again() -> Result<()> {
+        let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let socket = accept_async(stream).await.expect("accept websocket");
+            let (mut writer, mut reader) = socket.split();
+
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce(&mut reader, 1).await;
+            send_announce_reply(&mut writer).await;
+            expect_pull_work(&mut reader, 3).await;
+            send_control_push(&mut writer, ControlAction::Pause, None).await;
+            send_no_work_reply(&mut writer, 3).await;
+            assert_eq!(
+                expect_client_event(&mut reader, 4, "control_state").await,
+                json!({"state": "paused"})
+            );
+            send_control_push(&mut writer, ControlAction::Resume, None).await;
             assert_eq!(
                 expect_client_event(&mut reader, 5, "control_state").await,
                 json!({"state": "running"})
