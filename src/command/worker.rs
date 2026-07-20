@@ -799,8 +799,8 @@ impl Default for WorkerRuntime {
     fn default() -> Self {
         Self {
             idle_delay: Duration::from_secs(5),
-            reconnect_base_delay: Duration::ZERO,
-            reconnect_max_delay: Duration::ZERO,
+            reconnect_base_delay: Duration::from_secs(1),
+            reconnect_max_delay: Duration::from_secs(30),
             max_pulls: None,
         }
     }
@@ -3063,6 +3063,14 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_millis(800));
         assert_eq!(backoff.next_delay(), Duration::from_millis(1_000));
         assert_eq!(backoff.next_delay(), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn worker_runtime_defaults_back_off_reconnects() {
+        let runtime = WorkerRuntime::default();
+
+        assert_eq!(runtime.reconnect_base_delay, Duration::from_secs(1));
+        assert_eq!(runtime.reconnect_max_delay, Duration::from_secs(30));
     }
 
     #[test]
