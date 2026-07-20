@@ -4,7 +4,18 @@
 )]
 
 use anyhow::bail;
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
+#[cfg(unix)]
+use std::collections::HashSet;
+#[cfg(unix)]
+use std::io;
 use std::process::{ExitStatus, Output};
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio_process_tools::{Chunk, visitors::inspect::InspectChunks};
@@ -20,6 +31,14 @@ use tokio_stream::Stream;
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_millis(25);
 const DEFAULT_STDERR_LIMIT: usize = 32_768;
+
+#[cfg(unix)]
+static ACTIVE_PROCESS_GROUPS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+
+#[cfg(unix)]
+fn active_process_groups() -> &'static Mutex<HashSet<i32>> {
+    ACTIVE_PROCESS_GROUPS.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ManagedProcessOptions {
@@ -56,6 +75,20 @@ pub struct ManagedProcess {
         SingleSubscriberOutputStream<LossyWithoutBackpressure, ReplayEnabled>,
     >,
     options: ManagedProcessOptions,
+    #[cfg(unix)]
+    process_group: Option<i32>,
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            active_process_groups()
+                .lock()
+                .expect("active process groups lock")
+                .remove(&process_group);
+        }
+    }
 }
 
 /// Process policy for streams that must run through process completion.
@@ -186,7 +219,21 @@ impl ManagedProcess {
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .spawn()?;
-        Ok(Self { handle, options })
+        #[cfg(unix)]
+        let process_group = handle.id().map(|pid| pid as i32);
+        #[cfg(unix)]
+        if let Some(process_group) = process_group {
+            active_process_groups()
+                .lock()
+                .expect("active process groups lock")
+                .insert(process_group);
+        }
+        Ok(Self {
+            handle,
+            options,
+            #[cfg(unix)]
+            process_group,
+        })
     }
 
     fn graceful_shutdown_for(options: ManagedProcessOptions) -> GracefulShutdown {
@@ -329,6 +376,37 @@ impl ManagedProcess {
         self.handle.id()
     }
 
+    #[cfg(unix)]
+    pub fn pause(&mut self) -> anyhow::Result<()> {
+        self.send_process_group_signal("SIGSTOP", Signal::SIGSTOP)
+    }
+
+    #[cfg(unix)]
+    pub fn resume(&mut self) -> anyhow::Result<()> {
+        self.send_process_group_signal("SIGCONT", Signal::SIGCONT)
+    }
+
+    #[cfg(unix)]
+    fn send_process_group_signal(
+        &mut self,
+        signal_name: &'static str,
+        signal: Signal,
+    ) -> anyhow::Result<()> {
+        self.handle
+            .send_signal_with_reaper(
+                signal_name,
+                |handle| {
+                    let pid = handle.id().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "managed process already exited")
+                    })?;
+                    killpg(Pid::from_raw(pid as i32), signal)
+                        .map_err(|error| io::Error::from_raw_os_error(error as i32))
+                },
+                |_| Ok(None),
+            )
+            .map_err(Into::into)
+    }
+
     pub async fn terminate_after(mut self, timeout: Duration) -> anyhow::Result<ExitStatus> {
         Ok(self
             .handle
@@ -342,6 +420,33 @@ impl ManagedProcess {
             .await?
             .into_result())
     }
+}
+
+#[cfg(unix)]
+pub fn pause_active_processes() -> anyhow::Result<()> {
+    signal_active_processes(Signal::SIGSTOP)
+}
+
+#[cfg(unix)]
+pub fn resume_active_processes() -> anyhow::Result<()> {
+    signal_active_processes(Signal::SIGCONT)
+}
+
+#[cfg(unix)]
+fn signal_active_processes(signal: Signal) -> anyhow::Result<()> {
+    let groups = active_process_groups()
+        .lock()
+        .expect("active process groups lock")
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    for group in groups {
+        match killpg(Pid::from_raw(group), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn managed_event_from_stream_event(event: StreamEvent) -> anyhow::Result<Option<ManagedEvent>> {
@@ -459,6 +564,7 @@ mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use std::{
         env,
         sync::{Arc, Mutex},
@@ -909,5 +1015,31 @@ mod tests {
             !status.success(),
             "timeout termination should return the child terminal status"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_process_pauses_and_resumes_process_group() -> anyhow::Result<()> {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let process = ManagedProcess::spawn("pause-resume-fixture", command)?;
+        let pid = process.id().expect("fixture process id");
+
+        pause_active_processes()?;
+        assert_eq!(linux_process_state(pid)?, 'T');
+
+        resume_active_processes()?;
+        assert_ne!(linux_process_state(pid)?, 'T');
+
+        process.terminate_after(Duration::ZERO).await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_state(pid: u32) -> anyhow::Result<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.chars().next())
+            .context("read Linux process state")
     }
 }

@@ -27,6 +27,7 @@ indicatif = "0.18"
 infer = { version = "0.19", default-features = false }
 crc32fast = "1"
 log = "0.4.21"
+nix = { version = "0.31", features = ["process", "signal"] }
 pin-project-lite = "0.2.16"
 same-file = "1.0.6"
 serde = { version = "1.0.185", features = ["derive"] }

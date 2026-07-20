@@ -23,6 +23,7 @@ dependencies = [
  "indicatif",
  "infer",
  "log",
+ "nix",
  "pin-project-lite",
  "proptest",
  "rstest",
