@@ -960,6 +960,7 @@ impl ConnectedWorker {
                 2,
                 ClientEvent::Announce(AnnouncePayload {
                     worker_id: config.worker_id.clone(),
+                    hostname: local_hostname(),
                     protocol_version: config.protocol_version,
                     version: config.version.clone(),
                     capabilities: Capabilities { crf_search: true },
@@ -1254,6 +1255,15 @@ impl ConnectedWorker {
             }
         }
     }
+}
+
+fn local_hostname() -> Option<String> {
+    std::env::var("HOSTNAME").ok().or_else(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|hostname| hostname.trim().to_owned())
+            .filter(|hostname| !hostname.is_empty())
+    })
 }
 
 fn format_bytes_per_second(bytes_per_second: u64) -> String {
@@ -3331,6 +3341,7 @@ mod tests {
                 2,
                 ClientEvent::Announce(AnnouncePayload {
                     worker_id: "abav1-dev".into(),
+                    hostname: local_hostname(),
                     protocol_version,
                     version: "0.11.4".into(),
                     capabilities: Capabilities { crf_search: true },

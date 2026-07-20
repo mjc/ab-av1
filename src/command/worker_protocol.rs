@@ -95,6 +95,8 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AnnouncePayload {
     pub(crate) worker_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hostname: Option<String>,
     pub(crate) protocol_version: u64,
     pub(crate) version: String,
     pub(crate) capabilities: Capabilities,
@@ -487,6 +489,7 @@ mod tests {
             2,
             ClientEvent::Announce(AnnouncePayload {
                 worker_id: "abav1-dev".into(),
+                hostname: None,
                 protocol_version: 1,
                 version: "0.11.4".into(),
                 capabilities: Capabilities { crf_search: true },
