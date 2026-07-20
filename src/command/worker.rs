@@ -1,9 +1,9 @@
 use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent, ClientFrame,
-    CrfSearchProgressPayload, CrfSearchResultPayload, ErrorReplyPayload, FailureReportPayload,
-    HeartbeatPayload, PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply,
-    TransferFailurePayload, TransferProgressPayload, TransferStage, TransferStartedPayload,
-    WorkStatus,
+    ControlAction, ControlPayload, ControlState, ControlStatePayload, CrfSearchProgressPayload,
+    CrfSearchResultPayload, ErrorReplyPayload, FailureReportPayload, HeartbeatPayload,
+    PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply, TransferFailurePayload,
+    TransferProgressPayload, TransferStage, TransferStartedPayload, WorkStatus,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, sample_encode};
@@ -239,6 +239,18 @@ struct WorkerJobReportState {
     crf_results: Vec<CrfSearchResultPayload>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerJobOutcome {
+    Completed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerControlState {
+    Running,
+    Stopped,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct PendingJob {
@@ -428,7 +440,7 @@ async fn run_worker_job_with_reporting(
     job: WorkerJob,
     probe: Arc<Ffprobe>,
     worker: &mut Option<ConnectedWorker>,
-) -> Result<crf_search::Sample> {
+) -> Result<WorkerJobOutcome> {
     let crf_config = job.crf_search_config()?;
     let mut run = std::pin::pin!(crf_search::run(crf_config, probe));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -488,6 +500,35 @@ async fn run_worker_job_with_reporting(
                                             cancel.job_id, cancel.reason
                                         ));
                                     }
+                                    Some(WorkerPush::Control(control))
+                                        if control.video_id.is_none()
+                                            || control.video_id == Some(job.assignment.video_id) =>
+                                    {
+                                        match control.action {
+                                            ControlAction::Pause => {
+                                                crate::process::managed::pause_active_processes()?;
+                                                current_worker.send_control_state(
+                                                    ControlState::Paused,
+                                                    Some(job.assignment.video_id),
+                                                ).await?;
+                                            }
+                                            ControlAction::Resume | ControlAction::Start => {
+                                                crate::process::managed::resume_active_processes()?;
+                                                current_worker.send_control_state(
+                                                    ControlState::Running,
+                                                    Some(job.assignment.video_id),
+                                                ).await?;
+                                            }
+                                            ControlAction::Stop => {
+                                                crate::process::managed::resume_active_processes()?;
+                                                current_worker.send_control_state(
+                                                    ControlState::Stopped,
+                                                    None,
+                                                ).await?;
+                                                return Ok(WorkerJobOutcome::Stopped);
+                                            }
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -520,7 +561,7 @@ async fn run_worker_job_with_reporting(
                             if disconnected || worker.is_none() {
                                 completed_best = Some(best);
                             } else {
-                                return Ok(best);
+                                return Ok(WorkerJobOutcome::Completed);
                             }
                         }
                     }
@@ -536,8 +577,8 @@ async fn run_worker_job_with_reporting(
                             Ok(mut reconnected) => {
                                 if replay_worker_state(&mut reconnected, &state).await {
                                     *worker = Some(reconnected);
-                                    if let Some(best) = completed_best.take() {
-                                        return Ok(best);
+                                    if completed_best.take().is_some() {
+                                        return Ok(WorkerJobOutcome::Completed);
                                     }
                                 }
                             }
@@ -844,11 +885,13 @@ enum PendingJobOutcome {
     Waiting,
     Ready,
     Canceled,
+    Stopped,
 }
 
 #[derive(Debug)]
 enum WorkerPush {
     Cancel(CancelPayload),
+    Control(ControlPayload),
     Started(TransferStartedPayload),
 }
 
@@ -871,6 +914,7 @@ struct ConnectedWorker {
     negotiated_protocol_version: u64,
     next_ref: u64,
     socket: WorkerSocket,
+    pending_control: Option<ControlAction>,
 }
 
 impl ConnectedWorker {
@@ -922,6 +966,7 @@ impl ConnectedWorker {
             negotiated_protocol_version: announce.protocol_version,
             next_ref: 3,
             socket,
+            pending_control: None,
         })
     }
 
@@ -940,13 +985,53 @@ impl ConnectedWorker {
         );
 
         send_json(&mut self.socket, frame).await?;
-        expect_reply(&mut self.socket, &request_ref.to_string(), "pull_work").await
+        let expected_ref = request_ref.to_string();
+        while let Some(message) = self.socket.next().await {
+            match message.context("read websocket message")? {
+                Message::Text(text) => {
+                    if let Some(WorkerPush::Control(control)) = decode_worker_push(&text)? {
+                        self.pending_control = Some(control.action);
+                        continue;
+                    }
+                    if let Some(reply) = decode_expected_reply(&text, &expected_ref, "pull_work")? {
+                        return reply;
+                    }
+                }
+                Message::Ping(payload) => {
+                    self.socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .context("send websocket pong")?;
+                }
+                Message::Close(frame) => {
+                    bail!("websocket closed while waiting for work: {frame:?}")
+                }
+                Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+            }
+        }
+        bail!("websocket ended while waiting for work")
+    }
+
+    fn take_pending_control(&mut self) -> Option<ControlAction> {
+        self.pending_control.take()
     }
 
     async fn send_event(&mut self, event: ClientEvent) -> Result<()> {
         let request_ref = self.next_ref;
         self.next_ref += 1;
         send_json(&mut self.socket, ClientFrame::new(request_ref, event)).await
+    }
+
+    async fn send_control_state(
+        &mut self,
+        state: ControlState,
+        active_video_id: Option<u64>,
+    ) -> Result<()> {
+        self.send_event(ClientEvent::ControlState(ControlStatePayload {
+            state,
+            active_video_id,
+        }))
+        .await
     }
 
     async fn send_transfer_progress(&mut self, payload: TransferProgressPayload) -> Result<()> {
@@ -1014,6 +1099,26 @@ impl ConnectedWorker {
                                 );
                                 Ok(PendingJobOutcome::Waiting)
                             }
+                            Some(WorkerPush::Control(control)) => match control.action {
+                                ControlAction::Stop => {
+                                    self.send_control_state(ControlState::Stopped, None).await?;
+                                    Ok(PendingJobOutcome::Stopped)
+                                }
+                                ControlAction::Pause => {
+                                    self.send_control_state(
+                                        ControlState::Paused,
+                                        Some(pending_job.job.assignment.video_id),
+                                    ).await?;
+                                    Ok(PendingJobOutcome::Waiting)
+                                }
+                                ControlAction::Resume | ControlAction::Start => {
+                                    self.send_control_state(
+                                        ControlState::Running,
+                                        Some(pending_job.job.assignment.video_id),
+                                    ).await?;
+                                    Ok(PendingJobOutcome::Waiting)
+                                }
+                            },
                             Some(_) => Ok(PendingJobOutcome::Waiting),
                             None => Ok(PendingJobOutcome::Waiting),
                         }
@@ -1092,6 +1197,40 @@ impl ConnectedWorker {
             }
         }
     }
+
+    async fn wait_until_started(&mut self, idle_delay: Duration) -> Result<()> {
+        loop {
+            tokio::select! {
+                frame = self.socket.next() => match frame {
+                    Some(Ok(Message::Ping(payload))) => {
+                        self.socket.send(Message::Pong(payload)).await.context("send websocket pong")?;
+                    }
+                    Some(Ok(Message::Pong(_)))
+                    | Some(Ok(Message::Binary(_)))
+                    | Some(Ok(Message::Frame(_))) => {}
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(WorkerPush::Control(control)) = decode_worker_push(&text)? {
+                            match control.action {
+                                ControlAction::Start | ControlAction::Resume => {
+                                    self.send_control_state(ControlState::Running, None).await?;
+                                    return Ok(());
+                                }
+                                ControlAction::Pause | ControlAction::Stop => {
+                                    self.send_control_state(ControlState::Stopped, None).await?;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(frame))) => bail!("websocket closed while worker stopped: {frame:?}"),
+                    Some(Err(error)) => return Err(error).context("read websocket message while worker stopped"),
+                    None => bail!("websocket ended while worker stopped"),
+                },
+                _ = tokio::time::sleep(idle_delay) => {
+                    self.send_event(ClientEvent::Heartbeat(heartbeat_payload(Path::new("."), None))).await?;
+                }
+            }
+        }
+    }
 }
 
 fn format_bytes_per_second(bytes_per_second: u64) -> String {
@@ -1103,7 +1242,7 @@ async fn run_worker_job_and_publish(
     config: &WorkerConfig,
     worker: &mut Option<ConnectedWorker>,
     job: &WorkerJob,
-) -> Result<()> {
+) -> Result<WorkerJobOutcome> {
     debug!(
         job_id = %job.assignment.job_id,
         input = %job.input_path().display(),
@@ -1111,15 +1250,17 @@ async fn run_worker_job_and_publish(
     );
     let probe = Arc::new(crate::ffprobe::probe(job.input_path()));
     debug!(job_id = %job.assignment.job_id, "probe complete, running crf search");
-    match run_worker_job_with_reporting(config, job.clone(), probe, worker).await {
-        Ok(_) => {}
+    let outcome = match run_worker_job_with_reporting(config, job.clone(), probe, worker).await {
+        Ok(outcome) => outcome,
         Err(error) => {
             publish_worker_failure(worker, job, &error).await;
             return Err(error);
         }
+    };
+    if outcome == WorkerJobOutcome::Completed {
+        remove_completed_worker_input(config, job)?;
     }
-    remove_completed_worker_input(config, job)?;
-    Ok(())
+    Ok(outcome)
 }
 
 fn remove_completed_worker_input(config: &WorkerConfig, job: &WorkerJob) -> Result<()> {
@@ -1414,11 +1555,13 @@ pub async fn worker(config: WorkerConfig) -> Result<()> {
 
 async fn run_worker_until(config: &WorkerConfig, runtime: WorkerRuntime) -> Result<()> {
     let mut completed_pulls = 0usize;
+    let mut control_state = WorkerControlState::Running;
     let mut reconnect_backoff =
         ReconnectBackoff::new(runtime.reconnect_base_delay, runtime.reconnect_max_delay);
 
     loop {
-        match run_connected_worker(config, runtime, &mut completed_pulls).await {
+        match run_connected_worker(config, runtime, &mut completed_pulls, &mut control_state).await
+        {
             Ok(()) => {
                 reconnect_backoff.reset();
                 return Ok(());
@@ -1519,6 +1662,7 @@ async fn run_connected_worker(
     config: &WorkerConfig,
     runtime: WorkerRuntime,
     completed_pulls: &mut usize,
+    control_state: &mut WorkerControlState,
 ) -> Result<()> {
     debug!(
         connect = %config.connect,
@@ -1531,6 +1675,15 @@ async fn run_connected_worker(
     let mut pending_job: Option<PendingJob> = None;
 
     loop {
+        if *control_state == WorkerControlState::Stopped {
+            worker
+                .as_mut()
+                .expect("connected worker")
+                .wait_until_started(runtime.idle_delay)
+                .await?;
+            *control_state = WorkerControlState::Running;
+        }
+
         if pending_job.is_some() {
             let next = {
                 let job = pending_job.as_mut().expect("pending job");
@@ -1565,6 +1718,11 @@ async fn run_connected_worker(
                     pending_job = None;
                     continue;
                 }
+                PendingJobOutcome::Stopped => {
+                    pending_job = None;
+                    *control_state = WorkerControlState::Stopped;
+                    continue;
+                }
                 PendingJobOutcome::Ready => {
                     let job = pending_job.take().expect("pending job");
                     debug!(
@@ -1572,7 +1730,11 @@ async fn run_connected_worker(
                         input = %job.input_path().display(),
                         "pending job input arrived"
                     );
-                    run_worker_job_and_publish(config, &mut worker, &job.job).await?;
+                    if run_worker_job_and_publish(config, &mut worker, &job.job).await?
+                        == WorkerJobOutcome::Stopped
+                    {
+                        *control_state = WorkerControlState::Stopped;
+                    }
                     continue;
                 }
             }
@@ -1581,6 +1743,27 @@ async fn run_connected_worker(
         debug!("requesting work");
         let worker_ref = worker.as_mut().expect("connected worker");
         let work_status = worker_ref.request_work().await?;
+        if let Some(control) = worker_ref.take_pending_control() {
+            match control {
+                ControlAction::Stop => {
+                    worker_ref
+                        .send_control_state(ControlState::Stopped, None)
+                        .await?;
+                    *control_state = WorkerControlState::Stopped;
+                    continue;
+                }
+                ControlAction::Pause => {
+                    worker_ref
+                        .send_control_state(ControlState::Paused, None)
+                        .await?;
+                }
+                ControlAction::Resume | ControlAction::Start => {
+                    worker_ref
+                        .send_control_state(ControlState::Running, None)
+                        .await?;
+                }
+            }
+        }
         *completed_pulls += 1;
         let status = work_status_label(&work_status);
         println!(
@@ -1617,7 +1800,11 @@ async fn run_connected_worker(
                         phase = ?phase,
                         "input already present, starting job"
                     );
-                    run_worker_job_and_publish(config, &mut worker, &job).await?;
+                    if run_worker_job_and_publish(config, &mut worker, &job).await?
+                        == WorkerJobOutcome::Stopped
+                    {
+                        *control_state = WorkerControlState::Stopped;
+                    }
                 }
                 WorkerJobPhase::AwaitingInput(delivery) => {
                     let pending = match delivery {
@@ -1635,7 +1822,11 @@ async fn run_connected_worker(
                                         input = %job.input_path().display(),
                                         "downloaded worker input over HTTP, starting job"
                                     );
-                                    run_worker_job_and_publish(config, &mut worker, &job).await?;
+                                    if run_worker_job_and_publish(config, &mut worker, &job).await?
+                                        == WorkerJobOutcome::Stopped
+                                    {
+                                        *control_state = WorkerControlState::Stopped;
+                                    }
                                     None
                                 }
                                 Some(pending) => Some(pending),
@@ -1726,6 +1917,10 @@ fn decode_worker_push(text: &str) -> Result<Option<WorkerPush>> {
         "cancel" => WorkerPush::Cancel(
             serde_json::from_value::<CancelPayload>(payload.clone())
                 .context("decode cancel push")?,
+        ),
+        "control" => WorkerPush::Control(
+            serde_json::from_value::<ControlPayload>(payload.clone())
+                .context("decode control push")?,
         ),
         "transfer_started" => WorkerPush::Started(
             serde_json::from_value::<TransferStartedPayload>(payload.clone())
@@ -1926,53 +2121,9 @@ where
     while let Some(message) = reader.next().await {
         match message.context("read websocket message")? {
             Message::Text(text) => {
-                let ServerPushFrame(_, msg_ref, topic, event, body): ServerPushFrame<Value> =
-                    serde_json::from_str(&text).context("decode phoenix frame")?;
-                if topic != CRF_SEARCH_TOPIC
-                    || event != "phx_reply"
-                    || msg_ref.as_deref() != Some(expected_ref)
-                {
-                    continue;
+                if let Some(reply) = decode_expected_reply(&text, expected_ref, expected_event)? {
+                    return reply;
                 }
-                debug!(
-                    expected_event,
-                    raw = %text,
-                    "received phoenix reply"
-                );
-
-                let ReplyBody { status, response }: ReplyBody<Value> =
-                    serde_json::from_value::<ReplyBody<Value>>(body)
-                        .context("decode phoenix reply body")?;
-                debug!(
-                    expected_event,
-                    status = %status,
-                    response = %response,
-                    "decoded phoenix reply"
-                );
-                return match status.as_str() {
-                    "ok" => serde_json::from_value(response.clone()).map_err(|error| {
-                        let raw_response = response.to_string();
-                        anyhow!("decode phoenix ok reply: {error}; raw_response={raw_response}")
-                    }),
-                    "error" => {
-                        let error: ErrorReplyPayload = serde_json::from_value(response)
-                            .context("decode phoenix error reply")?;
-                        let supported_versions = match error.supported_protocol_versions.is_empty()
-                        {
-                            true => String::new(),
-                            false => format!(
-                                " (supported_protocol_versions={:?})",
-                                error.supported_protocol_versions
-                            ),
-                        };
-                        Err(anyhow!(
-                            "{expected_event} failed: {}{}",
-                            error.reason,
-                            supported_versions
-                        ))
-                    }
-                    other => Err(anyhow!("unexpected phoenix status {other}")),
-                };
             }
             Message::Close(frame) => {
                 bail!("websocket closed before {expected_event} reply: {frame:?}")
@@ -1984,6 +2135,46 @@ where
     }
 
     bail!("websocket ended before {expected_event} reply")
+}
+
+fn decode_expected_reply<T>(
+    text: &str,
+    expected_ref: &str,
+    expected_event: &str,
+) -> Result<Option<Result<T>>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let ServerPushFrame(_, msg_ref, topic, event, body): ServerPushFrame<Value> =
+        serde_json::from_str(text).context("decode phoenix frame")?;
+    if topic != CRF_SEARCH_TOPIC || event != "phx_reply" || msg_ref.as_deref() != Some(expected_ref)
+    {
+        return Ok(None);
+    }
+    let ReplyBody { status, response }: ReplyBody<Value> =
+        serde_json::from_value(body).context("decode phoenix reply body")?;
+    Ok(Some(match status.as_str() {
+        "ok" => serde_json::from_value(response.clone())
+            .map_err(|error| anyhow!("decode phoenix ok reply: {error}; raw_response={response}")),
+        "error" => {
+            let error: ErrorReplyPayload =
+                serde_json::from_value(response).context("decode phoenix error reply")?;
+            let supported_versions = if error.supported_protocol_versions.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (supported_protocol_versions={:?})",
+                    error.supported_protocol_versions
+                )
+            };
+            Err(anyhow!(
+                "{expected_event} failed: {}{}",
+                error.reason,
+                supported_versions
+            ))
+        }
+        other => Err(anyhow!("unexpected phoenix status {other}")),
+    }))
 }
 
 #[cfg(test)]
@@ -2173,6 +2364,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn stopped_worker_waits_for_start_before_pulling_again() -> Result<()> {
+        let (listener, address) = FakeCoordinator::bind("127.0.0.1:0").await?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let socket = accept_async(stream).await.expect("accept websocket");
+            let (mut writer, mut reader) = socket.split();
+
+            expect_join(&mut reader).await;
+            send_join_reply(&mut writer).await;
+            expect_announce(&mut reader, 1).await;
+            send_announce_reply(&mut writer).await;
+            expect_pull_work(&mut reader, 3).await;
+            send_control_push(&mut writer, ControlAction::Stop, None).await;
+            send_no_work_reply(&mut writer, 3).await;
+            assert_eq!(
+                expect_client_event(&mut reader, 4, "control_state").await,
+                json!({"state": "stopped"})
+            );
+            send_control_push(&mut writer, ControlAction::Start, None).await;
+            assert_eq!(
+                expect_client_event(&mut reader, 5, "control_state").await,
+                json!({"state": "running"})
+            );
+            expect_pull_work(&mut reader, 6).await;
+            send_no_work_reply(&mut writer, 6).await;
+        });
+
+        run_worker_until(
+            &FakeCoordinator {
+                address,
+                server: tokio::spawn(async {}),
+            }
+            .worker_config(WorkerTestConfig::continuous()),
+            WorkerRuntime {
+                idle_delay: Duration::from_secs(30),
+                reconnect_base_delay: Duration::from_millis(1),
+                reconnect_max_delay: Duration::from_millis(1),
+                max_pulls: Some(1),
+            },
+        )
+        .await?;
+        server.await.expect("server task");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_reconnects_after_disconnect_and_continues_pulling_work() -> Result<()> {
         let coordinator = FakeCoordinator::with_no_work_replies(1).await?;
         let address = coordinator.address;
@@ -2240,6 +2477,7 @@ mod tests {
         }
         .worker_config(WorkerTestConfig::continuous());
         let mut completed_pulls = 0;
+        let mut control_state = WorkerControlState::Running;
         let error = run_connected_worker(
             &config,
             WorkerRuntime {
@@ -2249,6 +2487,7 @@ mod tests {
                 max_pulls: None,
             },
             &mut completed_pulls,
+            &mut control_state,
         )
         .await
         .expect_err("server closes after resend assignment");
@@ -2337,6 +2576,28 @@ mod tests {
         assert_eq!(session.work_status, "no_work");
 
         server.await.expect("server task");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_decodes_pause_control_push() -> Result<()> {
+        let text = serde_json::to_string(&ServerPushFrame::new(
+            "control",
+            crate::command::worker_protocol::ControlPayload {
+                action: crate::command::worker_protocol::ControlAction::Pause,
+                video_id: Some(123),
+            },
+        ))?;
+
+        assert!(matches!(
+            decode_worker_push(&text)?,
+            Some(WorkerPush::Control(
+                crate::command::worker_protocol::ControlPayload {
+                    action: crate::command::worker_protocol::ControlAction::Pause,
+                    video_id: Some(123),
+                }
+            ))
+        ));
         Ok(())
     }
 
@@ -3137,6 +3398,22 @@ mod tests {
             ))
             .await
             .expect("send cancel push");
+    }
+
+    async fn send_control_push<W>(writer: &mut W, action: ControlAction, video_id: Option<u64>)
+    where
+        W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        writer
+            .send(Message::Text(
+                serde_json::to_string(&ServerPushFrame::new(
+                    "control",
+                    ControlPayload { action, video_id },
+                ))
+                .expect("control push json"),
+            ))
+            .await
+            .expect("send control push");
     }
 
     async fn serve_no_work_session(listener: TcpListener, no_work_replies: usize) {
