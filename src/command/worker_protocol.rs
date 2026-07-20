@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 pub(crate) const CRF_SEARCH_TOPIC: &str = "workers:crf_search";
 
@@ -105,6 +105,7 @@ pub(crate) struct Capabilities {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HeartbeatPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_rounded_option_f32")]
     pub(crate) cpu_percent: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) memory_rss_bytes: Option<u64>,
@@ -121,10 +122,13 @@ pub(crate) struct HeartbeatPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CrfSearchProgressPayload {
     pub(crate) video_id: u64,
+    #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) percent: f32,
     pub(crate) filename: String,
     pub(crate) eta: Option<u64>,
+    #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) fps: f32,
+    #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) crf: f32,
     pub(crate) sample_num: u64,
     pub(crate) total_samples: u64,
@@ -135,18 +139,27 @@ pub(crate) struct CrfSearchResultPayload {
     pub(crate) job_id: String,
     pub(crate) video_id: u64,
     pub(crate) source_name: String,
+    #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) crf: f32,
+    #[serde(serialize_with = "serialize_rounded_option_f32")]
     pub(crate) vmaf_score: Option<f32>,
+    #[serde(serialize_with = "serialize_rounded_option_f32")]
     pub(crate) xpsnr_score: Option<f32>,
     pub(crate) predicted_encode_size: u64,
+    #[serde(serialize_with = "serialize_rounded_f64")]
     pub(crate) encode_percent: f64,
+    #[serde(serialize_with = "serialize_rounded_f64")]
     pub(crate) predicted_encode_time_secs: f64,
     pub(crate) from_cache: bool,
+    #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) score: f32,
+    #[serde(serialize_with = "serialize_rounded_f64")]
     pub(crate) percent: f64,
     pub(crate) size: u64,
+    #[serde(serialize_with = "serialize_rounded_f64")]
     pub(crate) time: f64,
     pub(crate) params: serde_json::Value,
+    #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) target: f32,
     pub(crate) chosen: bool,
 }
@@ -359,11 +372,39 @@ pub(crate) struct TransferProgressPayload {
     pub(crate) filename: String,
     pub(crate) received_bytes: u64,
     pub(crate) expected_bytes: Option<u64>,
+    #[serde(serialize_with = "serialize_rounded_f64")]
     pub(crate) percent: f64,
     pub(crate) bytes_per_second: u64,
     pub(crate) eta: Option<u64>,
     pub(crate) chunk_index: u64,
     pub(crate) total_chunks: u64,
+}
+
+fn serialize_rounded_f32<S>(value: &f32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_f64(round_two(*value as f64))
+}
+
+fn serialize_rounded_option_f32<S>(value: &Option<f32>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value
+        .map(|value| round_two(value as f64))
+        .serialize(serializer)
+}
+
+fn serialize_rounded_f64<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_f64(round_two(*value))
+}
+
+fn round_two(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -465,6 +506,118 @@ mod tests {
                     "active_video_id": 123,
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn outbound_float_payloads_round_to_two_places() {
+        assert_eq!(
+            serde_json::to_value(HeartbeatPayload {
+                cpu_percent: Some(12.346),
+                memory_rss_bytes: None,
+                memory_total_bytes: None,
+                disk_free_bytes: None,
+                disk_total_bytes: None,
+                active_video_id: None,
+            })
+            .expect("serialize heartbeat floats"),
+            json!({ "cpu_percent": 12.35 })
+        );
+
+        assert_eq!(
+            serde_json::to_value(CrfSearchProgressPayload {
+                video_id: 123,
+                percent: 42.346,
+                filename: "movie.mkv".into(),
+                eta: None,
+                fps: 27.346,
+                crf: 31.346,
+                sample_num: 2,
+                total_samples: 4,
+            })
+            .expect("serialize crf progress floats"),
+            json!({
+                "video_id": 123,
+                "percent": 42.35,
+                "filename": "movie.mkv",
+                "eta": null,
+                "fps": 27.35,
+                "crf": 31.35,
+                "sample_num": 2,
+                "total_samples": 4,
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(TransferProgressPayload {
+                job_id: "job-123".into(),
+                transfer_id: "job-123".into(),
+                video_id: 123,
+                filename: "movie.mkv".into(),
+                received_bytes: 512,
+                expected_bytes: Some(1024),
+                percent: 66.666,
+                bytes_per_second: 256,
+                eta: Some(2),
+                chunk_index: 3,
+                total_chunks: 8,
+            })
+            .expect("serialize transfer progress floats"),
+            json!({
+                "job_id": "job-123",
+                "transfer_id": "job-123",
+                "video_id": 123,
+                "filename": "movie.mkv",
+                "received_bytes": 512,
+                "expected_bytes": 1024,
+                "percent": 66.67,
+                "bytes_per_second": 256,
+                "eta": 2,
+                "chunk_index": 3,
+                "total_chunks": 8,
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(CrfSearchResultPayload {
+                job_id: "job-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                crf: 31.346,
+                vmaf_score: Some(96.346),
+                xpsnr_score: Some(95.346),
+                predicted_encode_size: 123,
+                encode_percent: 42.346,
+                predicted_encode_time_secs: 87.346,
+                from_cache: false,
+                score: 96.346,
+                percent: 42.346,
+                size: 123,
+                time: 87.346,
+                params: json!({}),
+                target: 95.346,
+                chosen: true,
+            })
+            .expect("serialize crf result floats"),
+            json!({
+                "job_id": "job-123",
+                "video_id": 123,
+                "source_name": "movie.mkv",
+                "crf": 31.35,
+                "vmaf_score": 96.35,
+                "xpsnr_score": 95.35,
+                "predicted_encode_size": 123,
+                "encode_percent": 42.35,
+                "predicted_encode_time_secs": 87.35,
+                "from_cache": false,
+                "score": 96.35,
+                "percent": 42.35,
+                "size": 123,
+                "time": 87.35,
+                "params": {},
+                "target": 95.35,
+                "chosen": true,
+            })
         );
     }
 
@@ -585,13 +738,13 @@ mod tests {
                     "video_id": 123,
                     "source_name": "movie.mkv",
                     "crf": 31.5,
-                    "vmaf_score": 96.19999694824219,
+                    "vmaf_score": 96.2,
                     "xpsnr_score": null,
                     "predicted_encode_size": 123456,
                     "encode_percent": 42.5,
                     "predicted_encode_time_secs": 87.5,
                     "from_cache": true,
-                    "score": 96.19999694824219,
+                    "score": 96.2,
                     "percent": 42.5,
                     "size": 123456,
                     "time": 87.5,
