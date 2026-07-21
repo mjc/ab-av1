@@ -1460,7 +1460,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Paused,
                                     active_video_id: Some(job.assignment.video_id),
-                                    job_id: Some(job.assignment.job_id.clone()),
+                                    job_id: None,
                                 }),
                                 "control_state",
                             );
@@ -1474,7 +1474,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Running,
                                     active_video_id: Some(job.assignment.video_id),
-                                    job_id: Some(job.assignment.job_id.clone()),
+                                    job_id: None,
                                 }),
                                 "control_state",
                             );
@@ -1487,7 +1487,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Stopped,
                                     active_video_id: None,
-                                    job_id: Some(job.assignment.job_id.clone()),
+                                    job_id: None,
                                 }),
                                 "control_state",
                             );
