@@ -459,6 +459,8 @@ pub(crate) struct ControlStatePayload {
     pub(crate) state: ControlState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) active_video_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +650,7 @@ mod tests {
             ClientEvent::ControlState(ControlStatePayload {
                 state: ControlState::Paused,
                 active_video_id: Some(123),
+                job_id: None,
             }),
         );
 

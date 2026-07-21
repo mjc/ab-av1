@@ -1460,6 +1460,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Paused,
                                     active_video_id: Some(job.assignment.video_id),
+                                    job_id: Some(job.assignment.job_id.clone()),
                                 }),
                                 "control_state",
                             );
@@ -1473,6 +1474,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Running,
                                     active_video_id: Some(job.assignment.video_id),
+                                    job_id: Some(job.assignment.job_id.clone()),
                                 }),
                                 "control_state",
                             );
@@ -1485,6 +1487,7 @@ async fn run_multiplex_crf(
                                 ClientEvent::ControlState(ControlStatePayload {
                                     state: ControlState::Stopped,
                                     active_video_id: None,
+                                    job_id: Some(job.assignment.job_id.clone()),
                                 }),
                                 "control_state",
                             );
@@ -1673,10 +1676,44 @@ async fn run_multiplex_encode_with_heartbeat_interval(
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => match control.action {
-                    ControlAction::Pause => process_scope.pause()?,
-                    ControlAction::Resume | ControlAction::Start => process_scope.resume()?,
+                    ControlAction::Pause => {
+                        process_scope.pause()?;
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::ControlState(ControlStatePayload {
+                                state: ControlState::Paused,
+                                active_video_id: Some(job.assignment.video_id),
+                                job_id: Some(job.assignment.job_id.clone()),
+                            }),
+                            "control_state",
+                        );
+                    }
+                    ControlAction::Resume | ControlAction::Start => {
+                        process_scope.resume()?;
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::ControlState(ControlStatePayload {
+                                state: ControlState::Running,
+                                active_video_id: Some(job.assignment.video_id),
+                                job_id: Some(job.assignment.job_id.clone()),
+                            }),
+                            "control_state",
+                        );
+                    }
                     ControlAction::Stop => {
                         process_scope.stop()?;
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::ControlState(ControlStatePayload {
+                                state: ControlState::Stopped,
+                                active_video_id: None,
+                                job_id: Some(job.assignment.job_id.clone()),
+                            }),
+                            "control_state",
+                        );
                         return Ok(WorkerJobOutcome::Stopped);
                     }
                 },
@@ -1857,6 +1894,7 @@ impl ConnectedWorker {
         self.send_event(ClientEvent::ControlState(ControlStatePayload {
             state,
             active_video_id,
+            job_id: None,
         }))
         .await
     }
