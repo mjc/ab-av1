@@ -3248,20 +3248,21 @@ async fn handle_multiplex_frame(
                     }
                 }
                 Some(WorkerPush::Control(control)) => {
-                    let job = control
-                        .job_id
-                        .as_deref()
-                        .and_then(|job_id| jobs.get(job_id))
-                        .or_else(|| {
-                            control.video_id.and_then(|video_id| {
-                                jobs.values().find(|job| {
-                                    job.job.assignment.video_id == video_id && !job.finished
-                                })
-                            })
-                        });
-                    if let Some(job) = job {
+                    let jobs: Vec<_> = jobs
+                        .values()
+                        .filter(|job| {
+                            control_targets_job(
+                                &control,
+                                &job.job.assignment.job_id,
+                                job.job.assignment.video_id,
+                                job.finished,
+                            )
+                        })
+                        .collect();
+
+                    for job in jobs {
                         job.command
-                            .send(JobCommand::Control(control))
+                            .send(JobCommand::Control(control.clone()))
                             .map_err(|_| anyhow!("worker control channel closed"))?;
                     }
                 }
@@ -3448,6 +3449,20 @@ fn work_status_label(reply: &ServerReply) -> String {
             format!("{} (job_id={})", payload.status.as_str(), payload.job_id)
         }
     }
+}
+
+fn control_targets_job(
+    control: &ControlPayload,
+    job_id: &str,
+    video_id: u64,
+    finished: bool,
+) -> bool {
+    !finished
+        && match (&control.job_id, control.video_id) {
+            (None, None) => true,
+            (Some(target_job_id), _) => target_job_id == job_id,
+            (None, Some(target_video_id)) => target_video_id == video_id,
+        }
 }
 
 fn decode_worker_push(text: &str) -> Result<Option<WorkerPush>> {
@@ -4690,6 +4705,19 @@ mod tests {
             ))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn unscoped_control_targets_every_active_job() {
+        let control = crate::command::worker_protocol::ControlPayload {
+            action: crate::command::worker_protocol::ControlAction::Resume,
+            video_id: None,
+            job_id: None,
+        };
+
+        assert!(control_targets_job(&control, "crf-1", 1, false));
+        assert!(control_targets_job(&control, "encode-2", 2, false));
+        assert!(!control_targets_job(&control, "finished-3", 3, true));
     }
 
     #[test]
