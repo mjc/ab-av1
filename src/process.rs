@@ -139,6 +139,13 @@ pub(crate) fn parse_ffmpeg_progress(line: &str) -> Option<FfmpegProgress> {
     let frame = parse_label_substr("frame=", line)?.parse().ok()?;
     let fps = parse_label_substr("fps=", line)?.parse().ok()?;
     let progress_time = parse_label_substr("time=", line)?;
+    if progress_time == "N/A" {
+        return Some(FfmpegProgress {
+            frame,
+            fps,
+            time: Duration::ZERO,
+        });
+    }
     let (h, rest) = progress_time.split_once(':')?;
     let (m, s) = rest.split_once(':')?;
     let h = h.parse::<u64>().ok()?;
@@ -471,7 +478,14 @@ fn parse_ffmpeg_progress_line() {
 #[test]
 fn parse_ffmpeg_progress_na_time() {
     let out = "frame=  288 fps= 94 q=-0.0 size=N/A time=N/A bitrate=N/A speed=3.94x    ";
-    assert_eq!(FfmpegOut::try_parse(out), None);
+    assert_eq!(
+        FfmpegOut::try_parse(out),
+        Some(FfmpegOut::Progress {
+            frame: 288,
+            fps: 94.0,
+            time: Duration::ZERO,
+        })
+    );
 }
 
 #[test]

@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{command::SmallDuration, log::ProgressLogger};
 use log::info;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
 pub struct EncodeRun {
@@ -49,7 +49,13 @@ where
     let mut progress = ProgressState::default();
     while let Some(event) = enc.next().await {
         let event = event?;
-        if let Some(BarUpdate::Fps { fps, time }) = apply_ffmpeg_event(&mut progress, event) {
+        if let Some(BarUpdate::Fps { frame, fps, time }) = apply_ffmpeg_event(&mut progress, event)
+        {
+            let time = media_time(
+                frame,
+                time,
+                session.probe.fps.as_ref().copied().unwrap_or_default(),
+            );
             sink.set_message(format!("{fps} fps, "));
             if let Ok(d) = &session.probe.duration {
                 sink.set_position(time.as_micros_u64());
@@ -68,4 +74,25 @@ where
         output: partial.commit(),
         stream_sizes: progress.stream_sizes,
     })
+}
+
+fn media_time(frame: u64, reported: Duration, source_fps: f64) -> Duration {
+    if reported.is_zero() && source_fps > 0.0 {
+        Duration::from_secs_f64(frame as f64 / source_fps)
+    } else {
+        reported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_media_time_from_frame_when_ffmpeg_reports_na() {
+        assert_eq!(
+            media_time(240, Duration::ZERO, 24.0),
+            Duration::from_secs(10)
+        );
+    }
 }
