@@ -3158,11 +3158,44 @@ async fn replay_multiplex_jobs(
     jobs: &HashMap<String, MultiplexJob>,
 ) -> bool {
     for (job_id, job) in jobs {
+        if let Some(progress) = encode_reconnect_progress(&job.job, &job.state, job.finished)
+            && !send_multiplex_event(
+                worker,
+                ClientEvent::EncodeProgress(progress),
+                job_id,
+                "encode_progress",
+            )
+            .await
+        {
+            return false;
+        }
         if !replay_multiplex_state(worker, &job.state, job_id).await {
             return false;
         }
     }
     true
+}
+
+fn encode_reconnect_progress(
+    job: &WorkerJob,
+    state: &WorkerJobReportState,
+    finished: bool,
+) -> Option<EncodeProgressPayload> {
+    (!finished
+        && job.assignment.job_type == JobKind::Encode
+        && state.encode_progress.is_none()
+        && state.encode_completed.is_none()
+        && state.failure.is_none())
+    .then(|| EncodeProgressPayload {
+        job_id: job.assignment.job_id.clone(),
+        video_id: job.assignment.video_id,
+        percent: 0.0,
+        fps: 0.0,
+        eta: None,
+        output_bytes: 0,
+        output_percent: 0.0,
+        throughput: None,
+    })
 }
 
 async fn replay_multiplex_state(
@@ -3769,6 +3802,39 @@ mod tests {
             next_multiplex_job_type(WorkerMode::Both, &jobs, &pending, &no_work),
             Some(JobKind::Encode)
         );
+    }
+
+    #[test]
+    fn reconnect_progress_identifies_active_encode_without_prior_progress() {
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id: "encode-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 1_000,
+                chunk_size_bytes: 256,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: vec!["encode".into(), "--input".into(), "movie.mkv".into()],
+                crf_search_args: Vec::new(),
+            },
+            PathBuf::from("/tmp/encode-123"),
+            PathBuf::from("/tmp/encode-123/movie.mkv"),
+        );
+
+        assert!(matches!(
+            encode_reconnect_progress(&job, &WorkerJobReportState::default(), false),
+            Some(EncodeProgressPayload {
+                job_id,
+                video_id: 123,
+                percent: 0.0,
+                ..
+            }) if job_id == "encode-123"
+        ));
     }
 
     #[test]
