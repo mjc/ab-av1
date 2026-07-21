@@ -38,6 +38,7 @@ pub(crate) enum ClientEvent {
     TransferFailure(TransferFailurePayload),
     CrfSearchProgress(CrfSearchProgressPayload),
     CrfSearchResult(CrfSearchResultPayload),
+    CrfSearchCompleted(CrfSearchCompletedPayload),
     #[cfg_attr(not(test), allow(dead_code))]
     EncodeProgress(EncodeProgressPayload),
     EncodeCompleted(EncodeCompletedPayload),
@@ -63,6 +64,10 @@ impl ClientEvent {
                 ("crf_search_progress", ClientPayload::Progress(payload))
             }
             Self::CrfSearchResult(payload) => ("crf_search_result", ClientPayload::Result(payload)),
+            Self::CrfSearchCompleted(payload) => (
+                "crf_search_completed",
+                ClientPayload::CrfSearchCompleted(payload),
+            ),
             Self::EncodeProgress(payload) => {
                 ("encode_progress", ClientPayload::EncodeProgress(payload))
             }
@@ -86,6 +91,7 @@ enum ClientPayload {
     TransferFailure(TransferFailurePayload),
     Progress(CrfSearchProgressPayload),
     Result(CrfSearchResultPayload),
+    CrfSearchCompleted(CrfSearchCompletedPayload),
     EncodeProgress(EncodeProgressPayload),
     EncodeCompleted(EncodeCompletedPayload),
     Failure(FailureReportPayload),
@@ -153,6 +159,7 @@ pub(crate) struct HeartbeatPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CrfSearchProgressPayload {
+    pub(crate) job_id: String,
     pub(crate) video_id: u64,
     #[serde(serialize_with = "serialize_rounded_f32")]
     pub(crate) percent: f32,
@@ -164,6 +171,16 @@ pub(crate) struct CrfSearchProgressPayload {
     pub(crate) crf: f32,
     pub(crate) sample_num: u64,
     pub(crate) total_samples: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CrfSearchCompletedPayload {
+    pub(crate) job_id: String,
+    pub(crate) video_id: u64,
+    pub(crate) result: String,
+    #[serde(serialize_with = "serialize_rounded_f32")]
+    pub(crate) chosen_crf: f32,
+    pub(crate) results: Vec<CrfSearchResultPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -663,6 +680,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_value(CrfSearchProgressPayload {
+                job_id: "job-123".into(),
                 video_id: 123,
                 percent: 42.346,
                 filename: "movie.mkv".into(),
@@ -674,6 +692,7 @@ mod tests {
             })
             .expect("serialize crf progress floats"),
             json!({
+                "job_id": "job-123",
                 "video_id": 123,
                 "percent": 42.35,
                 "filename": "movie.mkv",
@@ -806,6 +825,7 @@ mod tests {
         let frame = ClientFrame::new(
             5,
             ClientEvent::CrfSearchProgress(CrfSearchProgressPayload {
+                job_id: "job-123".into(),
                 video_id: 123,
                 percent: 42.5,
                 filename: "movie.mkv".into(),
@@ -825,6 +845,7 @@ mod tests {
                 "workers:crf_search",
                 "crf_search_progress",
                 {
+                    "job_id": "job-123",
                     "video_id": 123,
                     "percent": 42.5,
                     "filename": "movie.mkv",
@@ -833,6 +854,37 @@ mod tests {
                     "crf": 31.0,
                     "sample_num": 2,
                     "total_samples": 4,
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn crf_search_completion_serializes_job_identity() {
+        let frame = ClientFrame::new(
+            6,
+            ClientEvent::CrfSearchCompleted(CrfSearchCompletedPayload {
+                job_id: "job-123".into(),
+                video_id: 123,
+                result: "ok".into(),
+                chosen_crf: 31.5,
+                results: Vec::new(),
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(frame).expect("serialize CRF completion"),
+            json!([
+                "1",
+                "6",
+                "workers:crf_search",
+                "crf_search_completed",
+                {
+                    "job_id": "job-123",
+                    "video_id": 123,
+                    "result": "ok",
+                    "chosen_crf": 31.5,
+                    "results": [],
                 }
             ])
         );

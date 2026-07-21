@@ -1,14 +1,15 @@
 use crate::command::worker_protocol::{
     AnnouncePayload, CRF_SEARCH_TOPIC, CancelPayload, Capabilities, ClientEvent, ClientFrame,
-    ControlAction, ControlPayload, ControlState, ControlStatePayload, CrfSearchProgressPayload,
-    CrfSearchResultPayload, EncodeCompletedPayload, EncodeProgressPayload, ErrorReplyPayload,
-    FailureReportPayload, HeartbeatPayload, JobKind, PullWorkPayload, ReplyBody, ServerPushFrame,
-    ServerReply, TransferFailurePayload, TransferProgressPayload, TransferStage,
-    TransferStartedPayload, WorkStatus,
+    ControlAction, ControlPayload, ControlState, ControlStatePayload, CrfSearchCompletedPayload,
+    CrfSearchProgressPayload, CrfSearchResultPayload, EncodeCompletedPayload,
+    EncodeProgressPayload, ErrorReplyPayload, FailureReportPayload, HeartbeatPayload, JobKind,
+    PullWorkPayload, ReplyBody, ServerPushFrame, ServerReply, TransferFailurePayload,
+    TransferProgressPayload, TransferStage, TransferStartedPayload, WorkStatus,
 };
 use crate::command::worker_transfer::{Chunk, ChunkReceiver};
 use crate::command::{crf_search, encode, sample_encode};
 use crate::ffprobe::Ffprobe;
+use crate::process::managed::ProcessScope;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -309,6 +310,7 @@ impl WorkerJob {
         status: &sample_encode::Status,
     ) -> CrfSearchProgressPayload {
         CrfSearchProgressPayload {
+            job_id: self.assignment.job_id.clone(),
             video_id: self.assignment.video_id,
             percent: (status.progress.clamp(0.0, 1.0) * 100.0),
             filename: self.assignment.source_name.clone(),
@@ -387,6 +389,8 @@ struct WorkerJobReportState {
     encode_completed: Option<EncodeCompletedPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<FailureReportPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crf_completed: Option<CrfSearchCompletedPayload>,
     crf_results: Vec<CrfSearchResultPayload>,
 }
 
@@ -779,6 +783,14 @@ async fn handle_crf_update(
         Ok(crf_search::Update::Done(best)) => {
             let payload = job.crf_result_payload(&best, true);
             state.crf_results.push(payload.clone());
+            let completed = CrfSearchCompletedPayload {
+                job_id: job.assignment.job_id.clone(),
+                video_id: job.assignment.video_id,
+                result: "ok".into(),
+                chosen_crf: best.crf,
+                results: Vec::new(),
+            };
+            state.crf_completed = Some(completed.clone());
             let mut disconnected = false;
             if let Some(worker) = worker {
                 disconnected = !send_worker_event(
@@ -788,6 +800,15 @@ async fn handle_crf_update(
                     "crf_result",
                 )
                 .await;
+                if !disconnected {
+                    disconnected = !send_worker_event(
+                        worker,
+                        ClientEvent::CrfSearchCompleted(completed),
+                        &job.assignment.job_id,
+                        "crf_search_completed",
+                    )
+                    .await;
+                }
             }
             Ok((Some(best), disconnected))
         }
@@ -902,6 +923,15 @@ async fn replay_worker_state(worker: &mut ConnectedWorker, state: &WorkerJobRepo
             ClientEvent::CrfSearchResult(result.clone()),
             "state",
             "crf_result",
+        )
+        .await;
+    }
+    if let Some(completed) = &state.crf_completed {
+        delivered &= send_worker_event(
+            worker,
+            ClientEvent::CrfSearchCompleted(completed.clone()),
+            "state",
+            "crf_search_completed",
         )
         .await;
     }
@@ -1198,15 +1228,15 @@ async fn run_multiplex_job(
     output: UnboundedSender<MultiplexOutput>,
 ) {
     let job_id = job.assignment.job_id.clone();
-    let result = run_multiplex_job_inner(&job, &mut commands, &output).await;
-    if result.is_err()
-        && job.input_dir == worker_job_input_dir(&job.assignment.job_id)
-        && let Err(error) = fs::remove_dir_all(&job.input_dir)
-    {
+    let process_scope = ProcessScope::new(job_id.clone());
+    let result = process_scope
+        .run(run_multiplex_job_inner(&job, &mut commands, &output))
+        .await;
+    if let Err(error) = cleanup_multiplex_worker_input(&job, &result) {
         debug!(
             job_id = %job.assignment.job_id,
             error = %error,
-            "failed to remove incomplete multiplexed worker job directory"
+            "failed to remove completed multiplexed worker job directory"
         );
     }
     let outcome = result.map_err(|error| format!("{error:#}"));
@@ -1214,6 +1244,28 @@ async fn run_multiplex_job(
         job_id,
         result: outcome,
     });
+}
+
+fn cleanup_multiplex_worker_input(
+    job: &WorkerJob,
+    outcome: &Result<WorkerJobOutcome>,
+) -> Result<()> {
+    if matches!(outcome, Ok(WorkerJobOutcome::Completed)) {
+        let retain_local_output = job.assignment.job_type == JobKind::Encode
+            && job.assignment.output_transfer.is_none()
+            && job.assignment.output_shared_path.is_none();
+        if retain_local_output && job.input_dir == worker_job_input_dir(&job.assignment.job_id) {
+            fs::remove_file(job.input_path()).with_context(|| {
+                format!(
+                    "remove completed worker input {}",
+                    job.input_path().display()
+                )
+            })?;
+        } else {
+            remove_worker_input(job)?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_multiplex_job_inner(
@@ -1377,6 +1429,7 @@ async fn run_multiplex_crf(
     output: &UnboundedSender<MultiplexOutput>,
 ) -> Result<WorkerJobOutcome> {
     let crf_config = job.crf_search_config()?;
+    let process_scope = ProcessScope::new(job.assignment.job_id.clone());
     let mut run = std::pin::pin!(crf_search::run(crf_config, probe));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1399,7 +1452,7 @@ async fn run_multiplex_crf(
                 Some(JobCommand::Control(control)) => {
                     match control.action {
                         ControlAction::Pause => {
-                            crate::process::managed::pause_active_processes()?;
+                            process_scope.pause()?;
                             paused = true;
                             let _ = multiplex_event(
                                 output,
@@ -1412,7 +1465,7 @@ async fn run_multiplex_crf(
                             );
                         }
                         ControlAction::Resume | ControlAction::Start => {
-                            crate::process::managed::resume_active_processes()?;
+                            process_scope.resume()?;
                             paused = false;
                             let _ = multiplex_event(
                                 output,
@@ -1425,7 +1478,7 @@ async fn run_multiplex_crf(
                             );
                         }
                         ControlAction::Stop => {
-                            crate::process::managed::resume_active_processes()?;
+                            process_scope.stop()?;
                             let _ = multiplex_event(
                                 output,
                                 &job.assignment.job_id,
@@ -1451,6 +1504,18 @@ async fn run_multiplex_crf(
                             &job.assignment.job_id,
                             ClientEvent::CrfSearchResult(payload),
                             "crf_result",
+                        );
+                        let _ = multiplex_event(
+                            output,
+                            &job.assignment.job_id,
+                            ClientEvent::CrfSearchCompleted(CrfSearchCompletedPayload {
+                                job_id: job.assignment.job_id.clone(),
+                                video_id: job.assignment.video_id,
+                                result: "ok".into(),
+                                chosen_crf: best.crf,
+                                results: Vec::new(),
+                            }),
+                            "crf_search_completed",
                         );
                         return Ok(WorkerJobOutcome::Completed);
                     }
@@ -1487,7 +1552,19 @@ async fn run_multiplex_encode(
     commands: &mut UnboundedReceiver<JobCommand>,
     output: &UnboundedSender<MultiplexOutput>,
 ) -> Result<WorkerJobOutcome> {
+    run_multiplex_encode_with_heartbeat_interval(job, probe, commands, output, HEARTBEAT_INTERVAL)
+        .await
+}
+
+async fn run_multiplex_encode_with_heartbeat_interval(
+    job: &WorkerJob,
+    probe: Arc<Ffprobe>,
+    commands: &mut UnboundedReceiver<JobCommand>,
+    output: &UnboundedSender<MultiplexOutput>,
+    heartbeat_interval: Duration,
+) -> Result<WorkerJobOutcome> {
     let config = job.encode_config()?;
+    let process_scope = ProcessScope::new(job.assignment.job_id.clone());
     let _ = multiplex_event(
         output,
         &job.assignment.job_id,
@@ -1540,8 +1617,18 @@ async fn run_multiplex_encode(
         );
     });
     tokio::pin!(run);
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                let _ = multiplex_event(
+                    output,
+                    &job.assignment.job_id,
+                    ClientEvent::Heartbeat(heartbeat_payload(&job.input_dir, Some(job.assignment.video_id))),
+                    "heartbeat",
+                );
+            }
             result = &mut run => {
                 let (output_path, finished) = result?;
                 let output_bytes = finished.metrics.output_bytes;
@@ -1586,10 +1673,10 @@ async fn run_multiplex_encode(
                     bail!("worker job {} canceled: {}", cancel.job_id, cancel.reason);
                 }
                 Some(JobCommand::Control(control)) => match control.action {
-                    ControlAction::Pause => crate::process::managed::pause_active_processes()?,
-                    ControlAction::Resume | ControlAction::Start => crate::process::managed::resume_active_processes()?,
+                    ControlAction::Pause => process_scope.pause()?,
+                    ControlAction::Resume | ControlAction::Start => process_scope.resume()?,
                     ControlAction::Stop => {
-                        crate::process::managed::resume_active_processes()?;
+                        process_scope.stop()?;
                         return Ok(WorkerJobOutcome::Stopped);
                     }
                 },
@@ -2991,6 +3078,7 @@ fn record_multiplex_event(state: &mut WorkerJobReportState, event: &ClientEvent)
         ClientEvent::TransferProgress(payload) => state.transfer_progress = Some(payload.clone()),
         ClientEvent::CrfSearchProgress(payload) => state.crf_progress = Some(payload.clone()),
         ClientEvent::CrfSearchResult(payload) => state.crf_results.push(payload.clone()),
+        ClientEvent::CrfSearchCompleted(payload) => state.crf_completed = Some(payload.clone()),
         ClientEvent::EncodeProgress(payload) => state.encode_progress = Some(payload.clone()),
         ClientEvent::EncodeCompleted(payload) => state.encode_completed = Some(payload.clone()),
         ClientEvent::VideoFailed(payload) => state.failure = Some(payload.clone()),
@@ -3247,6 +3335,17 @@ async fn replay_multiplex_state(
         {
             return false;
         }
+    }
+    if let Some(payload) = &state.crf_completed
+        && !send_multiplex_event(
+            worker,
+            ClientEvent::CrfSearchCompleted(payload.clone()),
+            job_id,
+            "crf_search_completed",
+        )
+        .await
+    {
+        return false;
     }
     if let Some(payload) = &state.encode_progress
         && !send_multiplex_event(
@@ -3995,6 +4094,99 @@ mod tests {
         }
         assert!(completed, "completion must follow successful upload");
         let _ = fs::remove_dir_all(input_dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiplex_encode_sends_heartbeat_without_ffmpeg_progress() -> Result<()> {
+        let input_dir =
+            std::env::temp_dir().join(format!("ab-av1-multiplex-heartbeat-{}", std::process::id()));
+        fs::create_dir_all(&input_dir)?;
+        let input = input_dir.join("movie.mkv");
+        fs::write(&input, b"input-bytes")?;
+        crate::command::encode::test_hooks::set_fixture("sleep-long");
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id: "heartbeat-job".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 11,
+                chunk_size_bytes: 1,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: vec![
+                    "encode".into(),
+                    "--input".into(),
+                    "/server/movie.mkv".into(),
+                    "--output".into(),
+                    input_dir.join("movie.av1.mkv").display().to_string(),
+                    "--crf".into(),
+                    "30".into(),
+                ],
+                crf_search_args: Vec::new(),
+            },
+            input_dir.clone(),
+            input,
+        );
+        let (output, mut outputs) = mpsc::unbounded_channel();
+        let (commands, mut command_receiver) = mpsc::unbounded_channel();
+        let mut run = std::pin::pin!(run_multiplex_encode_with_heartbeat_interval(
+            &job,
+            Arc::new(Ffprobe {
+                duration: Ok(Duration::from_secs(120)),
+                has_audio: false,
+                max_audio_channels: None,
+                fps: Ok(24.0),
+                resolution: Some((1920, 1080)),
+                is_image: false,
+                pix_fmt: Some("yuv420p".into()),
+            }),
+            &mut command_receiver,
+            &output,
+            Duration::from_millis(1),
+        ));
+
+        assert!(matches!(
+            tokio::select! {
+                item = outputs.recv() => item,
+                result = &mut run => panic!("encode ended early: {result:?}"),
+            },
+            Some(MultiplexOutput::Event {
+                event: ClientEvent::EncodeProgress(_),
+                ..
+            })
+        ));
+        let heartbeat = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                tokio::select! {
+                    item = outputs.recv() => match item {
+                        Some(MultiplexOutput::Event {
+                            event: ClientEvent::Heartbeat(_),
+                            ..
+                        }) => break true,
+                        Some(_) => continue,
+                        None => break false,
+                    },
+                    result = &mut run => panic!("encode ended early: {result:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        commands.send(JobCommand::Control(ControlPayload {
+            action: ControlAction::Stop,
+            video_id: Some(123),
+            job_id: Some("heartbeat-job".into()),
+        }))?;
+        assert!(matches!(run.await?, WorkerJobOutcome::Stopped));
+        crate::command::encode::test_hooks::clear();
+        let _ = fs::remove_dir_all(input_dir);
+        assert!(heartbeat);
         Ok(())
     }
 
@@ -4787,6 +4979,85 @@ mod tests {
         );
         remove_worker_input(&job)?;
         assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn multiplex_worker_input_cleanup_is_success_only() -> Result<()> {
+        let job_id = format!("cleanup-outcome-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let input_path = root.join("movie.mkv");
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"data")?;
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id,
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 4,
+                chunk_size_bytes: 4,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: vec!["crf-search".into(), "--input".into(), "movie.mkv".into()],
+            },
+            root.clone(),
+            input_path,
+        );
+
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Stopped))?;
+        assert!(root.exists());
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
+        assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn completed_local_encode_cleanup_preserves_output() -> Result<()> {
+        let job_id = format!("cleanup-local-output-{}", std::process::id());
+        let root = worker_job_input_dir(&job_id);
+        let _ = fs::remove_dir_all(&root);
+        let input_path = root.join("movie.mkv");
+        let output_path = root.join("movie.av1.mkv");
+        fs::create_dir_all(&root)?;
+        fs::write(&input_path, b"input")?;
+        fs::write(&output_path, b"output")?;
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::Encode,
+                job_id,
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 5,
+                chunk_size_bytes: 5,
+                target_vmaf: 0.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: vec![
+                    "encode".into(),
+                    "--input".into(),
+                    "movie.mkv".into(),
+                    "--output".into(),
+                    "movie.av1.mkv".into(),
+                ],
+                crf_search_args: Vec::new(),
+            },
+            root.clone(),
+            input_path.clone(),
+        );
+
+        cleanup_multiplex_worker_input(&job, &Ok(WorkerJobOutcome::Completed))?;
+
+        assert!(!input_path.exists());
+        assert!(output_path.exists());
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
