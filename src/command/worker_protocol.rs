@@ -224,6 +224,7 @@ pub(crate) struct EncodeCompletedPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct FailureReportPayload {
+    pub(crate) job_id: String,
     pub(crate) video_id: u64,
     pub(crate) stage: String,
     pub(crate) category: String,
@@ -1279,6 +1280,26 @@ mod tests {
                 "retriable": true,
                 "reason": "disk full",
             })
+        );
+    }
+
+    #[test]
+    fn process_failure_payload_serializes_job_identity() {
+        let payload = FailureReportPayload {
+            job_id: "encode-42".into(),
+            video_id: 42,
+            stage: "encoding".into(),
+            category: "process_failure".into(),
+            message: "ffmpeg failed".into(),
+            code: "worker_encode_failed".into(),
+            context: json!({}),
+            retriable: false,
+            stderr_excerpt: Some("ffmpeg failed".into()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).expect("serialize process failure")["job_id"],
+            "encode-42"
         );
     }
 }

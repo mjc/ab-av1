@@ -348,6 +348,7 @@ impl WorkerJob {
 
     fn failure_payload(&self, error: &anyhow::Error) -> FailureReportPayload {
         FailureReportPayload {
+            job_id: self.assignment.job_id.clone(),
             video_id: self.assignment.video_id,
             stage: match self.assignment.job_type {
                 JobKind::CrfSearch => "crf_search",
