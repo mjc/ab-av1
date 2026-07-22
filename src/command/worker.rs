@@ -3285,6 +3285,20 @@ async fn replay_multiplex_jobs(
     jobs: &HashMap<String, MultiplexJob>,
 ) -> bool {
     for (job_id, job) in jobs {
+        if !send_multiplex_event(
+            worker,
+            ClientEvent::ControlState(ControlStatePayload {
+                state: ControlState::Running,
+                active_video_id: Some(job.job.assignment.video_id),
+                job_id: Some(job_id.clone()),
+            }),
+            job_id,
+            "control_state",
+        )
+        .await
+        {
+            return false;
+        }
         if let Some(progress) = encode_reconnect_progress(&job.job, &job.state, job.finished)
             && !send_multiplex_event(
                 worker,
