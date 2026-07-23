@@ -369,6 +369,8 @@ impl WorkerJob {
     }
 
     fn failure_payload(&self, error: &anyhow::Error) -> FailureReportPayload {
+        let exit_code = 1;
+
         FailureReportPayload {
             job_id: self.assignment.job_id.clone(),
             video_id: self.assignment.video_id,
@@ -379,14 +381,11 @@ impl WorkerJob {
             .into(),
             category: "process_failure".into(),
             message: error.to_string(),
-            code: match self.assignment.job_type {
-                JobKind::CrfSearch => "worker_crf_search_failed",
-                JobKind::Encode => "worker_encode_failed",
-            }
-            .into(),
+            code: format!("EXIT_{exit_code}"),
             context: json!({
                 "job_id": self.assignment.job_id,
                 "source_name": self.assignment.source_name,
+                "exit_code": exit_code,
                 "error_chain": format!("{error:#}"),
             }),
             retriable: false,
@@ -3989,6 +3988,36 @@ mod tests {
     fn max_active_jobs_overrides_detected_capacity() {
         let capacity = WorkerCapacity::new(16, WorkerMode::Both, std::num::NonZeroUsize::new(1));
         assert_eq!(capacity.max_active_jobs(), 1);
+    }
+
+    #[test]
+    fn worker_failure_payload_uses_cli_exit_code_shape() {
+        let job = WorkerJob::new(
+            JobAssignedPayload {
+                status: WorkStatus::JobAssigned,
+                job_type: JobKind::CrfSearch,
+                job_id: "crf-search-123".into(),
+                video_id: 123,
+                source_name: "movie.mkv".into(),
+                size_bytes: 1_000,
+                chunk_size_bytes: 256,
+                target_vmaf: 95.0,
+                transfer: None,
+                output_transfer: None,
+                output_shared_path: None,
+                encode_args: Vec::new(),
+                crf_search_args: vec!["crf-search".into(), "movie.mkv".into()],
+            },
+            PathBuf::from("/tmp/crf-search-123"),
+            PathBuf::from("/tmp/crf-search-123/movie.mkv"),
+        );
+
+        let payload = job.failure_payload(&anyhow!("ab-av1 failed"));
+
+        assert_eq!(payload.stage, "crf_search");
+        assert_eq!(payload.category, "process_failure");
+        assert_eq!(payload.code, "EXIT_1");
+        assert_eq!(payload.context["exit_code"], json!(1));
     }
 
     #[test]

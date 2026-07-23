@@ -1346,7 +1346,7 @@ mod tests {
             stage: "encoding".into(),
             category: "process_failure".into(),
             message: "ffmpeg failed".into(),
-            code: "worker_encode_failed".into(),
+            code: "EXIT_1".into(),
             context: json!({}),
             retriable: false,
             stderr_excerpt: Some("ffmpeg failed".into()),
