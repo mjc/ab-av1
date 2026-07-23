@@ -378,10 +378,10 @@ mod tests {
         assert_ne!(hash_a.finish(), hash_b.finish());
     }
 
-    // ab-kgc.24: duplicate ffmpeg flags should survive single removal
+    // ab-kgc.24: remove_arg mirrors main and only strips the first matching flag pair
     #[test]
-    fn remove_arg_strips_only_first_matching_pair() {
-        // setup — duplicate flags should require multiple removals or retain extras
+    fn remove_arg_strips_first_matching_pair() {
+        // setup — duplicate flags should leave later pairs alone
         let mut args = vec![
             Arc::new("-preset".to_string()),
             Arc::new("8".to_string()),
@@ -394,7 +394,7 @@ mod tests {
         // execute
         remove_arg(&mut args, "-preset");
 
-        // assert — second -preset pair must survive one removal
+        // assert — only the first pair is removed
         assert_eq!(
             args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             vec!["-preset", "6", "-crf", "30"]

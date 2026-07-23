@@ -23,6 +23,7 @@ fn top_level_help_mentions_all_commands() {
         "encode",
         "crf-search",
         "auto-encode",
+        "worker",
         "print-completions",
     ] {
         assert!(help.contains(cmd), "missing command: {cmd}");

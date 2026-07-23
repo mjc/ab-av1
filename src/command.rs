@@ -6,6 +6,9 @@ pub mod print_completions;
 pub(crate) mod rules;
 pub mod sample_encode;
 pub mod vmaf;
+pub mod worker;
+pub(crate) mod worker_protocol;
+pub(crate) mod worker_transfer;
 pub mod xpsnr;
 
 pub use auto_encode::auto_encode;
@@ -14,6 +17,7 @@ pub use encode::encode;
 pub use print_completions::print_completions;
 pub use sample_encode::sample_encode;
 pub use vmaf::vmaf;
+pub use worker::worker;
 pub use xpsnr::xpsnr;
 
 const PROGRESS_CHARS: &str = "##-";

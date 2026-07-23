@@ -13,12 +13,11 @@ mod test_support;
 mod vmaf;
 mod xpsnr;
 
-use ::log::LevelFilter;
 use anyhow::anyhow;
 use clap::Parser;
 use futures_util::FutureExt;
-use std::io::IsTerminal;
 use tokio::signal;
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -29,21 +28,24 @@ enum Command {
     Encode(command::encode::Args),
     CrfSearch(command::crf_search::Args),
     AutoEncode(command::auto_encode::Args),
+    Worker(command::worker::Args),
     PrintCompletions(command::print_completions::Args),
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    env_logger::builder()
-        .filter_module(
-            "ab_av1",
-            match std::io::stderr().is_terminal() {
-                true => LevelFilter::Off,
-                false => LevelFilter::Info,
-            },
-        )
-        .parse_default_env()
-        .init();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls crypto provider");
+
+    let default_filter = if cfg!(debug_assertions) {
+        "ab_av1=debug"
+    } else {
+        "ab_av1=info"
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    fmt().with_env_filter(filter).init();
 
     let action = Command::parse();
     let keep = action.keep_temp_files();
@@ -65,6 +67,7 @@ async fn main() {
         Command::AutoEncode(args) => {
             command::auto_encode(command::auto_encode::AutoEncodeConfig::from(args)).boxed_local()
         }
+        Command::Worker(args) => command::worker(args.into()).boxed_local(),
         Command::PrintCompletions(args) => return command::print_completions(args.into()),
     });
 
@@ -131,6 +134,7 @@ mod tests {
             .expect("parse print-completions command");
 
         match command {
+            Command::Worker(_) => {}
             Command::PrintCompletions(_) => {}
             _ => panic!("expected print-completions command"),
         }

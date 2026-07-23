@@ -13,6 +13,8 @@ static TEMPS: LazyLock<Mutex<HashMap<PathBuf, TempKind>>> = LazyLock::new(<_>::d
 pub enum TempKind {
     /// Should always be deleted at the end of the program.
     NotKeepable,
+    /// Deleted on final cleanup, but not while another concurrent job is running.
+    Guarded,
     /// Usually deleted but may be kept, e.g. with --keep.
     Keepable,
 }
@@ -36,7 +38,7 @@ pub struct CleanupGuard {
 
 impl CleanupGuard {
     pub fn arm(path: PathBuf) -> Self {
-        add(&path, TempKind::NotKeepable);
+        add(&path, TempKind::Guarded);
         Self {
             path,
             registered: true,
@@ -171,6 +173,22 @@ mod tests {
         assert!(!drop.exists(), "NotKeepable file should be deleted");
 
         // cleanup
+        clean_all().await;
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn early_cleanup_preserves_guarded_output() {
+        let path = temp_path("guarded");
+        fs::write(&path, b"stay").expect("write temp file");
+        let _guard = CleanupGuard::arm(path.clone());
+
+        clean(true).await;
+
+        assert!(
+            path.exists(),
+            "an active encode output must survive early cleanup"
+        );
         clean_all().await;
     }
 

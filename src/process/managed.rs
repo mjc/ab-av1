@@ -4,7 +4,20 @@
 )]
 
 use anyhow::bail;
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
+#[cfg(unix)]
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+#[cfg(unix)]
+use std::io;
 use std::process::{ExitStatus, Output};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio_process_tools::{Chunk, visitors::inspect::InspectChunks};
@@ -20,6 +33,71 @@ use tokio_stream::Stream;
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_millis(25);
 const DEFAULT_STDERR_LIMIT: usize = 32_768;
+
+#[cfg(unix)]
+static ACTIVE_PROCESS_GROUPS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+
+#[cfg(unix)]
+static SCOPED_PROCESS_GROUPS: OnceLock<Mutex<HashMap<ProcessScope, HashSet<i32>>>> =
+    OnceLock::new();
+
+tokio::task_local! {
+    static PROCESS_SCOPE: ProcessScope;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProcessScope(Arc<str>);
+
+impl ProcessScope {
+    #[must_use]
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
+        Self(id.into())
+    }
+
+    pub async fn run<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        PROCESS_SCOPE.scope(self.clone(), future).await
+    }
+
+    #[cfg(unix)]
+    pub fn pause(&self) -> anyhow::Result<()> {
+        self.signal(Signal::SIGSTOP)
+    }
+
+    #[cfg(unix)]
+    pub fn resume(&self) -> anyhow::Result<()> {
+        self.signal(Signal::SIGCONT)
+    }
+
+    #[cfg(unix)]
+    pub fn stop(&self) -> anyhow::Result<()> {
+        self.resume()?;
+        self.signal(Signal::SIGTERM)
+    }
+
+    #[cfg(unix)]
+    fn signal(&self, signal: Signal) -> anyhow::Result<()> {
+        let groups = scoped_process_groups()
+            .lock()
+            .expect("scoped process groups lock")
+            .get(self)
+            .cloned()
+            .unwrap_or_default();
+        signal_process_groups(groups, signal)
+    }
+}
+
+#[cfg(unix)]
+fn active_process_groups() -> &'static Mutex<HashSet<i32>> {
+    ACTIVE_PROCESS_GROUPS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(unix)]
+fn scoped_process_groups() -> &'static Mutex<HashMap<ProcessScope, HashSet<i32>>> {
+    SCOPED_PROCESS_GROUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ManagedProcessOptions {
@@ -56,6 +134,33 @@ pub struct ManagedProcess {
         SingleSubscriberOutputStream<LossyWithoutBackpressure, ReplayEnabled>,
     >,
     options: ManagedProcessOptions,
+    #[cfg(unix)]
+    process_group: Option<i32>,
+    #[cfg(unix)]
+    process_scope: Option<ProcessScope>,
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            active_process_groups()
+                .lock()
+                .expect("active process groups lock")
+                .remove(&process_group);
+            if let Some(scope) = &self.process_scope {
+                let mut groups = scoped_process_groups()
+                    .lock()
+                    .expect("scoped process groups lock");
+                if let Some(scoped) = groups.get_mut(scope) {
+                    scoped.remove(&process_group);
+                    if scoped.is_empty() {
+                        groups.remove(scope);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Process policy for streams that must run through process completion.
@@ -186,7 +291,33 @@ impl ManagedProcess {
                     .max_buffered_chunks(DEFAULT_MAX_BUFFERED_CHUNKS)
             })
             .spawn()?;
-        Ok(Self { handle, options })
+        #[cfg(unix)]
+        let process_group = handle.id().map(|pid| pid as i32);
+        #[cfg(unix)]
+        let process_scope = PROCESS_SCOPE.try_with(Clone::clone).ok();
+        #[cfg(unix)]
+        if let Some(process_group) = process_group {
+            active_process_groups()
+                .lock()
+                .expect("active process groups lock")
+                .insert(process_group);
+            if let Some(scope) = &process_scope {
+                scoped_process_groups()
+                    .lock()
+                    .expect("scoped process groups lock")
+                    .entry(scope.clone())
+                    .or_default()
+                    .insert(process_group);
+            }
+        }
+        Ok(Self {
+            handle,
+            options,
+            #[cfg(unix)]
+            process_group,
+            #[cfg(unix)]
+            process_scope,
+        })
     }
 
     fn graceful_shutdown_for(options: ManagedProcessOptions) -> GracefulShutdown {
@@ -329,6 +460,37 @@ impl ManagedProcess {
         self.handle.id()
     }
 
+    #[cfg(unix)]
+    pub fn pause(&mut self) -> anyhow::Result<()> {
+        self.send_process_group_signal("SIGSTOP", Signal::SIGSTOP)
+    }
+
+    #[cfg(unix)]
+    pub fn resume(&mut self) -> anyhow::Result<()> {
+        self.send_process_group_signal("SIGCONT", Signal::SIGCONT)
+    }
+
+    #[cfg(unix)]
+    fn send_process_group_signal(
+        &mut self,
+        signal_name: &'static str,
+        signal: Signal,
+    ) -> anyhow::Result<()> {
+        self.handle
+            .send_signal_with_reaper(
+                signal_name,
+                |handle| {
+                    let pid = handle.id().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "managed process already exited")
+                    })?;
+                    killpg(Pid::from_raw(pid as i32), signal)
+                        .map_err(|error| io::Error::from_raw_os_error(error as i32))
+                },
+                |_| Ok(None),
+            )
+            .map_err(Into::into)
+    }
+
     pub async fn terminate_after(mut self, timeout: Duration) -> anyhow::Result<ExitStatus> {
         Ok(self
             .handle
@@ -342,6 +504,41 @@ impl ManagedProcess {
             .await?
             .into_result())
     }
+}
+
+#[cfg(unix)]
+pub fn pause_active_processes() -> anyhow::Result<()> {
+    signal_active_processes(Signal::SIGSTOP)
+}
+
+#[cfg(unix)]
+pub fn resume_active_processes() -> anyhow::Result<()> {
+    signal_active_processes(Signal::SIGCONT)
+}
+
+#[cfg(unix)]
+fn signal_active_processes(signal: Signal) -> anyhow::Result<()> {
+    let groups = active_process_groups()
+        .lock()
+        .expect("active process groups lock")
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    signal_process_groups(groups, signal)
+}
+
+#[cfg(unix)]
+fn signal_process_groups(
+    groups: impl IntoIterator<Item = i32>,
+    signal: Signal,
+) -> anyhow::Result<()> {
+    for group in groups {
+        match killpg(Pid::from_raw(group), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn managed_event_from_stream_event(event: StreamEvent) -> anyhow::Result<Option<ManagedEvent>> {
@@ -381,8 +578,11 @@ impl MustCompleteProcess {
     /// and only then yields `ProcessDone`.
     pub fn stderr_events(self) -> impl Stream<Item = anyhow::Result<ManagedEvent>> {
         async_stream::try_stream! {
-            let mut process = self.0;
-            let mut stderr = process.handle.stderr().try_subscribe()?;
+            let mut process = TerminateOnDropProcess(Some(self.0));
+            let Some(inner) = process.0.as_mut() else {
+                return;
+            };
+            let mut stderr = inner.handle.stderr().try_subscribe()?;
             while let Some(event) = stderr.next_event().await {
                 match managed_event_from_stream_event(event)? {
                     Some(ManagedEvent::RawStderr(chunk)) => yield ManagedEvent::RawStderr(chunk),
@@ -392,7 +592,13 @@ impl MustCompleteProcess {
                 }
             }
 
-            yield ManagedEvent::ProcessDone(wait_for_process_done(&mut process).await?);
+            drop(stderr);
+            let Some(inner) = process.0.as_mut() else {
+                return;
+            };
+            let done = wait_for_process_done(inner).await?;
+            drop(process.0.take());
+            yield ManagedEvent::ProcessDone(done);
         }
     }
 }
@@ -450,6 +656,7 @@ mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use std::{
         env,
         sync::{Arc, Mutex},
@@ -900,5 +1107,116 @@ mod tests {
             !status.success(),
             "timeout termination should return the child terminal status"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_process_pauses_and_resumes_process_group() -> anyhow::Result<()> {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let process = ManagedProcess::spawn("pause-resume-fixture", command)?;
+        let pid = process.id().expect("fixture process id");
+
+        pause_active_processes()?;
+        assert_eq!(linux_process_state(pid)?, 'T');
+
+        resume_active_processes()?;
+        assert_ne!(linux_process_state(pid)?, 'T');
+
+        process.terminate_after(Duration::ZERO).await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_scope_controls_only_its_process_group() -> anyhow::Result<()> {
+        let first_scope = ProcessScope::new("first-job");
+        let second_scope = ProcessScope::new("second-job");
+        let first = first_scope
+            .run(async {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                ManagedProcess::spawn("first scoped fixture", command)
+            })
+            .await?;
+        let second = second_scope
+            .run(async {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                ManagedProcess::spawn("second scoped fixture", command)
+            })
+            .await?;
+        let first_pid = first.id().expect("first fixture process id");
+        let second_pid = second.id().expect("second fixture process id");
+
+        first_scope.pause()?;
+        wait_for_linux_process_state(first_pid, 'T').await?;
+        assert_ne!(linux_process_state(second_pid)?, 'T');
+
+        first_scope.resume()?;
+        wait_for_linux_process_not_state(first_pid, 'T').await?;
+        first.terminate_after(Duration::ZERO).await?;
+        second.terminate_after(Duration::ZERO).await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_scope_stops_only_its_process_group() -> anyhow::Result<()> {
+        let first_scope = ProcessScope::new("stopped-job");
+        let second_scope = ProcessScope::new("running-job");
+        let first = first_scope
+            .run(async {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                ManagedProcess::spawn("stopped scoped fixture", command)
+            })
+            .await?;
+        let second = second_scope
+            .run(async {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                ManagedProcess::spawn("running scoped fixture", command)
+            })
+            .await?;
+        let second_pid = second.id().expect("running fixture process id");
+
+        first_scope.stop()?;
+        let status = first.terminate_after(Duration::from_secs(1)).await?;
+
+        assert!(!status.success());
+        assert_ne!(linux_process_state(second_pid)?, 'Z');
+        second.terminate_after(Duration::ZERO).await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_state(pid: u32) -> anyhow::Result<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.chars().next())
+            .context("read Linux process state")
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_linux_process_state(pid: u32, expected: char) -> anyhow::Result<()> {
+        for _ in 0..50 {
+            if linux_process_state(pid)? == expected {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        anyhow::bail!("process {pid} did not enter state {expected}")
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_linux_process_not_state(pid: u32, unexpected: char) -> anyhow::Result<()> {
+        for _ in 0..50 {
+            if linux_process_state(pid)? != unexpected {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        anyhow::bail!("process {pid} remained in state {unexpected}")
     }
 }

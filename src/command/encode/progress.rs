@@ -12,7 +12,11 @@ pub struct StreamSizes {
 
 /// Progress bar updates derived from ffmpeg stderr events.
 pub enum BarUpdate {
-    Fps { fps: f32, time: Duration },
+    Fps {
+        frame: u64,
+        fps: f32,
+        time: Duration,
+    },
 }
 
 /// Mutable encode progress state updated by [`apply_ffmpeg_event`].
@@ -23,7 +27,9 @@ pub struct ProgressState {
 
 pub fn apply_ffmpeg_event(state: &mut ProgressState, event: FfmpegOut) -> Option<BarUpdate> {
     match event {
-        FfmpegOut::Progress { fps, time, .. } if fps > 0.0 => Some(BarUpdate::Fps { fps, time }),
+        FfmpegOut::Progress { frame, fps, time } if fps > 0.0 => {
+            Some(BarUpdate::Fps { frame, fps, time })
+        }
         FfmpegOut::StreamSizes {
             video,
             audio,
@@ -76,7 +82,8 @@ mod tests {
             },
         );
         match update {
-            Some(BarUpdate::Fps { fps, time }) => {
+            Some(BarUpdate::Fps { frame, fps, time }) => {
+                assert_eq!(frame, 1);
                 assert_eq!(fps, 24.0);
                 assert_eq!(time, Duration::from_secs(1));
             }
