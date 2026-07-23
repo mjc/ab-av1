@@ -73,23 +73,36 @@ impl WorkerMode {
 struct WorkerCapacity {
     logical_cpus: usize,
     mode: WorkerMode,
+    max_active_jobs: Option<std::num::NonZeroUsize>,
 }
 
 impl WorkerCapacity {
     #[must_use]
-    const fn new(logical_cpus: usize, mode: WorkerMode) -> Self {
-        Self { logical_cpus, mode }
+    const fn new(
+        logical_cpus: usize,
+        mode: WorkerMode,
+        max_active_jobs: Option<std::num::NonZeroUsize>,
+    ) -> Self {
+        Self {
+            logical_cpus,
+            mode,
+            max_active_jobs,
+        }
     }
 
     #[must_use]
-    fn detect(mode: WorkerMode) -> Self {
+    fn detect(mode: WorkerMode, max_active_jobs: Option<std::num::NonZeroUsize>) -> Self {
         let logical_cpus =
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        Self::new(logical_cpus, mode)
+        Self::new(logical_cpus, mode, max_active_jobs)
     }
 
     #[must_use]
     const fn max_active_jobs(self) -> usize {
+        if let Some(max_active_jobs) = self.max_active_jobs {
+            return max_active_jobs.get();
+        }
+
         match self.mode {
             WorkerMode::CrfSearch | WorkerMode::Encode => 1,
             WorkerMode::Both => {
@@ -137,6 +150,10 @@ pub struct Args {
     /// Job kinds this worker accepts.
     #[arg(long = "worker-mode", alias = "mode", default_value = "both")]
     worker_mode: WorkerMode,
+
+    /// Maximum jobs to run concurrently in worker mode.
+    #[arg(long, env = "AB_AV1_WORKER_MAX_ACTIVE_JOBS")]
+    max_active_jobs: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +166,7 @@ pub struct WorkerConfig {
     once: bool,
     local_path: Option<PathBuf>,
     worker_mode: WorkerMode,
+    max_active_jobs: Option<std::num::NonZeroUsize>,
 }
 
 impl From<Args> for WorkerConfig {
@@ -162,6 +180,7 @@ impl From<Args> for WorkerConfig {
             once,
             local_path,
             worker_mode,
+            max_active_jobs,
         }: Args,
     ) -> Self {
         Self {
@@ -173,6 +192,7 @@ impl From<Args> for WorkerConfig {
             once,
             local_path,
             worker_mode,
+            max_active_jobs,
         }
     }
 }
@@ -1764,7 +1784,7 @@ struct ConnectedWorker {
 
 impl ConnectedWorker {
     async fn connect(config: &WorkerConfig) -> Result<Self> {
-        let capacity = WorkerCapacity::detect(config.worker_mode);
+        let capacity = WorkerCapacity::detect(config.worker_mode, config.max_active_jobs);
         let request_url = worker_websocket_url(&config.connect, &config.token)?;
         let mut request = request_url
             .clone()
@@ -2856,7 +2876,7 @@ async fn run_multiplexed_worker(
 ) -> Result<()> {
     let connected = ConnectedWorker::connect(config).await?;
     let mut connection = Some(MultiplexedWorker::from_connected(connected));
-    let capacity = WorkerCapacity::detect(config.worker_mode);
+    let capacity = WorkerCapacity::detect(config.worker_mode, config.max_active_jobs);
     let (output, mut outputs) = mpsc::unbounded_channel();
     let mut jobs: HashMap<String, MultiplexJob> = HashMap::new();
     let mut pending: HashMap<String, (JobKind, Option<String>)> = HashMap::new();
@@ -3852,6 +3872,7 @@ mod tests {
                 once: config.once,
                 local_path: None,
                 worker_mode: WorkerMode::CrfSearch,
+                max_active_jobs: None,
             }
         }
 
@@ -3871,6 +3892,7 @@ mod tests {
             once: false,
             local_path: None,
             worker_mode: WorkerMode::CrfSearch,
+            max_active_jobs: std::num::NonZeroUsize::new(1),
         });
 
         assert_eq!(config.connect, "http://127.0.0.1:4000");
@@ -3880,6 +3902,10 @@ mod tests {
         assert_eq!(config.protocol_version, 1);
         assert!(!config.once);
         assert_eq!(config.worker_mode, WorkerMode::CrfSearch);
+        assert_eq!(
+            config.max_active_jobs.map(std::num::NonZeroUsize::get),
+            Some(1)
+        );
     }
 
     #[test]
@@ -3917,11 +3943,52 @@ mod tests {
     }
 
     #[test]
+    fn args_accepts_nonzero_max_active_jobs() {
+        let args = Args::try_parse_from([
+            "ab-av1",
+            "--connect",
+            "http://127.0.0.1:4000",
+            "--token",
+            "token",
+            "--worker-id",
+            "worker",
+            "--max-active-jobs",
+            "1",
+        ])
+        .expect("parse max active jobs");
+
+        assert_eq!(
+            args.max_active_jobs.map(std::num::NonZeroUsize::get),
+            Some(1)
+        );
+        assert!(
+            Args::try_parse_from([
+                "ab-av1",
+                "--connect",
+                "http://127.0.0.1:4000",
+                "--token",
+                "token",
+                "--worker-id",
+                "worker",
+                "--max-active-jobs",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn both_mode_capacity_changes_after_eight_logical_cpus() {
-        let small = WorkerCapacity::new(8, WorkerMode::Both);
-        let large = WorkerCapacity::new(9, WorkerMode::Both);
+        let small = WorkerCapacity::new(8, WorkerMode::Both, None);
+        let large = WorkerCapacity::new(9, WorkerMode::Both, None);
         assert_eq!(small.max_active_jobs(), 1);
         assert_eq!(large.max_active_jobs(), 2);
+    }
+
+    #[test]
+    fn max_active_jobs_overrides_detected_capacity() {
+        let capacity = WorkerCapacity::new(16, WorkerMode::Both, std::num::NonZeroUsize::new(1));
+        assert_eq!(capacity.max_active_jobs(), 1);
     }
 
     #[test]
@@ -4342,6 +4409,7 @@ mod tests {
             once: false,
             local_path: Some(input.clone()),
             worker_mode: WorkerMode::Encode,
+            max_active_jobs: None,
         };
         let local = tokio::task::LocalSet::new();
         let result = local
