@@ -3761,13 +3761,13 @@ fn handle_multiplex_frame(
                         return Ok(true);
                     }
                     Err(error) => {
-                        debug!(
+                        warn!(
                             job_id = %ack.job_id,
                             event = ack.name,
                             error = %error,
-                            "multiplexed worker event was rejected"
+                            "multiplexed worker event was rejected; keeping connection"
                         );
-                        return Ok(false);
+                        return Ok(true);
                     }
                 }
             }
@@ -6142,6 +6142,43 @@ mod tests {
 
         assert!(!connection_is_alive);
         assert_eq!(completed_pulls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn multiplexed_event_error_keeps_connection_alive() -> Result<()> {
+        let mut jobs = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut no_work = HashMap::new();
+        let mut pending_acks = HashMap::from([(
+            "4".into(),
+            PendingEventAck::new("encode-1", "control_state"),
+        )]);
+        let mut scheduler = WorkScheduler::new(std::num::NonZeroUsize::new(1).unwrap());
+        let (output, _outputs) = mpsc::unbounded_channel();
+        let mut completed_pulls = 0;
+        let frame = Message::Text(
+            (serde_json::to_string(&ServerFrame::reply(
+                4,
+                ReplyBody::error(ErrorReplyPayload::new("stale worker control")),
+            ))?)
+            .into(),
+        );
+
+        let connection_is_alive = handle_multiplex_frame(
+            decode_worker_frame(Some(Ok(frame))).map(|frame| frame.expect("text worker frame")),
+            &mut jobs,
+            &mut pending,
+            &mut no_work,
+            &mut pending_acks,
+            &mut scheduler,
+            &output,
+            &mut completed_pulls,
+            None,
+        )?;
+
+        assert!(connection_is_alive);
+        assert!(pending_acks.is_empty());
         Ok(())
     }
 
